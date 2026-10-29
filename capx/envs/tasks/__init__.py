@@ -107,6 +107,26 @@ register_config(
     ),
 )
 
+from .franka.franka_libero_mem_env import FrankaLiberoMemCodeEnv
+register_exec_env("franka_libero_mem_code_env", FrankaLiberoMemCodeEnv)
+register_config(
+    "franka_libero_mem_code_env",
+    CodeExecEnvConfig(
+        low_level="franka_libero_mem_0_low_level",
+        apis=["FrankaLiberoApi"],
+    ),
+)
+
+from .robomme.robomme_env import RoboMMECodeEnv
+register_exec_env("robomme_code_env", RoboMMECodeEnv)
+register_config(
+    "robomme_code_env",
+    CodeExecEnvConfig(
+        low_level="robomme_PickXtimes_low_level",
+        apis=[],  # no RoboMME control API yet
+    ),
+)
+
 # # Non-privileged (perception-based) Libero environments
 # register_exec_env("franka_libero_pick_place_code_env", FrankaLiberoPickPlaceCodeEnv)
 # register_config(

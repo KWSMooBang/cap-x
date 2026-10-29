@@ -1,0 +1,27 @@
+# RoboMME PickXtimes (Counting suite, temporal memory), test split.
+# Requires: uv sync --extra robomme  (Python >= 3.11, exclusive with libero/libero-mem/robosuite/molmo/verl)
+# SAPIEN needs a Vulkan device (NVIDIA ICD, or lavapipe from mesa-vulkan-drivers for CPU rendering).
+# obs["memory"]: task_goal, simple/grounded_subgoal_online, status, reset_obs_lists (frames returned at reset).
+# No RoboMME control API is registered yet, so `apis` is empty; use this low-level env directly, e.g.
+#   uv run --no-sync python scripts/bench_smoke.py --config-path env_configs/robomme/robomme_pickxtimes.yaml
+
+env:
+  _target_: capx.envs.tasks.robomme.robomme_env.RoboMMECodeEnv
+  cfg:
+    _target_: capx.envs.tasks.base.CodeExecEnvConfig
+    low_level:
+      _target_: capx.envs.simulators.robomme.RoboMMEEnv
+      task_id: PickXtimes
+      episode_idx: 0
+      dataset: test
+    privileged: false
+    apis: []
+    prompt: |
+      You are controlling a Franka Emika Panda robot.
+      Goal: {libero_environment_goal}
+
+record_video: true
+output_dir: ./outputs/robomme_pickxtimes
+
+trials: 50
+num_workers: 1

@@ -79,6 +79,28 @@ libero = [
   "gym==0.25.2",
   "scikit-learn",
 ]
+# LIBERO-Mem (arXiv 2511.11478): a LIBERO fork that also ships its own robosuite 1.4.1.
+# Same distribution names as the `libero` extra, so the two are mutually exclusive.
+libero-mem = [
+  "libero",
+  "robosuite",
+  "easydict==1.9",
+  "robomimic==0.2.0",
+  "einops==0.4.1",
+  "thop==0.1.1-2209072238",
+  "bddl==1.0.1",
+  "future==0.18.2",
+  "cloudpickle==2.1.0",
+  "gym==0.25.2",
+  "scikit-learn",
+]
+# RoboMME (arXiv 2603.04639): ManiSkill3/SAPIEN memory benchmark. Requires Python >= 3.11.
+robomme = [
+  "robomme ; python_full_version >= '3.11'",
+  "mani-skill ; python_full_version >= '3.11'",
+  "torch==2.9.1",
+  "torchvision==0.24.1",
+]
 robosuite = [
   "robosuite"
 ]
@@ -119,11 +141,16 @@ verl = [
 robosuite = [
   { path = "capx/third_party/robosuite", extra = "robosuite", editable = true},
   { path = "capx/third_party/libero_dependencies/robosuite", extra = "libero", editable = true },
+  { path = "capx/third_party/LIBERO-Mem/thirdparty/robosuite", extra = "libero-mem", editable = true },
 ]
 libero = [
   { path = "capx/third_party/LIBERO-PRO", extra = "libero", editable = true},
+  { path = "capx/third_party/LIBERO-Mem", extra = "libero-mem", editable = true},
 ]
 verl = { path = "capx/third_party/verl" }
+robomme = { path = "capx/third_party/RoboMME", extra = "robomme", editable = true }
+# Same ManiSkill fork/commit as RoboMME's own [tool.uv.sources]
+mani-skill = { git = "https://github.com/YinpeiDai/ManiSkill.git", rev = "07be6fbc66350ddca200abfb0a11b692f078f7fd", extra = "robomme" }
 contact_graspnet_pytorch = { path = "capx/third_party/contact_graspnet_pytorch", editable = true }
 sam3 = { path = "capx/third_party/sam3", editable = true}
 nvidia-curobo = { path = "capx/third_party/curobo", editable = true}
@@ -140,7 +167,9 @@ override-dependencies = [
     "opencv-python-headless<4.13",
     "opencv-python ; sys_platform == 'never'",
     "jax<0.4.30",
-    "jaxlib<0.4.30"
+    "jaxlib<0.4.30",
+    # RoboMME pins setuptools==80.9.0; relax it so the base resolution keeps its locked setuptools
+    "setuptools<81",
 ]
 conflicts = [
   [
@@ -155,6 +184,22 @@ conflicts = [
     { extra = "molmo" },
     { extra = "verl" },
   ],
+  [
+    { extra = "libero-mem" },
+    { extra = "libero" },
+  ],
+  [
+    { extra = "libero-mem" },
+    { extra = "robosuite" },
+  ],
+  # RoboMME pins torch==2.9.1/setuptools==80.9.0 and ManiSkill's gymnasium==0.29.1; keep it in its own
+  # resolution fork so the other extras' locked versions are unaffected. (Pairwise: a single group
+  # would also make libero/molmo/verl/... mutually exclusive with each other.)
+  [{ extra = "robomme" }, { extra = "libero" }],
+  [{ extra = "robomme" }, { extra = "libero-mem" }],
+  [{ extra = "robomme" }, { extra = "robosuite" }],
+  [{ extra = "robomme" }, { extra = "molmo" }],
+  [{ extra = "robomme" }, { extra = "verl" }],
 ]
 
 [build-system]
