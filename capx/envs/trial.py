@@ -797,6 +797,8 @@ def _run_single_trial(
         exec_start = time.time()
         obs_next, reward, terminated, truncated, info_step = env.step(code)
         exec_s = time.time() - exec_start
+        # Cumulative low-level sim steps; the episode is truncated at the env's max_steps (horizon).
+        sim_steps = getattr(getattr(env, "low_level_env", None), "_sim_step_count", None)
 
         # Record frame index after step
         frame_end = env.get_video_frame_count() if recording_frames else 0
@@ -855,6 +857,7 @@ def _run_single_trial(
                     "reasoning": mt_reasoning if mt_reasoning is not None else "",
                     "exec_s": round(exec_s, 2),
                     "decision_s": round(decision_s, 2),
+                    "sim_steps": sim_steps,
                 })
                 del code_blocks[code_block_idx:]
                 del code_block_metadata[code_block_idx:]
@@ -874,6 +877,7 @@ def _run_single_trial(
                     "reasoning": mt_reasoning if mt_reasoning is not None else (new_code or ""),
                     "exec_s": round(exec_s, 2),
                     "decision_s": round(decision_s, 2),
+                    "sim_steps": sim_steps,
                 })
                 print("Model chose to finish")
                 num_finishes += 1
