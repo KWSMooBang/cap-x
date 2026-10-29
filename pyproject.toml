@@ -79,6 +79,21 @@ libero = [
   "gym==0.25.2",
   "scikit-learn",
 ]
+# LIBERO-Mem (arXiv 2511.11478): a LIBERO fork that also ships its own robosuite 1.4.1.
+# Same distribution names as the `libero` extra, so the two are mutually exclusive.
+libero-mem = [
+  "libero",
+  "robosuite",
+  "easydict==1.9",
+  "robomimic==0.2.0",
+  "einops==0.4.1",
+  "thop==0.1.1-2209072238",
+  "bddl==1.0.1",
+  "future==0.18.2",
+  "cloudpickle==2.1.0",
+  "gym==0.25.2",
+  "scikit-learn",
+]
 robosuite = [
   "robosuite"
 ]
@@ -119,9 +134,11 @@ verl = [
 robosuite = [
   { path = "capx/third_party/robosuite", extra = "robosuite", editable = true},
   { path = "capx/third_party/libero_dependencies/robosuite", extra = "libero", editable = true },
+  { path = "capx/third_party/LIBERO-Mem/thirdparty/robosuite", extra = "libero-mem", editable = true },
 ]
 libero = [
   { path = "capx/third_party/LIBERO-PRO", extra = "libero", editable = true},
+  { path = "capx/third_party/LIBERO-Mem", extra = "libero-mem", editable = true},
 ]
 verl = { path = "capx/third_party/verl" }
 contact_graspnet_pytorch = { path = "capx/third_party/contact_graspnet_pytorch", editable = true }
@@ -154,6 +171,14 @@ conflicts = [
   [
     { extra = "molmo" },
     { extra = "verl" },
+  ],
+  [
+    { extra = "libero-mem" },
+    { extra = "libero" },
+  ],
+  [
+    { extra = "libero-mem" },
+    { extra = "robosuite" },
   ],
 ]
 

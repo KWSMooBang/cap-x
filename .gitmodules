@@ -24,3 +24,6 @@
 [submodule "capx/third_party/b1k"]
 	path = capx/third_party/b1k
 	url = https://github.com/qingh097/b1k.git
+[submodule "capx/third_party/LIBERO-Mem"]
+	path = capx/third_party/LIBERO-Mem
+	url = https://github.com/libero-mem/libero-mem.git

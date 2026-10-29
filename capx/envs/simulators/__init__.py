@@ -61,6 +61,22 @@ except Exception:
     print("LIBERO not installed!")
     # traceback.print_exc()
 
+# LIBERO-Mem shares the `libero`/`robosuite` package names with LIBERO-PRO.
+# Using LIBERO-Mem run: uv sync --extra libero-mem
+try:
+    from .libero_mem import FrankaLiberoMemEnv
+    from capx.integrations.libero_mem import libero_mem_num_tasks
+
+    # Usage in YAML: low_level: franka_libero_mem_<task_id>_low_level
+    import functools
+    for _tid in range(libero_mem_num_tasks()):
+        register_env(
+            f"franka_libero_mem_{_tid}_low_level",
+            functools.partial(FrankaLiberoMemEnv, task_id=_tid),
+        )
+except Exception:
+    print("LIBERO-Mem not installed!")
+
 try:
     from .r1pro_b1k import R1ProBehaviourLowLevel
     register_env("r1pro_b1k_low_level", R1ProBehaviourLowLevel)

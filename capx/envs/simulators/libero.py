@@ -21,10 +21,15 @@ here = os.path.dirname(os.path.abspath(__file__))
 vendor_root = os.path.normpath(os.path.join(here, "..", "third_party", "LIBERO"))
 if os.path.isdir(vendor_root) and vendor_root not in sys.path:
     sys.path.append(vendor_root)
-# try:
-from libero import benchmark  # type: ignore[import-not-found]
-from libero.envs import OffScreenRenderEnv  # type: ignore[import-not-found]
-from libero.utils import get_libero_path  # type: ignore[import-not-found]
+try:
+    from libero import benchmark  # type: ignore[import-not-found]
+    from libero.envs import OffScreenRenderEnv  # type: ignore[import-not-found]
+    from libero.utils import get_libero_path  # type: ignore[import-not-found]
+except ImportError:
+    # Upstream LIBERO layout (used by LIBERO-Mem, see capx.envs.simulators.libero_mem)
+    from libero.libero import benchmark  # type: ignore[import-not-found]
+    from libero.libero.envs import OffScreenRenderEnv  # type: ignore[import-not-found]
+    from libero.libero.utils import get_libero_path  # type: ignore[import-not-found]
 # except Exception as e:  # pragma: no cover - optional dependency
 #     raise ModuleNotFoundError(
 #         "LIBERO not available; add submodule or run `uv sync --extra libero`."
@@ -57,7 +62,7 @@ class FrankaLiberoEnv(BaseEnv):
         self._render_width = 800
         self._render_height = 512
 
-        self.handle = load_libero_task(
+        self.handle = self._load_handle(
             suite_name=suite_name,
             task_id=task_id,
             cam_w=self._render_width,
@@ -145,6 +150,10 @@ class FrankaLiberoEnv(BaseEnv):
             self.viser_server = None
 
         self.reset()
+
+    def _load_handle(self, **kwargs: Any) -> Any:
+        """Create the LIBERO task handle. Overridden by LIBERO forks (e.g. LIBERO-Mem)."""
+        return load_libero_task(**kwargs)
 
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None

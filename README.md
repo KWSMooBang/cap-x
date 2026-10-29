@@ -72,6 +72,15 @@ uv sync --active --extra libero --extra contactgraspnet
 
 See [docs/libero-tasks.md](docs/libero-tasks.md) for running any of 130+ LIBERO tasks.
 
+#### Memory benchmarks (LIBERO-Mem)
+
+```bash
+uv venv .venv-libero-mem --python 3.12 && source .venv-libero-mem/bin/activate
+uv sync --active --extra libero-mem --extra contactgraspnet   # exclusive with --extra libero
+```
+
+See [docs/memory-benchmarks.md](docs/memory-benchmarks.md).
+
 #### BEHAVIOR (Isaac Sim)
 
 BEHAVIOR tasks run on NVIDIA Isaac Sim via OmniGibson. Requires Python 3.10 and CUDA 12.x.
