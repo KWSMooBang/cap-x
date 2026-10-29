@@ -19,9 +19,12 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 
 ## 백로그
 1. [완료·bg 병합 b9c0046] bench-setup: LIBERO-Mem·RoboMME submodule + uv extra + cap-x wrapper (RoboMME 카메라 렌더링은 kubectl 쪽에서 진행)
-1a. [진행] libero-init-fix: FrankaLiberoEnv.reset 이 init state 를 무시하는 버그 수정 (L2 exp_cap-bg_libero-init-fix)
-1b. [진행] baseline-configs: 앙상블 끔·VDM 켬·multi-turn 켬 기준선 YAML (LIBERO-PRO, LIBERO-Mem 10개) + docs (L2 exp_cap-bg_baseline-configs)
+1a. [완료·bg 병합 b51b346] libero-init-fix: reset 직후 sim state = init_states[(seed-1)%N] (차이 0.0). LIBERO-Mem 우회 제거
+1b. [완료·bg 병합 b98b4ac] baseline-configs: env_configs/capbg_baseline/ (LIBERO-PRO swap 0, LIBERO-Mem task_00..09),
+    앙상블 끔·VDM 켬·multi-turn 켬, 생성기 scripts/gen_capbg_baseline_configs.py, docs/capbg-baseline.md
 1c. RoboMME control API (지금 apis: [] 라 cap-x 로 못 돌림)
+1d. LIBERO 설정 경로를 레포별로 분리 (이 서버의 ~/.libero/config.yaml 이 다른 프로젝트 RACA 를 가리킴)
+1e. [진행] kubectl 기준선 파일럿 — 사람이 baccus_cap-bg 에 직접 지시
 2. 기존 cap-x baseline 으로 두 benchmark 평가 (Belief Graph 없이)
 3. Belief Graph 모듈 설계·구현 (VDM 연동, code refinement 트리거)
 
