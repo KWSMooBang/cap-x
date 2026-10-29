@@ -1,5 +1,24 @@
 # cap-bg EXPERIMENTS
 
+## 20261029_mem_pilot_ensoff_t1800 (2026-10-30) — discard (예산 문제로 판정 불가), 관찰은 keep
+- 실행: kubectl baccus_cap-bg, A100 1장 · CPU 16, EGL, worker 5. 비용 약 8달러.
+- 코드: 17b71ae (= bg 2e59b74 + exp/libero-mem-egl 0b3fc22 + exp/trial-timeout 17b71ae)
+- 설정: env_configs/capbg_baseline/libero_mem task_00 / task_02 / task_06 × 5 trial.
+  Kimi-K3 coding + Qwen3.8-27B VDM (Nebius), 앙상블 끔, VDM 켬, multi-turn 켬.
+  budget: 실제로는 reset 후 1000s · 재시도 없음 (--trial-timeout-s 1800 은 trial.py 하드코딩 alarm(1000) 때문에 무시됨 → 8b3edea 에서 수정).
+- 결과 (baccus 보고 원문): 0/15 성공 (timeout 13 / FINISH-but-fail 2).
+  task_00: 0/5 (timeout 3, finish_but_fail 2) → timeout 제외 0/2 · task_02: 0/5 (timeout 5) · task_06: 0/5 (timeout 5)
+- 관찰:
+  - timeout 원인은 API 지연이 아니라 sim 코드 실행 시간. 모델 호출 69회, 중앙값 6–8s, Nebius 재시도 0, Molmo 실패 0. 1000s 안에 trial 당 0–4턴.
+  - 중단 run(20261029_mem_pilot_ensoff, timeout 미강제, task_00): trial 5 가 약 16분에 과제 완료 상태에 도달했지만 인지하지 못하고
+    계속 행동해 실패(9턴, 1149s). trial 3 도 약 13분에 완료 상태 도달. → CaP-BG 신호 S5(완료 검증)가 노리는 실패가 실제로 나타남.
+  - GPU EGL 패치(exp/libero-mem-egl) 실검증 완료 — trial 중 EGL 에러 없음.
+- 판단: discard. 1000s 예산이 해결 가능한 trial 도 자르므로 기준선 숫자로 쓸 수 없음.
+- next: 턴별 시간(099eabe 부터 all_responses.json 에 exec_s·decision_s)으로 sim 실행이 왜 느린지 확인 → 예산 재설정 후 기준선 재실행.
+- 한계: 5 trial/task, CPU 경합(worker 5 + 서버들) 미측정.
+- 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261029_mem_pilot_ensoff_t1800/{RESULTS.md,ANALYSIS.md},
+  로그 /workspace/cap-bg/logs/20261029_mem_pilot_ensoff_t1800/, 집계 /workspace/cap-bg/analyze_pilot.py
+
 ## libero-pro-pilot-run10 (2026-10-29) — discard (참고용)
 - 실행: kubectl 세션 baccus_cap-bg, pod cap-bg-gpu (A100 1장), MUJOCO_GL=egl, 10 trial · 5 workers, 3794s
 - 설정: env_configs/libero/franka_libero_cap_agent0.yaml (libero_object_swap task 0)
