@@ -16,11 +16,17 @@ class LiberoHandle:
     task_language: str
     init_states: Any
 
+    def init_state_index(self, seed: int | None) -> int:
+        """Benchmark init state for a trial: seed None -> 0, else seed is the 1-based trial id."""
+        return 0 if seed is None else (seed - 1) % len(self.init_states)
+
     def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
+        # Official LIBERO eval order: env.reset() then set_init_state(). Never env.reset() after
+        # set_init_state() -- the hard reset re-samples the BDDL placement and drops the init state.
         self.env.seed(seed)
         obs = self.env.reset()
-        if self.init_states is not None:
-            self.env.set_init_state(self.init_states[0])
+        if self.init_states is not None and len(self.init_states) > 0:
+            obs = self.env.set_init_state(self.init_states[self.init_state_index(seed)])
         return obs, {}
 
     def step(self, action: list[float]) -> tuple[Any, float, bool, dict[str, Any]]:
