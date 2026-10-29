@@ -13,7 +13,7 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
   cap-x 연결 코드(adapter·simulator·task·env_configs)는 submodule 밖에 둔다. 의존성 충돌 시 별도 uv extra + conflicts.
 
 ## 백로그
-1. [진행] bench-setup: LIBERO-Mem·RoboMME submodule + uv extra + cap-x env wrapper + smoke rollout
+1. [완료·bg 병합 b9c0046] bench-setup: LIBERO-Mem·RoboMME submodule + uv extra + cap-x wrapper (RoboMME 카메라 렌더링은 kubectl 쪽에서 진행)
 2. 기존 cap-x baseline 으로 두 benchmark 평가 (Belief Graph 없이)
 3. Belief Graph 모듈 설계·구현 (VDM 연동, code refinement 트리거)
 
