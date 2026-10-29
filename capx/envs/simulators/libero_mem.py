@@ -73,6 +73,9 @@ class FrankaLiberoMemEnv(FrankaLiberoEnv):
         info["memory"] = obs["memory"]
         return obs, info
 
+    def task_completed(self) -> bool:
+        return self.handle.task_success()
+
     def get_observation(self) -> dict[str, Any]:
         obs = super().get_observation()
         obs["memory"] = self.handle.memory_state()

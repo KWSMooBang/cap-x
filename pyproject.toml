@@ -193,15 +193,13 @@ conflicts = [
     { extra = "robosuite" },
   ],
   # RoboMME pins torch==2.9.1/setuptools==80.9.0 and ManiSkill's gymnasium==0.29.1; keep it in its own
-  # resolution fork so the other extras' locked versions are unaffected.
-  [
-    { extra = "robomme" },
-    { extra = "libero" },
-    { extra = "libero-mem" },
-    { extra = "robosuite" },
-    { extra = "molmo" },
-    { extra = "verl" },
-  ],
+  # resolution fork so the other extras' locked versions are unaffected. (Pairwise: a single group
+  # would also make libero/molmo/verl/... mutually exclusive with each other.)
+  [{ extra = "robomme" }, { extra = "libero" }],
+  [{ extra = "robomme" }, { extra = "libero-mem" }],
+  [{ extra = "robomme" }, { extra = "robosuite" }],
+  [{ extra = "robomme" }, { extra = "molmo" }],
+  [{ extra = "robomme" }, { extra = "verl" }],
 ]
 
 [build-system]

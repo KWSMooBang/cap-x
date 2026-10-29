@@ -81,10 +81,23 @@ class LiberoMemHandle(LiberoHandle):
         return obs, info
 
     def step(self, action: list[float]) -> tuple[Any, float, bool, dict[str, Any]]:
-        obs, reward, done, info = super().step(action)
-        # Advance the sequential-subgoal tracker exactly like upstream evaluation.
-        self.env.env._check_success(inc=True)
+        obs, _, _, info = self.env.step(action)
+        # Advance the sequential-subgoal tracker exactly like upstream evaluation, then
+        # compute reward/done from the updated progress (the env's own values predate it).
+        problem = self.env.env
+        problem._check_success(inc=True)
+        done = self.task_success()
+        reward = 1.0 if done else 0.0  # LIBERO's sparse completion reward
         return obs, reward, done, info
+
+    def task_success(self) -> bool:
+        """Full-task success. Upstream ``_check_success()`` also returns True on the step an
+        intermediate subgoal is appended, so require the whole sequence for Sequence/Or goals."""
+        problem = self.env.env
+        is_sequential = problem.parsed_problem["goal_state"][0][0] in ("sequence", "or")
+        if is_sequential and len(problem._satisfied_subgoals) < self.num_subgoals:
+            return False
+        return bool(problem._check_success())
 
     def reset_progress(self) -> None:
         self.env.env.reset_subgoal_progress()

@@ -58,6 +58,7 @@ class RoboMMEEnv(BaseEnv):
         self._gripper = 1.0
         self._reward = 0.0
         self._step_count = 0
+        self._episode_over = False
         self.reset()
 
     def _load(self, episode_idx: int) -> RoboMMEHandle:
@@ -82,6 +83,7 @@ class RoboMMEEnv(BaseEnv):
         self._gripper = 1.0
         self._reward = 0.0
         self._step_count = 0
+        self._episode_over = False
         obs = self.get_observation()
         info = {"task_prompt": self.handle.task_goal(), "memory": obs["memory"]}
         return obs, info
@@ -90,6 +92,7 @@ class RoboMMEEnv(BaseEnv):
         _, self._reward, terminated, truncated, info = self.handle.step(np.asarray(action, dtype=np.float64))
         self._step_count += 1
         truncated = truncated or self._step_count >= self.max_steps
+        self._episode_over = terminated or truncated or info.get("status") not in (None, "ongoing")
         return self.get_observation(), self._reward, terminated, truncated, info
 
     # ----------------------- joint-control interface (as FrankaLiberoEnv) -----------------------
@@ -104,12 +107,13 @@ class RoboMMEEnv(BaseEnv):
         target = np.asarray(joints, dtype=np.float64).reshape(7)
         action = np.concatenate([target, [self._gripper * 2.0 - 1.0]])
         for _ in range(max_steps):
-            self.step(action)
+            if self._episode_over:
+                break
+            _, _, terminated, truncated, info = self.step(action)
             current = np.asarray(self.handle.last_obs["joint_state_list"][-1], dtype=np.float64)[:7]
-            if np.linalg.norm(current - target) < tolerance or self.handle.last_info.get("status") not in (
-                None,
-                "ongoing",
-            ):
+            if terminated or truncated or info.get("status") not in (None, "ongoing"):
+                break
+            if np.linalg.norm(current - target) < tolerance:
                 break
 
     # ----------------------------------- observation -----------------------------------
