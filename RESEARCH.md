@@ -20,3 +20,5 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 ## GPU 예산
 - 미정 (main-control [BUDGET] 대기)
 - 2026-10-29: 사람 지시로 현재 GPU 사용 금지 (bench-setup 은 CPU 만). 해제 지시 전까지 GPU run 을 제출하지 않는다.
+- 2026-10-29: 이 서버는 쓸 GPU 가 없음. 남은 환경 설정(RoboMME 카메라 렌더링 등 GPU 필요한 부분)은
+  kubectl 서버 전용 세션 baccus_cap-bg 가 진행 (RoboMME: lavapipe 로는 렌더 불가 → NVIDIA Vulkan ICD 필요).
