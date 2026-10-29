@@ -54,10 +54,16 @@ source .venv-robomme/bin/activate
 uv sync --active --extra robomme
 ```
 
-- **SAPIEN needs a Vulkan device even to build a scene.** On a GPU host, the NVIDIA Vulkan ICD must be present
-  (`/usr/share/vulkan/icd.d/nvidia_icd.json`, and `NVIDIA_DRIVER_CAPABILITIES` must include `graphics`). For CPU
-  rendering, install lavapipe: `apt install mesa-vulkan-drivers`. Without either, env creation segfaults in
-  `sapien_env._setup_scene`.
+- **SAPIEN needs a Vulkan ICD even to build a scene.** On a GPU host, the NVIDIA Vulkan ICD must be present
+  (`/usr/share/vulkan/icd.d/nvidia_icd.json`, and `NVIDIA_DRIVER_CAPABILITIES` must include `graphics`). Without any
+  ICD, env creation segfaults in `sapien_env._setup_scene`.
+- **CPU (lavapipe, `mesa-vulkan-drivers`): state only, no camera images.** With
+  `VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.x86_64.json`, raw ManiSkill envs work with
+  `obs_mode="state", render_backend="none"`. Images do not work. SAPIEN exposes lavapipe only as
+  `pci:0000:00:00.0`, and ManiSkill's `parse_backend_device_id` splits that string on every `:` (ValueError).
+  ManiSkill's `"cpu"` fallback device cannot render. `BenchmarkEnvBuilder` hard-codes
+  `obs_mode="rgb+depth+segmentation"`, so `RoboMMEEnv` needs the NVIDIA ICD until ManiSkill parses `pci:` device
+  ids (e.g. `split(":", 1)`).
 - Envs: `capx.envs.simulators.robomme.RoboMMEEnv(task_id="PickXtimes", episode_idx=0, dataset="test")`, registered
   as `robomme_<TaskID>_low_level`. Actions use RoboMME's `joint_angle` space: absolute 7 joints plus a gripper value
   (+1 open, -1 closed). `reset(seed=k)` picks episode `(k-1) % n` of the split.
