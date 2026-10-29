@@ -53,6 +53,9 @@ if TYPE_CHECKING:
 
 
 MULTITURN_LIMIT = 10
+# Wall-clock budget per trial attempt in seconds, counted from after env.reset(); the
+# ``trial_timeout_s`` config key overrides it.
+TRIAL_TIMEOUT_SECONDS = 1000
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -655,7 +658,11 @@ def _run_single_trial(
     import signal
     remaining = signal.alarm(0)  # cancel current alarm
     if remaining > 0:
-        signal.alarm(1000)  # restart fresh 1000s from now
+        budget = config.get("trial_timeout_s")
+        budget = max(1, int(TRIAL_TIMEOUT_SECONDS if budget is None else budget))
+        signal.alarm(budget)  # restart the full budget from now
+        if partial_artifacts is not None:
+            partial_artifacts["deadline"] = time.monotonic() + budget
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
 

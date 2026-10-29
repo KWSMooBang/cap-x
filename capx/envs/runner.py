@@ -21,6 +21,7 @@ from tqdm import tqdm
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase, TrialTimeout
 from capx.envs.trial import (
+    TRIAL_TIMEOUT_SECONDS,
     _annotate_code_blocks,
     _build_log_lines,
     _run_single_trial,
@@ -37,7 +38,6 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 # Constants
 # ---------------------------------------------------------------------------
 
-TRIAL_TIMEOUT_SECONDS = 1000
 MAX_TRIAL_RETRIES = 3
 # After the deadline, SIGALRM re-fires at this interval until the trial unwinds.
 TIMEOUT_REFIRE_SECONDS = 2
@@ -324,7 +324,8 @@ def _run_single_trial_with_timeout(
         error: BaseException = exc
     else:
         signal.alarm(0)
-        if not timed_out and time.monotonic() < deadline:
+        # The trial restarts the budget after env.reset() and records the new deadline.
+        if not timed_out and time.monotonic() < partial_artifacts.get("deadline", deadline):
             return summary
         # The deadline passed, but no alarm escaped (swallowed, or not yet handled) before return.
         error = TrialTimeout(f"Trial {trial} exceeded {timeout_seconds} seconds")

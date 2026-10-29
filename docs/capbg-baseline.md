@@ -99,7 +99,8 @@ you commit. Example with Nebius (OpenAI-compatible chat-completions endpoint):
 
 ## Trial timeout
 
-Each trial attempt has a wall-clock budget (`trial_timeout_s`, default 1000 s) and is retried on timeout up to
+Each trial attempt has a wall-clock budget (`trial_timeout_s`, default 1000 s, counted from after `env.reset()`)
+and is retried on timeout up to
 `max_trial_retries` times (default 3). Both can be set in the YAML or on the CLI (`--trial-timeout-s`,
 `--max-trial-retries`). For baselines, use `--max-trial-retries 1`: with an enforced timeout, a retry re-rolls a
 slow trial and biases the success rate up. The budget includes model latency, so a timeout mixes slow API calls
