@@ -27,3 +27,6 @@
 [submodule "capx/third_party/LIBERO-Mem"]
 	path = capx/third_party/LIBERO-Mem
 	url = https://github.com/libero-mem/libero-mem.git
+[submodule "capx/third_party/RoboMME"]
+	path = capx/third_party/RoboMME
+	url = https://github.com/RoboMME/robomme_benchmark.git

@@ -36,3 +36,34 @@ uv run --no-sync python scripts/bench_smoke.py \
 ```
 
 Full run: `python capx/envs/launch.py --config-path env_configs/libero_mem/franka_libero_mem_6_swap_bowls.yaml`.
+
+## RoboMME
+
+[RoboMME](https://robomme.github.io) ([arXiv 2603.04639](https://arxiv.org/abs/2603.04639)) has 16 ManiSkill3/SAPIEN
+Panda tasks in 4 suites: Counting, Permanence, Reference and Imitation.
+
+- Submodule: `capx/third_party/RoboMME` → https://github.com/RoboMME/robomme_benchmark. Its own nested submodules
+  are baseline policies and are not needed: run `git submodule update --init capx/third_party/RoboMME` without
+  `--recursive`.
+- Requires Python >= 3.11, `torch==2.9.1` and the ManiSkill fork pinned by RoboMME (`YinpeiDai/ManiSkill@07be6fb`).
+  The `robomme` extra is exclusive with `libero`, `libero-mem`, `robosuite`, `molmo` and `verl`:
+
+```bash
+uv venv .venv-robomme --python 3.12
+source .venv-robomme/bin/activate
+uv sync --active --extra robomme
+```
+
+- **SAPIEN needs a Vulkan device even to build a scene.** On a GPU host, the NVIDIA Vulkan ICD must be present
+  (`/usr/share/vulkan/icd.d/nvidia_icd.json`, and `NVIDIA_DRIVER_CAPABILITIES` must include `graphics`). For CPU
+  rendering, install lavapipe: `apt install mesa-vulkan-drivers`. Without either, env creation segfaults in
+  `sapien_env._setup_scene`.
+- Envs: `capx.envs.simulators.robomme.RoboMMEEnv(task_id="PickXtimes", episode_idx=0, dataset="test")`, registered
+  as `robomme_<TaskID>_low_level`. Actions use RoboMME's `joint_angle` space: absolute 7 joints plus a gripper value
+  (+1 open, -1 closed). `reset(seed=k)` picks episode `(k-1) % n` of the split.
+- Memory state: `obs["memory"]` holds `task_goal`, `simple_subgoal_online`, `grounded_subgoal_online` and `status`,
+  plus `reset_obs_lists`: all frames returned at reset, including the conditioning video for Video* tasks.
+  `obs["obs_lists"]` holds every frame from the latest step.
+- No cap-x control API is registered for RoboMME yet (`apis: []` in `env_configs/robomme/*.yaml`).
+
+Smoke test (needs Vulkan): `uv run --no-sync python scripts/bench_smoke.py --config-path env_configs/robomme/robomme_pickxtimes.yaml`

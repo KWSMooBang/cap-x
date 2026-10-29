@@ -77,6 +77,18 @@ try:
 except Exception:
     print("LIBERO-Mem not installed!")
 
+# Using RoboMME run: uv sync --extra robomme  (Python >= 3.11; SAPIEN needs a Vulkan device)
+try:
+    from .robomme import RoboMMEEnv
+    from capx.integrations.robomme import ROBOMME_TASKS
+
+    # Usage in YAML: low_level: robomme_<TaskID>_low_level, e.g. robomme_PickXtimes_low_level
+    import functools
+    for _task in ROBOMME_TASKS:
+        register_env(f"robomme_{_task}_low_level", functools.partial(RoboMMEEnv, task_id=_task))
+except Exception:
+    print("RoboMME not installed!")
+
 try:
     from .r1pro_b1k import R1ProBehaviourLowLevel
     register_env("r1pro_b1k_low_level", R1ProBehaviourLowLevel)

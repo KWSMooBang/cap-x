@@ -72,11 +72,14 @@ uv sync --active --extra libero --extra contactgraspnet
 
 See [docs/libero-tasks.md](docs/libero-tasks.md) for running any of 130+ LIBERO tasks.
 
-#### Memory benchmarks (LIBERO-Mem)
+#### Memory benchmarks (LIBERO-Mem, RoboMME)
 
 ```bash
 uv venv .venv-libero-mem --python 3.12 && source .venv-libero-mem/bin/activate
 uv sync --active --extra libero-mem --extra contactgraspnet   # exclusive with --extra libero
+
+uv venv .venv-robomme --python 3.12 && source .venv-robomme/bin/activate
+uv sync --active --extra robomme                              # ManiSkill3/SAPIEN; needs a Vulkan device
 ```
 
 See [docs/memory-benchmarks.md](docs/memory-benchmarks.md).
