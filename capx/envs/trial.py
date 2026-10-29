@@ -718,6 +718,7 @@ def _run_single_trial(
             )
 
     # --- 3. Initial code generation ---
+    query_start = time.time()
     if config["use_oracle_code"]:
         raw_code = env.oracle_code
         with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
@@ -726,6 +727,7 @@ def _run_single_trial(
         ensemble_data = None
     else:
         raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+    initial_query_s = time.time() - query_start
 
     # Initialize partial artifacts for timeout recovery
     if partial_artifacts is not None:
@@ -756,6 +758,7 @@ def _run_single_trial(
         "decision": "initial",
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
+        "query_s": round(initial_query_s, 2),
     })
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
@@ -784,7 +787,9 @@ def _run_single_trial(
         # Record frame index before step
         frame_start = env.get_video_frame_count() if recording_frames else 0
 
+        exec_start = time.time()
         obs_next, reward, terminated, truncated, info_step = env.step(code)
+        exec_s = time.time() - exec_start
 
         # Record frame index after step
         frame_end = env.get_video_frame_count() if recording_frames else 0
@@ -816,6 +821,7 @@ def _run_single_trial(
                         frame_start, frame_end,
                     )
 
+            decision_start = time.time()
             decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
                 env, obs, args, config, visual_differencing_args,
                 multi_turn_prompt, code_blocks, code_block_idx, info_step,
@@ -825,6 +831,7 @@ def _run_single_trial(
                 wrist_turn_frames=wrist_turn_frames,
                 wrist_base64_history=wrist_base64_history,
             )
+            decision_s = time.time() - decision_start
 
             if mt_ensemble is not None:
                 mt_ensemble["regeneration"] = num_regenerations + 1
@@ -839,6 +846,8 @@ def _run_single_trial(
                     "code_blocks": new_blocks,
                     "decision": "regenerate",
                     "reasoning": mt_reasoning if mt_reasoning is not None else "",
+                    "exec_s": round(exec_s, 2),
+                    "decision_s": round(decision_s, 2),
                 })
                 del code_blocks[code_block_idx:]
                 del code_block_metadata[code_block_idx:]
@@ -856,6 +865,8 @@ def _run_single_trial(
                 all_responses.append({
                     "decision": "finish",
                     "reasoning": mt_reasoning if mt_reasoning is not None else (new_code or ""),
+                    "exec_s": round(exec_s, 2),
+                    "decision_s": round(decision_s, 2),
                 })
                 print("Model chose to finish")
                 num_finishes += 1

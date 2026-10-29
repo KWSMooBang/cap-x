@@ -97,6 +97,19 @@ you commit. Example with Nebius (OpenAI-compatible chat-completions endpoint):
   `docs/memory-benchmarks.md`): `MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1`. That path is
   much slower (CPU rendering, no JIT) and is meant for smoke checks, not evaluation.
 
+## Trial timeout
+
+Each trial attempt has a wall-clock budget (`trial_timeout_s`, default 1000 s) and is retried on timeout up to
+`max_trial_retries` times (default 3). Both can be set in the YAML or on the CLI (`--trial-timeout-s`,
+`--max-trial-retries`). For baselines, use `--max-trial-retries 1`: with an enforced timeout, a retry re-rolls a
+slow trial and biases the success rate up. The budget includes model latency, so a timeout mixes slow API calls
+with task failure; report timeouts separately.
+
+Known limitations of the SIGALRM timeout (the robust fix is killing the worker process from outside):
+
+- After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
+- Generated code that loops forever inside a bare `except:` can still swallow every alarm.
+
 ## Running on kubectl
 
 GPU pods are killed after 30 minutes without GPU use. Do `uv sync`, submodule checkout and other CPU-only work

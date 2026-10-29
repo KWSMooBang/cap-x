@@ -11,6 +11,7 @@ import functools
 import os
 import signal
 import sys
+import time
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -202,8 +203,14 @@ def _run_trial_with_retries(
     multi_turn_prompt: str | None,
 ) -> TrialSummary:
     """Attempt a trial up to ``max_trial_retries`` times, retrying on timeout."""
-    timeout_s = config.get("trial_timeout_s") or TRIAL_TIMEOUT_SECONDS
-    max_retries = config.get("max_trial_retries") or MAX_TRIAL_RETRIES
+    timeout_s = config.get("trial_timeout_s")
+    timeout_s = TRIAL_TIMEOUT_SECONDS if timeout_s is None else timeout_s
+    max_retries = config.get("max_trial_retries")
+    max_retries = MAX_TRIAL_RETRIES if max_retries is None else max_retries
+    if timeout_s <= 0:
+        raise ValueError(f"trial_timeout_s must be > 0, got {timeout_s}")
+    if max_retries < 1:
+        raise ValueError(f"max_trial_retries must be >= 1, got {max_retries}")
     for attempt in range(max_retries):
         try:
             is_last_attempt = attempt == max_retries - 1
@@ -296,6 +303,7 @@ def _run_single_trial_with_timeout(
         raise TrialTimeout(f"Trial {trial} exceeded {timeout_seconds} seconds")
 
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+    deadline = time.monotonic() + timeout_seconds
     signal.alarm(timeout_seconds)
     partial_artifacts: dict[str, Any] = {}
     try:
@@ -316,9 +324,9 @@ def _run_single_trial_with_timeout(
         error: BaseException = exc
     else:
         signal.alarm(0)
-        if not timed_out:
+        if not timed_out and time.monotonic() < deadline:
             return summary
-        # The deadline passed, but the sandbox swallowed every alarm until the trial returned.
+        # The deadline passed, but no alarm escaped (swallowed, or not yet handled) before return.
         error = TrialTimeout(f"Trial {trial} exceeded {timeout_seconds} seconds")
     finally:
         signal.alarm(0)
