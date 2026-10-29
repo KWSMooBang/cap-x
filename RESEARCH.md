@@ -16,6 +16,10 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
   env_configs/libero/franka_libero_cap_agent0.yaml(논문 CaP-Agent0 설정)과 hillclimb ensemble_*/multimodel_* 변형.
   upstream YAML 은 논문 설정 기록으로 두고, 그 YAML 로 돌릴 때는 --use-parallel-ensemble False --use-multimodel False 를 준다.
   앙상블은 필요할 때 ablation 으로만 켠다.
+- 2026-10-30: 기준선 trial 예산 (사람이 kubectl 세션에 승인): --trial-timeout-s 1800 --max-trial-retries 1, timeout 은 실패로 집계.
+  배경: 원래 runner 의 1000s SIGALRM timeout 이 sandbox(except BaseException)에 삼켜져 사실상 동작하지 않았음 → exp/trial-timeout 에서 수정.
+  재시도 3회를 그대로 두면 timeout 난 trial 을 다시 굴려 성공률이 위로 편향됨. 종료 사유(success / FINISH 후 실패 / 턴 한도 / timeout)는 따로 집계한다.
+  주의: 논문 수치도 이 버그가 있는 harness 에서 나왔을 가능성 → LIBERO-PRO 를 논문과 비교할 때 timeout 설정 차이를 적는다.
 
 ## 백로그
 1. [완료·bg 병합 b9c0046] bench-setup: LIBERO-Mem·RoboMME submodule + uv extra + cap-x wrapper (RoboMME 카메라 렌더링은 kubectl 쪽에서 진행)
