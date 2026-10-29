@@ -30,10 +30,16 @@ uv sync --active --extra libero-mem --extra contactgraspnet
 Smoke test (CPU rendering):
 
 ```bash
-CUDA_VISIBLE_DEVICES="" MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa \
+CUDA_VISIBLE_DEVICES="" MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1 \
 uv run --no-sync python scripts/bench_smoke.py \
     --config-path env_configs/libero_mem/franka_libero_mem_6_swap_bowls.yaml --out-dir outputs/bench_smoke/libero_mem_6
 ```
+
+`NUMBA_DISABLE_JIT=1` is needed when `libOSMesa` comes from apt (Ubuntu 24.04): it links the system `libLLVM`,
+which clashes with llvmlite's bundled LLVM and segfaults when robosuite JIT-compiles on `reset`. It makes the
+first reset slow (~50 s). EGL is not a workaround on Python 3.12: LIBERO-Mem's bundled robosuite 1.4.1 fails to
+create an EGL context with the locked PyOpenGL 3.1.6 (`No array-type handler for type _ctypes.CArgObject`), so
+use OSMesa even on GPU nodes.
 
 Full run: `python capx/envs/launch.py --config-path env_configs/libero_mem/franka_libero_mem_6_swap_bowls.yaml`.
 
