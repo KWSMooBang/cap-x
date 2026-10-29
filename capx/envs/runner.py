@@ -18,7 +18,7 @@ from typing import Any
 from tqdm import tqdm
 
 from capx.envs.configs.instantiate import instantiate
-from capx.envs.tasks.base import CodeExecutionEnvBase
+from capx.envs.tasks.base import CodeExecutionEnvBase, TrialTimeout
 from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
@@ -38,6 +38,8 @@ from capx.utils.parallel_eval import run_parallel_with_setup
 
 TRIAL_TIMEOUT_SECONDS = 1000
 MAX_TRIAL_RETRIES = 3
+# After the deadline, SIGALRM re-fires at this interval until the trial unwinds.
+TIMEOUT_REFIRE_SECONDS = 2
 
 
 # ---------------------------------------------------------------------------
@@ -199,21 +201,23 @@ def _run_trial_with_retries(
     config: dict[str, Any],
     multi_turn_prompt: str | None,
 ) -> TrialSummary:
-    """Attempt a trial up to MAX_TRIAL_RETRIES times, retrying on timeout."""
-    for attempt in range(MAX_TRIAL_RETRIES):
+    """Attempt a trial up to ``max_trial_retries`` times, retrying on timeout."""
+    timeout_s = config.get("trial_timeout_s") or TRIAL_TIMEOUT_SECONDS
+    max_retries = config.get("max_trial_retries") or MAX_TRIAL_RETRIES
+    for attempt in range(max_retries):
         try:
-            is_last_attempt = attempt == MAX_TRIAL_RETRIES - 1
+            is_last_attempt = attempt == max_retries - 1
             return _run_single_trial_with_timeout(
                 env=env,
                 trial=trial,
                 args=args,
                 config=config,
                 multi_turn_prompt=multi_turn_prompt,
-                timeout_s=TRIAL_TIMEOUT_SECONDS,
+                timeout_s=timeout_s,
                 raise_on_timeout=not is_last_attempt,
             )
         except TimeoutError:
-            print(f"Trial {trial} timed out (attempt {attempt + 1}/{MAX_TRIAL_RETRIES}). Retrying...")
+            print(f"Trial {trial} timed out (attempt {attempt + 1}/{max_retries}). Retrying...")
 
     # All retries exhausted
     return TrialSummary(
@@ -223,7 +227,7 @@ def _run_trial_with_retries(
         terminated=False,
         truncated=True,
         sandbox_rc=1,
-        log=f"Trial {trial} failed after {MAX_TRIAL_RETRIES} timeout retries",
+        log=f"Trial {trial} failed after {max_retries} timeout retries",
         task_completed=False,
         code_path=None,
         num_regenerations=0,
@@ -287,16 +291,19 @@ def _run_single_trial_with_timeout(
     def _timeout_handler(signum: int, frame) -> None:  # type: ignore[override]
         nonlocal timed_out
         timed_out = True
-        raise TimeoutError(f"Trial {trial} exceeded {timeout_seconds} seconds")
+        # Keep firing until the trial unwinds, in case generated code uses a bare ``except:``.
+        signal.alarm(TIMEOUT_REFIRE_SECONDS)
+        raise TrialTimeout(f"Trial {trial} exceeded {timeout_seconds} seconds")
 
     previous_handler = signal.signal(signal.SIGALRM, _timeout_handler)
     signal.alarm(timeout_seconds)
     partial_artifacts: dict[str, Any] = {}
     try:
-        return _run_single_trial(
+        summary = _run_single_trial(
             env, trial, args, config, multi_turn_prompt, partial_artifacts=partial_artifacts
         )
     except BaseException as exc:
+        signal.alarm(0)
         is_timeout = timed_out or isinstance(exc, TimeoutError)
         try:
             import requests as _requests
@@ -306,14 +313,21 @@ def _run_single_trial_with_timeout(
 
         if not is_timeout:
             raise
-        if raise_on_timeout:
-            raise TimeoutError(f"Trial {trial} timed out") from exc
-
-        print(f"Trial {trial} timed out after {timeout_seconds} seconds")
-        return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, exc)
+        error: BaseException = exc
+    else:
+        signal.alarm(0)
+        if not timed_out:
+            return summary
+        # The deadline passed, but the sandbox swallowed every alarm until the trial returned.
+        error = TrialTimeout(f"Trial {trial} exceeded {timeout_seconds} seconds")
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_handler)
+
+    if raise_on_timeout:
+        raise TimeoutError(f"Trial {trial} timed out") from error
+    print(f"Trial {trial} timed out after {timeout_seconds} seconds")
+    return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, error)
 
 
 def _build_timeout_summary(

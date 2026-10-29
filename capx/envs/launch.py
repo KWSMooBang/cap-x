@@ -97,6 +97,12 @@ class LaunchArgs:
     num_workers: int | None = None
     """Number of parallel worker processes to use. Overrides the value in the YAML config."""
 
+    trial_timeout_s: float | None = None
+    """Wall-clock budget per trial attempt in seconds (default 1000). Overrides the YAML config."""
+
+    max_trial_retries: int | None = None
+    """Attempts per trial on timeout; 1 disables retries (default 3). Overrides the YAML config."""
+
     record_video: bool | None = None
     """Whether to record and save videos of the environment execution."""
 

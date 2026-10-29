@@ -15,6 +15,14 @@ from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
 
 
+class TrialTimeout(BaseException):
+    """Raised by the runner's SIGALRM handler when a trial exceeds its wall-clock budget.
+
+    A BaseException so that ``except Exception`` in generated code cannot swallow it; the code
+    sandboxes below re-raise it instead of reporting it as a code error.
+    """
+
+
 class Tee(io.TextIOBase):
     """This allows streaming stdout and stderr to both the console and a buffer
     (enables breakpointing for debugging!)
@@ -78,6 +86,8 @@ class SimpleExecutor:
         try:
             exec(code, g, g)
             return {"ok": True, "result": g.get("RESULT")}
+        except TrialTimeout:
+            raise
         except BaseException as exc:  # defensive; propagate minimal info
             return {"ok": False, "error": repr(exc)}
 
@@ -172,6 +182,8 @@ class CodeExecutionEnvBase(Env):
                 contextlib.redirect_stderr(tee_err),
             ):
                 exec(code, self._exec_globals, self._exec_globals)
+        except TrialTimeout:
+            raise
         except BaseException:  # defensive; propagate minimal info
             ok = False
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
