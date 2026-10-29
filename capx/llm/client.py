@@ -42,6 +42,8 @@ VLM_MODELS = [
     "deepseek/deepseek-r1",
     "qwen/qwen3.5-122b-a10b",
     "moonshotai/kimi-k2",
+    "moonshotai/Kimi-K3",
+    "Qwen/Qwen3.8-27B",
 ]
 CLAUDE_MODELS = ["anthropic/claude-opus-4-5", "anthropic/claude-haiku-4-5"]
 OSS_MODELS = [
@@ -50,6 +52,8 @@ OSS_MODELS = [
     "deepseek/deepseek-r1",
     "qwen/qwen3.5-122b-a10b",
     "moonshotai/kimi-k2",
+    "moonshotai/Kimi-K3",
+    "Qwen/Qwen3.8-27B",
 ]
 OPENROUTER_MODELS = [
     "openrouter/google/gemini-2.5-pro-preview",

@@ -1,1 +1,11 @@
 mesa-vulkan-drivers
+libx11-6
+libxext6
+libxrender1
+libsm6
+libgl1
+libegl1
+libosmesa6
+libglib2.0-0
+libgomp1
+ffmpeg
