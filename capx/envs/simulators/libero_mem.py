@@ -8,8 +8,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
-
 from capx.integrations.libero_mem import (
     SUITE_NAME,
     ensure_libero_mem_importable,
@@ -57,16 +55,6 @@ class FrankaLiberoMemEnv(FrankaLiberoEnv):
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         obs, info = super().reset(seed=seed, options=options)
-        init_states = self.handle.init_states
-        if init_states is not None and len(init_states) > 0:
-            # FrankaLiberoEnv.reset() calls env.reset() after set_init_state(), and the hard reset
-            # re-samples the BDDL placement. Re-apply the init state so upstream layouts are used.
-            idx = 0 if seed is None else (seed - 1) % len(init_states)
-            self._current_obs = self.handle.env.set_init_state(init_states[idx])
-            self._current_joints = self.handle.env.sim.data.qpos[:7].copy()
-            self.home_joint_position = np.array(self._current_obs["robot0_joint_pos"], dtype=np.float64)
-            for _ in range(10):
-                self._step_once()
         # Upstream eval resets progress after placing the init state and settling.
         self.handle.reset_progress()
         obs = self.get_observation()
