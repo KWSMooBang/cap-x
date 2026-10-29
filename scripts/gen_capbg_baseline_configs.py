@@ -150,7 +150,8 @@ def build() -> dict[Path, str]:
             title=f"LIBERO-Mem task {task_id} ({upstream_name})",
             extra="--extra libero-mem",
             requires="uv sync --active --extra libero-mem --extra contactgraspnet (.venv-libero-mem); "
-            "MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1",
+            "GPU: MUJOCO_GL=egl PYOPENGL_PLATFORM=egl; CPU only: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa "
+            "NUMBA_DISABLE_JIT=1",
             path=f"env_configs/capbg_baseline/{rel.as_posix()}",
             code_env="capx.envs.tasks.franka.franka_libero_mem_env.FrankaLiberoMemCodeEnv",
             low_level="capx.envs.simulators.libero_mem.FrankaLiberoMemEnv",

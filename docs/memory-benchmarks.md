@@ -37,9 +37,9 @@ uv run --no-sync python scripts/bench_smoke.py \
 
 `NUMBA_DISABLE_JIT=1` is needed when `libOSMesa` comes from apt (Ubuntu 24.04): it links the system `libLLVM`,
 which clashes with llvmlite's bundled LLVM and segfaults when robosuite JIT-compiles on `reset`. It makes the
-first reset slow (~50 s). EGL is not a workaround on Python 3.12: LIBERO-Mem's bundled robosuite 1.4.1 fails to
-create an EGL context with the locked PyOpenGL 3.1.6 (`No array-type handler for type _ctypes.CArgObject`), so
-use OSMesa even on GPU nodes.
+first reset slow (~50 s). On GPU nodes, use `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl` instead. LIBERO-Mem's bundled
+robosuite 1.4.1 cannot create an EGL context with the locked PyOpenGL 3.1.6 on Python 3.12 (`No array-type
+handler for type _ctypes.CArgObject`), so `capx.envs.simulators.libero_mem` patches its `EGLGLContext` on import.
 
 Full run: `python capx/envs/launch.py --config-path env_configs/libero_mem/franka_libero_mem_6_swap_bowls.yaml`.
 

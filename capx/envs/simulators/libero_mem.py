@@ -12,9 +12,11 @@ from capx.integrations.libero_mem import (
     SUITE_NAME,
     ensure_libero_mem_importable,
     load_libero_mem_task,
+    patch_robosuite_egl_context,
 )
 
 ensure_libero_mem_importable()
+patch_robosuite_egl_context()
 
 from .libero import FrankaLiberoEnv  # noqa: E402
 

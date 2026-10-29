@@ -91,10 +91,11 @@ you commit. Example with Nebius (OpenAI-compatible chat-completions endpoint):
 ## Rendering
 
 - **LIBERO-PRO:** on GPU nodes, `MUJOCO_GL=egl` works (it is also the default set by `launch.py`).
-- **LIBERO-Mem:** use OSMesa even on GPU nodes, and `NUMBA_DISABLE_JIT=1` (see `docs/memory-benchmarks.md`):
-  `MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1`. EGL fails with LIBERO-Mem's robosuite 1.4.1
-  on Python 3.12, and the OSMesa/llvmlite LLVM clash segfaults without the numba flag. The first reset takes
-  about 20–50 s.
+- **LIBERO-Mem:** on GPU nodes, use `MUJOCO_GL=egl PYOPENGL_PLATFORM=egl`. LIBERO-Mem's robosuite 1.4.1 EGL
+  context fails with PyOpenGL 3.1.6 on Python 3.12; `capx.envs.simulators.libero_mem` patches it on import
+  (`patch_robosuite_egl_context`). Without a GPU, use OSMesa with `NUMBA_DISABLE_JIT=1` (see
+  `docs/memory-benchmarks.md`): `MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1`. That path is
+  much slower (CPU rendering, no JIT) and is meant for smoke checks, not evaluation.
 
 ## Running on kubectl
 
@@ -105,7 +106,7 @@ LIBERO-Mem (Molmo server already running):
 
 ```bash
 source .venv-libero-mem/bin/activate
-MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1 \
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl \
 uv run --no-sync --active capx/envs/launch.py \
     --config-path env_configs/capbg_baseline/libero_mem/task_06_swap_bowls.yaml \
     --model moonshotai/Kimi-K3 --server-url "$NEBIUS_SERVER_URL" --api-key "$NEBIUS_API_KEY" \

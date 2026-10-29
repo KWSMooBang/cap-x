@@ -118,6 +118,54 @@ class LiberoMemHandle(LiberoHandle):
         }
 
 
+def patch_robosuite_egl_context() -> None:
+    """Make LIBERO-Mem's robosuite 1.4.1 EGL context work on Python 3.12 with PyOpenGL 3.1.6.
+
+    Its ``EGLGLContext.__init__`` passes ``ctypes.byref(config)`` to ``eglChooseConfig``, which
+    PyOpenGL 3.1.6 rejects (``No array-type handler for type _ctypes.CArgObject``). Pass the
+    ``EGLConfig`` itself instead, as the robosuite fork used for LIBERO-PRO does. No-op unless
+    ``MUJOCO_GL=egl``.
+    """
+    if os.environ.get("MUJOCO_GL") != "egl":
+        return
+    import atexit
+    import ctypes
+
+    from robosuite.renderers.context import egl_context
+
+    EGL = egl_context.EGL
+
+    def __init__(self, max_width, max_height, device_id=0):
+        del max_width, max_height  # unused
+        num_configs = ctypes.c_long()
+        config = EGL.EGLConfig()
+        EGL.eglReleaseThread()
+        if egl_context.EGL_DISPLAY is None:
+            display = egl_context.create_initialized_egl_device_display(device_id=device_id)
+            if display == EGL.EGL_NO_DISPLAY:
+                raise ImportError("Cannot initialize an EGL device display.")
+            egl_context.EGL_DISPLAY = display
+            atexit.register(EGL.eglTerminate, display)
+        display = egl_context.EGL_DISPLAY
+        EGL.eglChooseConfig(display, egl_context.EGL_ATTRIBUTES, config, 1, num_configs)
+        if num_configs.value < 1:
+            raise RuntimeError(f"EGL found no framebuffer config for {egl_context.EGL_ATTRIBUTES}")
+        EGL.eglBindAPI(EGL.EGL_OPENGL_API)
+        self._context = EGL.eglCreateContext(display, config, EGL.EGL_NO_CONTEXT, None)
+        if not self._context:
+            raise RuntimeError("Cannot create an EGL context.")
+
+    def __del__(self):
+        # At interpreter exit eglTerminate (atexit) may run first; freeing then raises EGLError.
+        try:
+            self.free()
+        except Exception:
+            pass
+
+    egl_context.EGLGLContext.__init__ = __init__
+    egl_context.EGLGLContext.__del__ = __del__
+
+
 def _load_init_states(task_name: str) -> Any:
     """Pregenerated init states. Upstream only ships these for a few tasks (scripts/__init_data);
     for the rest, BDDL placement sampling on reset is used."""
