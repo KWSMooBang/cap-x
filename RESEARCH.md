@@ -42,6 +42,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     원칙: 두 조건(기준선·BG)에 같은 하네스. BG 가 풀 문제(완료 판단·이력 기억)는 하네스에 넣지 않는다.
     init 생성: task 1–5 통과율 33.6% (탈락 대부분 plate contact), task 9 100%. task 1–5 는 물체·영역 정의가 같아
     같은 seed 로 같은 50개 배치가 나옴 → 그대로 사용 (같은 장면에서 지시만 다른 통제된 비교; task 0 은 upstream 세트).
+1i. 영상 프레임을 메모리에 쌓지 않고 디스크로 바로 쓰기 (800x512 프레임이 4 step 마다 trial 끝까지 RAM 에 쌓여 worker 당 수 GB →
+    40Gi pod 에서 worker 5 가 OOM, 2026-10-30 파일럿은 worker 3 으로 대응). 에이전트가 보는 VDM 이미지와는 별개 경로라 결과엔 영향 없음.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
