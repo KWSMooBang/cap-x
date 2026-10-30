@@ -26,7 +26,7 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
   그 전 LIBERO-Mem run(20261029_mem_pilot_*, 5x5 run)은 'seg on (느린 경로)' 조건으로 기록.
 - 2026-10-30: 비교 run 평가 설계 — CaP-Agent0 API(FrankaLiberoApiReducedSkillLibrary) 그대로 유지 (사람 결정 '그대로').
   정답 위치 API 진단 실험은 하지 않음. 주 지표는 하위 목표 진행률·기억 관련 실패 비율·완료 후 계속 행동 비율.
-- 2026-10-30: 판단 프롬프트에 목표 문장이 채워지지 않는 원본 버그('Goal: {libero_environment_goal}')를 모든 조건에 고친다 (사람 승인).
+- 2026-10-30: 판단 프롬프트에 목표 문장이 채워지지 않는 원본 버그('Goal: {libero_environment_goal}')를 모든 조건에 고친다 (사람 승인). exp/goal-in-prompts 병합 완료.
 - 2026-10-30: 비교 파일럿 = none(같은 커밋으로 재실행) / vdm_history / bg_oracle × task_00..09 × 5 trial, goal-in-prompts 병합 커밋으로 (병합 사전 승인).
   자원: kubectl namespace 가용 자원의 3/4 까지만 (GPU·CPU·메모리 각각), GPU 1개는 사람 작업용으로 항상 비워 둠.
 - 2026-10-30: 모든 run 은 영상을 항상 녹화한다 (사람 결정). 실패 유형 분류에 필요. 메모리 부족이면 worker 수를 줄이고 영상은 유지.
