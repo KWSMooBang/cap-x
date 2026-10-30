@@ -1174,7 +1174,11 @@ def _memory_log(memory: Any, mem_turn: Any) -> dict[str, Any]:
 
 
 def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
-    """Inject the LIBERO task language into the prompt template if applicable."""
+    """Inject the LIBERO task language into the prompt template if applicable.
+
+    Fills both this observation's prompt (first code generation, VDM task description) and the
+    env's own prompt, which every later decision prompt is built from.
+    """
     if not hasattr(env.low_level_env, "handle"):
         return
     handle = env.low_level_env.handle
@@ -1188,3 +1192,7 @@ def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:
                 libero_environment_goal=goal
             )
         )
+        # Decision prompts are rebuilt from env.step()'s observation (the env's own prompt), so
+        # fill the goal there too (upstream cap-x left 'Goal: {libero_environment_goal}' in them).
+        if hasattr(env, "fill_prompt_goal"):
+            env.fill_prompt_goal(goal)
