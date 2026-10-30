@@ -624,9 +624,11 @@ def _handle_multi_turn_step(
 
     content, multiturn_ensemble_entry = query_decision()
     parsed = parse_multi_turn_decision(content["content"])
+    first_finish_reason = None
     if parsed.source == "empty":
         # One more try for an empty reply; if it is empty again, finish.
         print("Empty multi-turn reply; querying once more")
+        first_finish_reason = content.get("finish_reason")
         content, multiturn_ensemble_entry = query_decision()
         parsed = parse_multi_turn_decision(content["content"])
         if parsed.source == "empty":
@@ -640,6 +642,8 @@ def _handle_multi_turn_step(
         "finish_reason": content.get("finish_reason"),
         "usage": content.get("usage"),
     }
+    if parsed.source == "empty_retry" or first_finish_reason is not None:
+        parse_meta["empty_first_finish_reason"] = first_finish_reason
     return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
 

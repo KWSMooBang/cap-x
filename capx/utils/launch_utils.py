@@ -351,12 +351,14 @@ def _find_code(text: str) -> tuple[list[str], str | None, int, list[str]]:
         blocks.append(tail.group(1).strip())
         flags.append("unclosed_fence")
         end = len(text)
+    calls = list(_TOOL_CALL_CODE.finditer(text))
+    call_blocks = [m.group(1).strip() for m in calls if m.group(1).strip()]
+    if calls:
+        end = max(end, calls[-1].end())  # FINISH must follow the last code of either kind
     if blocks:
         return blocks, "code_block", end, flags
-    calls = list(_TOOL_CALL_CODE.finditer(text))
-    blocks = [m.group(1).strip() for m in calls if m.group(1).strip()]
-    if blocks:
-        return blocks, "tool_call", calls[-1].end(), flags
+    if call_blocks:
+        return call_blocks, "tool_call", end, flags
     return [], None, -1, flags
 
 

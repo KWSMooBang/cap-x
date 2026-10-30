@@ -78,3 +78,10 @@ def test_unclosed_fence_is_code():
     parsed = parse_multi_turn_decision("Next step:\n```python\nopen_gripper()\ngoto_pose(np.array([0.5,")
     assert (parsed.decision, parsed.source, parsed.flags) == ("regenerate", "code_block", ["unclosed_fence"])
     assert _extract_code(parsed.new_code)[0].startswith("open_gripper()")
+
+
+def test_finish_between_fence_and_tool_call_regenerates():
+    reply = ('```python\nopen_gripper()\n```\nFINISH? no, one more:\n'
+             '<|open|>argument key="code" type="string"<|sep|>close_gripper()\n<|close|>argument')
+    parsed = parse_multi_turn_decision(reply)
+    assert parsed.decision == "regenerate" and "finish_with_code" in parsed.flags
