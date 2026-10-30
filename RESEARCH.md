@@ -54,6 +54,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     이번엔 안 함: task 5 step 상한, 영상 프레임 디스크 스트리밍(1i), raw 코드 파서 보완.
 2a. [완료·bg 병합 cae13af] oracle-bg (L2 exp_cap-bg_oracle-bg): memory_mode none / vdm_history / bg_oracle, 정답 그래프 직렬화 + S2(정체)·S5(완료 검증).
     Phase A(capx/belief 독립 모듈) → exp/truncation 병합 후 Phase B(하네스 통합). 평가 설계(실험 규모·API 수준)는 비교 run 전 결정.
+1k. 모델 요청 재시도 목록에 HTTP 529(과부하)·429 추가 (지금은 404/500/502/503/504 만, 2026-10-30 비교 파일럿에서 529 로 trial 1건 손실).
+1l. FINISH 턴의 판단 프롬프트도 저장 (save_multiturn_prompts 가 regenerate 턴만 저장).
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
