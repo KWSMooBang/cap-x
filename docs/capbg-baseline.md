@@ -115,12 +115,16 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 
 The original harness treated any reply without the literal `REGENERATE` as FINISH, so new code written without
 the keyword (or in Kimi-K3's raw tool-call format) was dropped and the trial ended. Replies are now classified
-by `parse_multi_turn_decision` in this order: `REGENERATE` keyword (original behavior); a fenced code block
-(also an unclosed one cut off by the token limit) or a tool-call `code` argument means regenerate; `FINISH`
-with no code means finish; an empty reply is queried once more and finishes if it is empty again; anything
-else finishes. Each multi-turn entry in `all_responses.json` records `decision_source`, `decision_flags`
-(`finish_with_code`, `unclosed_fence`) and `legacy_decision`, so runs can report format violations and how
-often the decision differs from the original parser.
+by `parse_multi_turn_decision` in this order: `REGENERATE` keyword (original behavior, with the code after it
+normalized the same way); a fenced code block (also an unclosed one cut off by the token limit) or a tool-call
+`code` argument means regenerate, unless `FINISH` comes after the last code (e.g. quoting code that already
+ran), which finishes so that code is not run twice; `FINISH` with no code means finish; an empty reply is
+queried once more and finishes if it is empty again; anything else finishes. Each multi-turn entry in
+`all_responses.json` records `decision_source`, `decision_flags` (`finish_with_code`, `finish_after_code`,
+`unclosed_fence`) and `legacy_decision`, so runs can report format violations and how often the decision
+differs from the original parser. Every model reply entry also records `finish_reason` and `usage`:
+`finish_reason: length` means the reply hit `max_tokens`, and on Nebius reasoning tokens count against it (a
+reply cut during reasoning comes back with empty content).
 
 ## Privileged information
 

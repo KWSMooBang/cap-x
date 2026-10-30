@@ -327,6 +327,8 @@ class MultiTurnDecision:
     """Parsed multi-turn reply.
 
     source: keyword | code_block | tool_call | finish_keyword | empty | fallback
+    flags: finish_with_code (FINISH before the code: regenerate), finish_after_code (FINISH after
+        the last code: finish, e.g. quoting code that already ran), unclosed_fence (reply cut off).
     legacy_decision: what the original parser returned (REGENERATE keyword or else finish),
         so runs can count replies whose decision changed.
     """
@@ -338,34 +340,61 @@ class MultiTurnDecision:
     legacy_decision: str
 
 
+def _find_code(text: str) -> tuple[list[str], str | None, int, list[str]]:
+    """Code in a reply: (blocks, kind, end offset of the last code, flags). kind is code_block or tool_call."""
+    flags: list[str] = []
+    fenced = list(_FENCED_CODE.finditer(text))
+    blocks = [m.group(1).strip() for m in fenced if m.group(1).strip()]
+    end = fenced[-1].end() if fenced else -1
+    tail = _UNCLOSED_FENCE.search(text, fenced[-1].end() if fenced else 0)
+    if tail and tail.group(1).strip():
+        blocks.append(tail.group(1).strip())
+        flags.append("unclosed_fence")
+        end = len(text)
+    if blocks:
+        return blocks, "code_block", end, flags
+    calls = list(_TOOL_CALL_CODE.finditer(text))
+    blocks = [m.group(1).strip() for m in calls if m.group(1).strip()]
+    if blocks:
+        return blocks, "tool_call", calls[-1].end(), flags
+    return [], None, -1, flags
+
+
+def _as_python_block(blocks: list[str]) -> str:
+    return "```python\n" + "\n\n".join(blocks) + "\n```"
+
+
 def parse_multi_turn_decision(content: str | None) -> MultiTurnDecision:
     """Classify a multi-turn decision reply.
 
-    Order: the literal REGENERATE keyword (original behavior); otherwise new code in a fenced
-    block or a raw tool-call ``code`` argument also means regenerate; FINISH with no code means
-    finish; an empty reply is reported as ``empty`` (the caller may query again); anything else
-    finishes. ``new_code`` for regenerate is always text that ``_extract_code`` can parse.
+    Order: the literal REGENERATE keyword (original behavior; the code after it is normalized the
+    same way when found); otherwise new code in a fenced block (closed, or unclosed when the reply
+    was cut off) or a raw tool-call ``code`` argument means regenerate, unless FINISH comes after the
+    last code, which finishes; FINISH with no code finishes; an empty reply is reported as ``empty``
+    (the caller may query again); anything else finishes. ``new_code`` for regenerate is always text
+    that ``_extract_code`` can parse.
     """
     text = content or ""
     legacy = "regenerate" if "REGENERATE" in text else "finish"
     if "REGENERATE" in text:
-        return MultiTurnDecision("regenerate", text.split("REGENERATE")[1].strip(), "keyword", [], legacy)
+        after = text.split("REGENERATE", 1)[1]
+        blocks, _, _, flags = _find_code(after)
+        new_code = _as_python_block(blocks) if blocks else after.strip()
+        return MultiTurnDecision("regenerate", new_code, "keyword", flags, legacy)
     if not text.strip():
         return MultiTurnDecision("finish", content, "empty", [], legacy)
-    flags = ["finish_with_code"] if "FINISH" in text else []
-    blocks = [b.strip() for b in _FENCED_CODE.findall(text) if b.strip()]
-    tail = _UNCLOSED_FENCE.search(_FENCED_CODE.sub("", text))
-    if tail and tail.group(1).strip():
-        blocks.append(tail.group(1).strip())
-        flags.append("unclosed_fence")
+    blocks, kind, code_end, flags = _find_code(text)
     if blocks:
-        return MultiTurnDecision("regenerate", "```python\n" + "\n\n".join(blocks) + "\n```", "code_block", flags, legacy)
-    calls = [c.strip() for c in _TOOL_CALL_CODE.findall(text) if c.strip()]
-    if calls:
-        return MultiTurnDecision("regenerate", "```python\n" + "\n\n".join(calls) + "\n```", "tool_call", flags, legacy)
+        last_finish = text.rfind("FINISH")
+        if last_finish >= code_end:
+            # Final word is FINISH (e.g. quoting code that already ran): do not run it again.
+            return MultiTurnDecision("finish", content, "finish_keyword", flags + ["finish_after_code"], legacy)
+        if last_finish >= 0:
+            flags.append("finish_with_code")
+        return MultiTurnDecision("regenerate", _as_python_block(blocks), kind, flags, legacy)
     if "FINISH" in text:
-        return MultiTurnDecision("finish", content, "finish_keyword", [], legacy)
-    return MultiTurnDecision("finish", content, "fallback", [], legacy)
+        return MultiTurnDecision("finish", content, "finish_keyword", flags, legacy)
+    return MultiTurnDecision("finish", content, "fallback", flags, legacy)
 
 
 def _parse_multi_turn_decision(content: str) -> tuple[str, str | None]:

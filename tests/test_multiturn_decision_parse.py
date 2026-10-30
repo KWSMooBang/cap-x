@@ -39,9 +39,27 @@ def test_keyword_regenerate_unchanged():
     assert _parse_multi_turn_decision(reply) == ("regenerate", reply.split("REGENERATE")[1].strip())
 
 
-def test_finish_with_code_regenerates_and_flags():
+def test_finish_before_code_regenerates_and_flags():
     parsed = parse_multi_turn_decision("FINISH? Not yet:\n```python\nclose_gripper()\n```")
     assert (parsed.decision, parsed.source, parsed.flags) == ("regenerate", "code_block", ["finish_with_code"])
+
+
+def test_quoted_code_then_finish_does_not_rerun():
+    reply = "This code already ran and placed the bowl:\n```python\nopen_gripper()\ngoto_pose(p, q)\n```\nThe bowl is on the plate.\nFINISH"
+    parsed = parse_multi_turn_decision(reply)
+    assert (parsed.decision, parsed.source, parsed.flags) == ("finish", "finish_keyword", ["finish_after_code"])
+
+
+def test_keyword_with_tool_call_is_normalized():
+    reply = 'REGENERATE<|open|>tools<|sep|><|open|>call tool="code" index="1"<|sep|><|open|>argument key="code" type="string"<|sep|>open_gripper()\n<|close|>argument<|sep|><|close|>call<|sep|>'
+    parsed = parse_multi_turn_decision(reply)
+    assert (parsed.decision, parsed.source) == ("regenerate", "keyword")
+    assert _extract_code(parsed.new_code) == ["open_gripper()"]
+
+
+def test_keyword_with_unclosed_fence_flags():
+    parsed = parse_multi_turn_decision("REGENERATE\n```python\nopen_gripper()\nx = (")
+    assert parsed.flags == ["unclosed_fence"] and _extract_code(parsed.new_code)[0].startswith("open_gripper()")
 
 
 def test_bare_fence_is_code():

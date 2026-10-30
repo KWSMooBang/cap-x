@@ -473,11 +473,12 @@ def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
-) -> tuple[str, str | None, dict | None]:
+) -> tuple[str, str | None, dict | None, dict[str, Any]]:
     """Query the model for the initial code generation.
 
     Returns:
-        (raw_code, reasoning, ensemble_data)
+        (raw_code, reasoning, ensemble_data, response_meta) where response_meta holds the reply's
+        finish_reason and token usage when the API reports them.
     """
     # Save the initial prompt
     with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
@@ -498,7 +499,8 @@ def _query_initial_code(
     else:
         out = _query_model(args, obs["full_prompt"])
 
-    return out["content"], out["reasoning"], ensemble_data
+    response_meta = {"finish_reason": out.get("finish_reason"), "usage": out.get("usage")}
+    return out["content"], out["reasoning"], ensemble_data, response_meta
 
 
 # ---------------------------------------------------------------------------
@@ -635,6 +637,8 @@ def _handle_multi_turn_step(
         "decision_source": parsed.source,
         "decision_flags": parsed.flags,
         "legacy_decision": parsed.legacy_decision,
+        "finish_reason": content.get("finish_reason"),
+        "usage": content.get("usage"),
     }
     return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
@@ -745,9 +749,10 @@ def _run_single_trial(
         with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
             f.write(raw_code)
         reasoning = None
+        response_meta = {}
         ensemble_data = None
     else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        raw_code, reasoning, ensemble_data, response_meta = _query_initial_code(args, config, obs)
     initial_query_s = time.time() - query_start
 
     # Initialize partial artifacts for timeout recovery
@@ -780,6 +785,7 @@ def _run_single_trial(
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
         "query_s": round(initial_query_s, 2),
+        **response_meta,
     })
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
