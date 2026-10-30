@@ -37,6 +37,7 @@ class SignalContext:
     progress: Progress
     prev_progress: Progress | None
     events: list[Event] = field(default_factory=list)
+    executed: bool = True  # False: the turn ran no code (reply cut off at max_tokens twice)
 
 
 class SignalDetector(Protocol):
@@ -46,12 +47,13 @@ class SignalDetector(Protocol):
 
 
 class ProgressStall:
-    """S2: the turn ended with Delta unchanged (and not zero, not overshot, progress known)."""
+    """S2: an executed turn ended with Delta unchanged (and not zero, not overshot, progress known).
+    ``prev_progress`` is the progress after the last executed turn."""
 
     id = "S2"
 
     def detect(self, ctx: SignalContext) -> Signal | None:
-        if ctx.prev_progress is None or ctx.progress.overshot:
+        if not ctx.executed or ctx.prev_progress is None or ctx.progress.overshot:
             return None
         if not (ctx.progress.known and ctx.prev_progress.known) or ctx.progress.remaining == 0:
             return None

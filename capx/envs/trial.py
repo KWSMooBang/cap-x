@@ -24,6 +24,8 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from capx.belief.memory import DEFAULT_MAX_CHARS, make_memory
+from capx.belief.signals import ALL_SIGNALS
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 
@@ -542,6 +544,9 @@ def _handle_multi_turn_step(
     turn_frames: list[np.ndarray] | None = None,
     wrist_turn_frames: list[np.ndarray] | None = None,
     wrist_base64_history: list[str] | None = None,
+    memory: Any = None,
+    turn: int = 0,
+    executed: bool = True,
 ) -> tuple[str, str | None, str | None, dict | None, list | None]:
     """Execute one multi-turn decision step.
 
@@ -553,6 +558,10 @@ def _handle_multi_turn_step(
         wrist_turn_frames: Frames from the wrist camera for this turn (for video differencing).
         wrist_base64_history: History of wrist camera base64 images for image-based
             differencing with multiview.
+        memory: Per-trial memory (capx.belief.memory) or None. Updated after this turn's VDM; its
+            text goes into the decision prompt and a FINISH it rejects (S5a) is asked again once.
+        turn: Number of this turn (code blocks run so far, including skipped ones).
+        executed: False when this turn ran no code (reply cut off at max_tokens twice).
 
     Returns:
         (decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta)
@@ -612,71 +621,100 @@ def _handle_multi_turn_step(
     elif needs_visual and hasattr(env, "render"):
         visual_feedback_base64 = visual_feedback_base64_history[-1] if visual_feedback_base64_history else None
 
+    # Memory (memory_mode): updated with this turn's VDM text; None text for memory_mode none.
+    mem_turn = memory.after_turn(turn, differencing_feedback, executed=executed) if memory is not None else None
+    memory_text = mem_turn.text if mem_turn is not None else None
+
     # Build decision prompt
     if args.use_legacy_multi_turn_decision_prompt:
         print("Using legacy multi-turn decision prompt")
         decision_prompt = _build_multi_turn_decision_prompt_legacy(
             obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
-            is_video_feedback=is_video_feedback,
+            is_video_feedback=is_video_feedback, memory_text=memory_text,
         )
     else:
         decision_prompt = _build_multi_turn_decision_prompt(
             obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
-            is_video_feedback=is_video_feedback,
+            is_video_feedback=is_video_feedback, memory_text=memory_text,
         )
 
     # Query model
-    def query_decision():
+    def query_decision(prompt):
         if config["use_parallel_ensemble"]:
             if config.get("use_multimodel", False):
                 print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
-                out = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
+                out = _query_model_ensemble(args, prompt, is_multiturn=True)
             else:
                 print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
-                out = _query_single_model_ensemble(args, decision_prompt, args.model, is_multiturn=True)
+                out = _query_single_model_ensemble(args, prompt, args.model, is_multiturn=True)
             entry = {
                 "ensemble_candidates_txt": out.get("ensemble_candidates_txt", ""),
                 "ensemble_synthesis_txt": out.get("ensemble_synthesis_txt", ""),
             }
             return out, entry
-        return _query_model(args, decision_prompt), None
+        return _query_model(args, prompt), None
 
-    content, multiturn_ensemble_entry = query_decision()
-    truncation = None
-    first_usage = None
-    if content.get("finish_reason") == "length":
-        # Cut off at max_tokens (on Nebius possibly mid-reasoning, with empty content): ask once more.
-        print("Multi-turn reply hit max_tokens; querying once more")
-        first_usage = content.get("usage")
-        content, multiturn_ensemble_entry = query_decision()
-        truncation = "retry"
-    parsed = parse_multi_turn_decision(content["content"])
-    first_finish_reason = None
-    if parsed.source == "empty" and content.get("finish_reason") != "length":
-        # One more try for an empty reply; if it is empty again, finish.
-        print("Empty multi-turn reply; querying once more")
-        first_finish_reason = content.get("finish_reason")
-        content, multiturn_ensemble_entry = query_decision()
+    def ask(prompt):
+        content, multiturn_ensemble_entry = query_decision(prompt)
+        truncation = None
+        first_usage = None
+        if content.get("finish_reason") == "length":
+            # Cut off at max_tokens (on Nebius possibly mid-reasoning, with empty content): ask once more.
+            print("Multi-turn reply hit max_tokens; querying once more")
+            first_usage = content.get("usage")
+            content, multiturn_ensemble_entry = query_decision(prompt)
+            truncation = "retry"
         parsed = parse_multi_turn_decision(content["content"])
-        if parsed.source == "empty":
-            parsed.source = "empty_retry"
-    if content.get("finish_reason") == "length":
-        # Cut off again: run nothing; the next turn tells the model (unclosed_fence never applies here).
-        truncation = "skip"
-        parsed.decision, parsed.new_code, parsed.source, parsed.flags = "truncated_skip", None, "truncated_skip", []
+        first_finish_reason = None
+        if parsed.source == "empty" and content.get("finish_reason") != "length":
+            # One more try for an empty reply; if it is empty again, finish.
+            print("Empty multi-turn reply; querying once more")
+            first_finish_reason = content.get("finish_reason")
+            content, multiturn_ensemble_entry = query_decision(prompt)
+            parsed = parse_multi_turn_decision(content["content"])
+            if parsed.source == "empty":
+                parsed.source = "empty_retry"
+        if content.get("finish_reason") == "length":
+            # Cut off again: run nothing; the next turn tells the model (unclosed_fence never applies here).
+            truncation = "skip"
+            parsed.decision, parsed.new_code, parsed.source, parsed.flags = "truncated_skip", None, "truncated_skip", []
+
+        parse_meta = {
+            "decision_source": parsed.source,
+            "decision_flags": parsed.flags,
+            "legacy_decision": parsed.legacy_decision,
+            "finish_reason": content.get("finish_reason"),
+            "usage": content.get("usage"),
+        }
+        if parsed.source == "empty_retry" or first_finish_reason is not None:
+            parse_meta["empty_first_finish_reason"] = first_finish_reason
+        if truncation is not None:
+            parse_meta.update(truncation=truncation, truncated_first_usage=first_usage)
+        return parsed, content, multiturn_ensemble_entry, parse_meta
+
+    parsed, content, multiturn_ensemble_entry, parse_meta = ask(decision_prompt)
+
+    if memory is not None:
+        parse_meta.update(_memory_log(memory, mem_turn))
+        # S5(a): FINISH while task steps remain -> reject once and ask again; that answer stands.
+        rejection = memory.check_finish() if parsed.decision == "finish" else None
+        if rejection is not None:
+            print(f"FINISH rejected by memory signal {rejection.id}; querying once more")
+            rejection_prompt = copy.deepcopy(decision_prompt) + [
+                {"role": "assistant", "content": content["content"] or "FINISH"},
+                {"role": "user", "content": [{"type": "text", "text": rejection.text}]},
+            ]
+            first = {"reply": content["content"], "reasoning": content["reasoning"], **parse_meta}
+            for key in ("memory_mode", "memory_text", "memory_signals", "memory_state", "s5_rejected"):
+                first.pop(key, None)
+            parsed, content, multiturn_ensemble_entry, retry_meta = ask(rejection_prompt)
+            parse_meta = {
+                **retry_meta, **_memory_log(memory, mem_turn),
+                "s5_rejected": True, "s5_rejection": rejection.to_dict(),
+                "s5_rejection_prompt_tail": rejection_prompt[-2:], "s5_first_reply": first,
+            }
 
     reasoning = content["reasoning"]
-    parse_meta = {
-        "decision_source": parsed.source,
-        "decision_flags": parsed.flags,
-        "legacy_decision": parsed.legacy_decision,
-        "finish_reason": content.get("finish_reason"),
-        "usage": content.get("usage"),
-    }
-    if parsed.source == "empty_retry" or first_finish_reason is not None:
-        parse_meta["empty_first_finish_reason"] = first_finish_reason
-    if truncation is not None:
-        parse_meta.update(truncation=truncation, truncated_first_usage=first_usage)
     return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
 
@@ -720,6 +758,8 @@ def _run_single_trial(
             partial_artifacts["deadline"] = time.monotonic() + budget
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
+    # Memory condition (memory_mode); none adds nothing to any prompt.
+    memory = _make_trial_memory(config, env)
 
     if config["record_video"] and hasattr(env, "enable_video_capture"):
         env.enable_video_capture(True, clear=True, wrist_camera=use_wrist)
@@ -780,6 +820,13 @@ def _run_single_trial(
             )
 
     # --- 3. Initial code generation ---
+    # bg_oracle: the initial Belief Graph goes into a copy of the first prompt only (later decision
+    # prompts carry the current graph instead).
+    initial_memory_text = memory.initial_text() if config.get("memory_in_initial_prompt", True) else None
+    initial_obs = obs
+    if initial_memory_text is not None:
+        initial_obs = {**obs, "full_prompt": copy.deepcopy(obs["full_prompt"])}
+        initial_obs["full_prompt"][-1]["content"].append({"type": "text", "text": initial_memory_text})
     query_start = time.time()
     if config["use_oracle_code"]:
         raw_code = env.oracle_code
@@ -789,7 +836,7 @@ def _run_single_trial(
         response_meta = {}
         ensemble_data = None
     else:
-        raw_code, reasoning, ensemble_data, response_meta = _query_initial_code(args, config, obs)
+        raw_code, reasoning, ensemble_data, response_meta = _query_initial_code(args, config, initial_obs)
     initial_query_s = time.time() - query_start
 
     # Initialize partial artifacts for timeout recovery
@@ -827,12 +874,15 @@ def _run_single_trial(
         "block_idx": [0],
         "code_blocks": initial_blocks,
         "decision": "initial",
-        "initial_prompt": copy.deepcopy(obs["full_prompt"]),
+        "initial_prompt": copy.deepcopy(initial_obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
         "query_s": round(initial_query_s, 2),
         **response_meta,
         "init_source": reset_info.get("init_source"),
         "reset_memory": reset_info.get("memory"),
+        "memory_mode": memory.mode,
+        "memory_initial_text": initial_memory_text,
+        "memory_state": memory.state(),
     })
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
@@ -926,6 +976,9 @@ def _run_single_trial(
                 turn_frames=turn_frames,
                 wrist_turn_frames=wrist_turn_frames,
                 wrist_base64_history=wrist_base64_history,
+                memory=memory,
+                turn=code_block_idx,
+                executed=not skipped,
             )
             decision_s = time.time() - decision_start
 
@@ -1091,6 +1144,33 @@ def _run_single_trial(
         num_finishes=num_finishes,
         num_code_blocks=num_code_blocks,
     )
+
+
+def _make_trial_memory(config: dict[str, Any], env: CodeExecutionEnvBase) -> Any:
+    """Memory for this trial (capx.belief.memory), reset on the freshly reset low-level env.
+
+    bg_oracle reads simulator ground truth through ``env.low_level_env``; that reference stays in
+    the harness and is never put into the generated-code sandbox.
+    """
+    memory = make_memory(
+        config.get("memory_mode", "none"),
+        max_chars=config.get("memory_max_chars", DEFAULT_MAX_CHARS),
+        signals=config.get("memory_signals", ALL_SIGNALS),
+        max_finish_rejections=config.get("memory_max_finish_rejections", 1),
+    )
+    memory.reset(env.low_level_env)
+    return memory
+
+
+def _memory_log(memory: Any, mem_turn: Any) -> dict[str, Any]:
+    """Per-turn memory record for all_responses.json (the text is exactly what the prompt got)."""
+    return {
+        "memory_mode": memory.mode,
+        "memory_text": mem_turn.text if mem_turn is not None else None,
+        "memory_signals": mem_turn.signal_dicts() if mem_turn is not None else [],
+        "memory_state": memory.state(),
+        "s5_rejected": False,
+    }
 
 
 def _patch_libero_goal(env: CodeExecutionEnvBase, obs: dict[str, Any]) -> None:

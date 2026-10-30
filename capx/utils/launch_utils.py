@@ -82,6 +82,33 @@ def run_server_proc(api_cfg) -> multiprocessing.Process:
 DEFAULT_MAX_TOKENS = 2048 * 10
 
 
+def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, Any]:
+    """memory_* keys (see capx.belief.memory): CLI > YAML > defaults (memory_mode none)."""
+    from capx.belief.memory import DEFAULT_MAX_CHARS, MEMORY_MODES
+    from capx.belief.signals import ALL_SIGNALS
+
+    def pick(key: str, default: Any) -> Any:
+        cli = getattr(args, key, None)
+        return cli if cli is not None else configs_dict.get(key, default)
+
+    mode = pick("memory_mode", "none")
+    if mode not in MEMORY_MODES:
+        raise ValueError(f"memory_mode must be one of {MEMORY_MODES}, got {mode!r}")
+    signals = pick("memory_signals", list(ALL_SIGNALS))
+    if isinstance(signals, str):  # CLI: "S2,S5" or "none"
+        signals = [] if signals.strip().lower() in ("", "none") else [x.strip() for x in signals.split(",")]
+    unknown = set(signals) - set(ALL_SIGNALS)
+    if unknown:
+        raise ValueError(f"memory_signals: unknown {sorted(unknown)}; implemented: {ALL_SIGNALS}")
+    return {
+        "memory_mode": mode,
+        "memory_max_chars": int(pick("memory_max_chars", DEFAULT_MAX_CHARS)),
+        "memory_signals": list(signals),
+        "memory_in_initial_prompt": bool(pick("memory_in_initial_prompt", True)),
+        "memory_max_finish_rejections": int(pick("memory_max_finish_rejections", 1)),
+    }
+
+
 def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     """Load YAML configuration and merge with command-line arguments.
 
@@ -171,6 +198,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         if getattr(args, "web_ui_port", None) is not None
         else configs_dict.get("web_ui_port", 8200),
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
+        **_memory_config(args, configs_dict),
     }
 
     return env_factory, merged_config, api_servers
@@ -210,6 +238,7 @@ def _build_multi_turn_decision_prompt_legacy(
     visual_differencing_feedback: str | None = None,
     *,
     is_video_feedback: bool = False,
+    memory_text: str | None = None,
 ) -> list[dict]:
     """Build the multi-turn decision prompt for the model.
 
@@ -219,6 +248,8 @@ def _build_multi_turn_decision_prompt_legacy(
         visual_feedback: The base64 encoded image of the current state of the environment
         visual_differencing_feedback: Text description from VDM (image or video based)
         is_video_feedback: If True, use video-appropriate framing for the differencing feedback.
+        memory_text: Memory block (``memory_mode`` vdm_history / bg_oracle), placed after the VDM
+            feedback and before the decision instructions. None (memory_mode none) adds nothing.
 
     Returns:
         The multi-turn decision prompt as a list of dictionaries
@@ -254,6 +285,8 @@ def _build_multi_turn_decision_prompt_legacy(
         multi_turn_decision_prompt[-1]["content"].append(
             {"type": "text", "text": f"{feedback_header}\n{visual_differencing_feedback}"}
         )
+    if memory_text is not None:
+        multi_turn_decision_prompt[-1]["content"].append({"type": "text", "text": memory_text})
     multi_turn_decision_prompt[-1]["content"].append(
         {"type": "text", "text": "Based on the code output, potential error messages, and the observation made above, carefully reason about the following:\nPlease respond with EXACTLY ONE of the following:\n- The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.\n- The word 'FINISH' if the task appears to be complete"}
     )
@@ -269,6 +302,7 @@ def _build_multi_turn_decision_prompt(
     visual_differencing_feedback: str | None = None,
     *,
     is_video_feedback: bool = False,
+    memory_text: str | None = None,
 ) -> list[dict]:
     """Build the multi-turn decision prompt for the model.
 
@@ -278,6 +312,8 @@ def _build_multi_turn_decision_prompt(
         visual_feedback: The base64 encoded image of the current state of the environment
         visual_differencing_feedback: Text description from VDM (image or video based)
         is_video_feedback: If True, use video-appropriate framing for the differencing feedback.
+        memory_text: Memory block (``memory_mode`` vdm_history / bg_oracle), placed after the VDM
+            feedback and before the decision instructions. None (memory_mode none) adds nothing.
 
     Returns:
         The multi-turn decision prompt as a list of dictionaries
@@ -313,6 +349,8 @@ def _build_multi_turn_decision_prompt(
         multi_turn_decision_prompt[-1]["content"].append(
             {"type": "text", "text": f"{feedback_header}\n{visual_differencing_feedback}"}
         )
+    if memory_text is not None:
+        multi_turn_decision_prompt[-1]["content"].append({"type": "text", "text": memory_text})
     multi_turn_decision_prompt[-1]["content"].append(
         {"type": "text", "text": "Based on the code output, potential error messages, and the observation made above, carefully reason about the following:\nPlease respond with EXACTLY ONE of the following:\n- The word 'REGENERATE' followed immediately by new Python code in a fenced code block (```python...```) if you want to modify the code.\n- The word 'FINISH' if the task appears to be complete"}
     )

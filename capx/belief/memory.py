@@ -8,8 +8,11 @@ memory_mode:
 All three expose the same calls, so the harness does not branch on the mode:
   reset(low_level_env)            after env.reset()
   initial_text()                  memory text for the first code-generation prompt (or None)
-  after_turn(turn, vdm_text)      after each executed code block -> MemoryTurn
+  after_turn(turn, vdm_text, executed)
+                                  after each turn -> MemoryTurn; executed=False for a turn that ran no
+                                  code (a reply cut off at max_tokens twice)
   check_finish()                  on a FINISH decision -> rejection Signal or None (S5a)
+  state()                         small dict for logs
 """
 
 from __future__ import annotations
@@ -44,11 +47,14 @@ class NoMemory:
     def initial_text(self) -> str | None:
         return None
 
-    def after_turn(self, turn: int, vdm_text: str | None = None) -> MemoryTurn:
+    def after_turn(self, turn: int, vdm_text: str | None = None, executed: bool = True) -> MemoryTurn:
         return MemoryTurn(None)
 
     def check_finish(self) -> Signal | None:
         return None
+
+    def state(self) -> dict[str, Any]:
+        return {}
 
 
 class VdmHistoryMemory:
@@ -91,12 +97,15 @@ class VdmHistoryMemory:
                 text = text[len(text) - self.max_chars:] if self.max_chars > 0 else ""
         return text or None
 
-    def after_turn(self, turn: int, vdm_text: str | None = None) -> MemoryTurn:
+    def after_turn(self, turn: int, vdm_text: str | None = None, executed: bool = True) -> MemoryTurn:
         self.add(turn, vdm_text)
         return MemoryTurn(self.render())
 
     def check_finish(self) -> Signal | None:
         return None
+
+    def state(self) -> dict[str, Any]:
+        return {"entries": len(self.entries)}
 
 
 class BgOracleMemory:
@@ -127,6 +136,7 @@ class BgOracleMemory:
         self.detectors = default_detectors(self.enabled_signals)
         self.gate = FinishGate(self.max_finish_rejections if "S5" in self.enabled_signals else 0)
         _, self.progress = self.estimator.observe(0)
+        self.s2_baseline = self.progress  # progress after the last executed turn
         self.turn = 0
 
     def render(self, signals: list[Signal] = ()) -> str:  # type: ignore[assignment]
@@ -144,12 +154,17 @@ class BgOracleMemory:
     def initial_text(self) -> str | None:
         return self.render()
 
-    def after_turn(self, turn: int, vdm_text: str | None = None) -> MemoryTurn:
+    def after_turn(self, turn: int, vdm_text: str | None = None, executed: bool = True) -> MemoryTurn:
+        """Observe the sim after ``turn``. A turn that ran no code is still observed (the text keeps
+        the turn number current) but cannot fire S2; S2 then compares the next executed turn with the
+        last executed one."""
         assert self.estimator is not None, "reset() first"
         events, progress = self.estimator.observe(turn)
-        ctx = SignalContext(turn, self.estimator.graph, progress, self.progress, events)
+        ctx = SignalContext(turn, self.estimator.graph, progress, self.s2_baseline, events, executed=executed)
         fired = [s for d in self.detectors if (s := d.detect(ctx)) is not None]
         self.progress, self.turn = progress, turn
+        if executed:
+            self.s2_baseline = progress
         return MemoryTurn(self.render(fired), fired)
 
     def check_finish(self) -> Signal | None:

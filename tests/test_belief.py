@@ -247,7 +247,7 @@ def test_serialize_drops_oldest_events_first():
     short = mem.render()
     assert len(short) <= mem.max_chars
     assert "earlier omitted)" in short and "t1 akita_black_bowl_1" not in short
-    assert "t20 akita_black_bowl_1" in short and "Progress:" in short and "Objects:" in short
+    assert "t20 akita_black_bowl_1" in short and "Progress:" in short and "Objects (xyz in robot base frame, m):" in short
 
 
 def test_serialize_never_cuts_progress_and_signals():
@@ -259,7 +259,7 @@ def test_serialize_never_cuts_progress_and_signals():
         mem.after_turn(t)
     turn = mem.after_turn(6)  # nothing moved -> S2
     full = turn.text
-    lines = {ln.split(":")[0]: ln for ln in full.split("\n")}
+    lines = {ln.split(":")[0].split(" (xyz")[0]: ln for ln in full.split("\n")}
     progress, signals = lines["Progress"], lines["Signals"]
     fixed = len(lines["Belief graph (turn 6)"]) + len(progress) + len(signals) + 2
 

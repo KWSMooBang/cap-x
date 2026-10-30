@@ -3,7 +3,7 @@
 Format:
     Belief graph (turn N):
     Progress: step 1/3 done (akita_black_bowl_1 on plate_3) | next: akita_black_bowl_2 on plate_1 | remaining: 2
-    Objects: akita_black_bowl_1 at (x, y, z) on plate_3 | ...
+    Objects (xyz in robot base frame, m): akita_black_bowl_1 at (x, y, z) on plate_3 | ...
     Events: t1 akita_black_bowl_1 on plate_1 -> on plate_3 | ...
     Signals: S2 no progress this turn ...
 
@@ -22,6 +22,7 @@ from .progress import Pred, Progress, progress_line
 from .signals import Signal
 
 TRUNCATION_MARK = " ...[truncated]"
+OBJECTS_PREFIX = "Objects (xyz in robot base frame, m): "
 
 
 def objects_line(graph: BeliefGraph, subjects: Sequence[str] | None = None) -> str:
@@ -35,7 +36,7 @@ def objects_line(graph: BeliefGraph, subjects: Sequence[str] | None = None) -> s
         if node is not None and node.pos is not None:
             label += " at ({:.2f}, {:.2f}, {:.2f})".format(*((round(v, 2) or 0.0) for v in node.pos))
         parts.append(f"{label} {graph.location(name)}")
-    return "Objects: " + " | ".join(parts)
+    return OBJECTS_PREFIX + " | ".join(parts)
 
 
 def events_line(events: Sequence[Event], omitted: int = 0) -> str:
@@ -81,7 +82,7 @@ def serialize(
     # 2. Shorten the objects line.
     if len(text) > max_chars:
         budget = len(objects) - (len(text) - max_chars) - len(TRUNCATION_MARK)
-        objects = objects[: max(budget, len("Objects:"))] + TRUNCATION_MARK
+        objects = objects[: max(budget, len(OBJECTS_PREFIX))] + TRUNCATION_MARK
         text = compose(objects, events, omitted)
     # 3. Drop objects and events entirely. Title, progress and signals are never cut, even if
     #    they alone exceed max_chars.
