@@ -17,7 +17,16 @@
   (2) step_cap 이 34/50 으로 주 종료 사유 → 8000 step 이 반복·교체 과제에 충분한지 먼저 확인 필요 (하위 목표당 사용 step).
   (3) 잘린 응답(length) 의 미종결 코드가 실행됨: unclosed_fence 17건, 그중 task_02 tr1 은 무한 루프로 3600s timeout (영상 없음).
   (4) task_03 1건은 펜스 없는 raw 코드가 fallback → finish 처리.
-- next: 실패 유형 분석 (턴별 sim_steps·진행 상태·overshot + 영상) → step 예산 판단 → 잘림 처리·max_tokens 결정 후 BG 비교 run.
+- 실패 분석 (FAILURES.md, baccus, 기존 산출물만):
+  - 실패 48건: 조작 31 · 물체 혼동 5 · 잊음·순서 3 · 하네스 3 · 완료 후 계속 행동 2 · 예산 부족 2(task 5) · 지시 해석 반대 2(task 7).
+    기억 관련(혼동+잊음·순서+완료 후 계속) 10건 = 21%. upstream init 실패 18건 중 2, 생성 init 실패 30건 중 8 — 횟수 세기 과제(t2–t4)에 집중.
+  - task 7 은 지시문("rotate ... from left to right")과 BDDL 순서가 거울상으로 모호 → tr3 은 거울상 3단계를 해내고 0점. 기억 실패로 세지 않음.
+  - step 예산: 하위 목표당 step 중앙값 t0 455 · t1 569 · t2 1590 · t3 710 · t4 757 · t5 1778 · t8 1343 · t9 623 (t6·t7 달성 0).
+    하위 목표 수 × 중앙값이 8000 을 넘는 것은 task 5(7회, 약 12,448)뿐. step_cap 34건 중 23건은 하위 목표 0, 마지막 1000 step 안 진전 4건.
+    → 8000 은 task 5 외에는 병목 아님.
+  - unclosed_fence 17건: SyntaxError 후 다음 턴 12 · 잘린 코드가 오류 없이 실행 3 · 무한 루프 timeout 1 · 그 블록에서 turn_limit 1.
+  - 뷰어: https://claude.ai/artifact/6KRnzgXKgwfBZHsw8kiZVd (사람 계정 private)
+- next: 잘림 처리 수정 → task 5 step 예산 → 조작 실패가 지배적인 상황에서 BG 효과를 볼 평가 설계 결정 → Oracle BG 구현.
 - 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261030_mem10x5_capx/{RESULTS.md,ANALYSIS.md},
   로그 /workspace/cap-bg/logs/20261030_mem10x5_capx/, 영상 .../moonshotai_Kimi-K3/<task>/trial_*/video_combined.mp4 (49/50)
 
