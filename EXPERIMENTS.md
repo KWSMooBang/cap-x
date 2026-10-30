@@ -17,6 +17,9 @@
   (5) init state 가 없는 LIBERO-Mem task(1·2·3·4·5·9)는 raw BDDL reset 이라 시작 장면이 물리적으로 깨짐
       (plate region 3 이 1·2 를 포함 → 접시 겹침 → 병·그릇 넘어짐). task_02 trial 1·2·4·5 는 깨진 장면에서 시작 → 무효.
       ferrari-dev 실측: task 2 raw reset 10회 중 8회에서 20° 넘게 기운 물체. upstream 은 contact 0 + 사람 검수로 만든 init 을 task 0·6·7·8 에만 제공.
+- 특권 정보 오염 점검 (2026-10-30, baccus 읽기 전용 검사): LIBERO-Mem 전 run(pilot_ensoff, pilot_t1800, mem5x5, _oom_partial)과
+  LIBERO-PRO run10 의 모든 생성 코드에서 obs["memory"]·task_completed·_check_success·env.·sim.data·obs 키 나열 사용 0건 → 결과 오염 없음.
+  단 노출 경로(get_observation() 의 obs["memory"], sandbox 전역 env/obs)는 열려 있음.
 - next: (2)(4)(5) 수정 후 bg 기준으로 LIBERO-Mem task 0–9 기준선 재실행.
 - 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261029_mem5x5_step8000/{RESULTS.md,ANALYSIS.md},
   로그 /workspace/cap-bg/logs/20261029_mem5x5_step8000/, 뷰어 데이터 /workspace/cap-bg/viewer/20261029_mem5x5_step8000/,
