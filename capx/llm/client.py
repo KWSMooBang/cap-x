@@ -303,8 +303,12 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         raise RuntimeError(f"Unexpected response format: {body}") from exc
     if body.get("choices") is not None:
         out["reasoning"] = body.get("choices")[0].get("message").get("reasoning", None)
+        # "length" means the reply hit max_tokens (reasoning tokens count against it on some APIs).
+        out["finish_reason"] = body.get("choices")[0].get("finish_reason")
     else:
         out["reasoning"] = None
+        out["finish_reason"] = body.get("status")
+    out["usage"] = body.get("usage")
     return out  # type: ignore[return-value]
 
 

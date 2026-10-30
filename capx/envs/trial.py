@@ -40,7 +40,7 @@ from capx.utils.launch_utils import (
     _build_multi_turn_decision_prompt_legacy,
     _extract_code,
     _get_visual_feedback,
-    _parse_multi_turn_decision,
+    parse_multi_turn_decision,
     _save_trial_artifacts,
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
@@ -473,11 +473,12 @@ def _query_initial_code(
     args: LaunchArgs,
     config: dict[str, Any],
     obs: dict[str, Any],
-) -> tuple[str, str | None, dict | None]:
+) -> tuple[str, str | None, dict | None, dict[str, Any]]:
     """Query the model for the initial code generation.
 
     Returns:
-        (raw_code, reasoning, ensemble_data)
+        (raw_code, reasoning, ensemble_data, response_meta) where response_meta holds the reply's
+        finish_reason and token usage when the API reports them.
     """
     # Save the initial prompt
     with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
@@ -498,7 +499,8 @@ def _query_initial_code(
     else:
         out = _query_model(args, obs["full_prompt"])
 
-    return out["content"], out["reasoning"], ensemble_data
+    response_meta = {"finish_reason": out.get("finish_reason"), "usage": out.get("usage")}
+    return out["content"], out["reasoning"], ensemble_data, response_meta
 
 
 # ---------------------------------------------------------------------------
@@ -535,8 +537,9 @@ def _handle_multi_turn_step(
             differencing with multiview.
 
     Returns:
-        (decision, new_code, reasoning, multiturn_ensemble_entry)
-        where decision is "regenerate", "finish", or "continue".
+        (decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta)
+        where decision is "regenerate" or "finish" and parse_meta records how the reply was
+        classified (decision_source, decision_flags, legacy_decision).
     """
     use_wrist = config.get("use_wrist_camera", False)
 
@@ -604,25 +607,44 @@ def _handle_multi_turn_step(
         )
 
     # Query model
-    multiturn_ensemble_entry = None
-    if config["use_parallel_ensemble"]:
-        if config.get("use_multimodel", False):
-            print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
-            content = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
-        else:
-            print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
-            content = _query_single_model_ensemble(args, decision_prompt, args.model, is_multiturn=True)
-        multiturn_ensemble_entry = {
-            "ensemble_candidates_txt": content.get("ensemble_candidates_txt", ""),
-            "ensemble_synthesis_txt": content.get("ensemble_synthesis_txt", ""),
-        }
-    else:
-        content = _query_model(args, decision_prompt)
+    def query_decision():
+        if config["use_parallel_ensemble"]:
+            if config.get("use_multimodel", False):
+                print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
+                out = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
+            else:
+                print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
+                out = _query_single_model_ensemble(args, decision_prompt, args.model, is_multiturn=True)
+            entry = {
+                "ensemble_candidates_txt": out.get("ensemble_candidates_txt", ""),
+                "ensemble_synthesis_txt": out.get("ensemble_synthesis_txt", ""),
+            }
+            return out, entry
+        return _query_model(args, decision_prompt), None
+
+    content, multiturn_ensemble_entry = query_decision()
+    parsed = parse_multi_turn_decision(content["content"])
+    first_finish_reason = None
+    if parsed.source == "empty":
+        # One more try for an empty reply; if it is empty again, finish.
+        print("Empty multi-turn reply; querying once more")
+        first_finish_reason = content.get("finish_reason")
+        content, multiturn_ensemble_entry = query_decision()
+        parsed = parse_multi_turn_decision(content["content"])
+        if parsed.source == "empty":
+            parsed.source = "empty_retry"
 
     reasoning = content["reasoning"]
-    decision, new_code = _parse_multi_turn_decision(content["content"])
-
-    return decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt
+    parse_meta = {
+        "decision_source": parsed.source,
+        "decision_flags": parsed.flags,
+        "legacy_decision": parsed.legacy_decision,
+        "finish_reason": content.get("finish_reason"),
+        "usage": content.get("usage"),
+    }
+    if parsed.source == "empty_retry" or first_finish_reason is not None:
+        parse_meta["empty_first_finish_reason"] = first_finish_reason
+    return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +674,7 @@ def _run_single_trial(
     use_wrist = config.get("use_wrist_camera", False)
 
     # --- 1. Reset environment ---
-    obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    obs, reset_info = env.reset(options={"trial": trial}, seed=trial)
     # Reset the SIGALRM timer AFTER env.reset() so the timeout only covers
     # actual task execution, not scene loading / cuRobo JIT compilation.
     import signal
@@ -731,9 +753,10 @@ def _run_single_trial(
         with open(os.path.join(config["output_dir"], "oracle_code.py"), "w") as f:
             f.write(raw_code)
         reasoning = None
+        response_meta = {}
         ensemble_data = None
     else:
-        raw_code, reasoning, ensemble_data = _query_initial_code(args, config, obs)
+        raw_code, reasoning, ensemble_data, response_meta = _query_initial_code(args, config, obs)
     initial_query_s = time.time() - query_start
 
     # Initialize partial artifacts for timeout recovery
@@ -766,6 +789,9 @@ def _run_single_trial(
         "initial_prompt": copy.deepcopy(obs["full_prompt"]),
         "reasoning": reasoning if reasoning is not None else "",
         "query_s": round(initial_query_s, 2),
+        **response_meta,
+        "init_source": reset_info.get("init_source"),
+        "reset_memory": reset_info.get("memory"),
     })
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
@@ -814,11 +840,25 @@ def _run_single_trial(
 
         obs = obs_next
 
+        # Step cap: env.step reports truncated from the env's own step count (stderr matching only as
+        # a fallback for envs without one).
+        if truncated or "terminated episode" in info_step["stderr"]:
+            truncated = True
+            all_responses.append({
+                "decision": "truncated",
+                "reason": "step_cap",
+                "block_idx": [code_block_idx],
+                "exec_s": round(exec_s, 2),
+                "sim_steps": sim_steps,
+                "memory": info_step.get("memory"),
+                # The block that hit the cap may still have completed the task (summary keeps it).
+                "task_completed": info_step.get("task_completed"),
+            })
+            print(f"Episode truncated at {sim_steps} sim steps (step cap)")
+            break
+
         # Multi-turn decision
         if multi_turn_prompt:
-            if "terminated episode" in info_step["stderr"]:
-                truncated = True
-                break
 
             # Get turn frames for video differencing
             turn_frames = None
@@ -831,7 +871,7 @@ def _run_single_trial(
                     )
 
             decision_start = time.time()
-            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
+            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt, parse_meta = _handle_multi_turn_step(
                 env, obs, args, config, visual_differencing_args,
                 multi_turn_prompt, code_blocks, code_block_idx, info_step,
                 task_description, visual_feedback_imgs, visual_feedback_base64_history,
@@ -858,6 +898,8 @@ def _run_single_trial(
                     "exec_s": round(exec_s, 2),
                     "decision_s": round(decision_s, 2),
                     "sim_steps": sim_steps,
+                    "memory": info_step.get("memory"),
+                    **parse_meta,
                 })
                 del code_blocks[code_block_idx:]
                 del code_block_metadata[code_block_idx:]
@@ -878,6 +920,8 @@ def _run_single_trial(
                     "exec_s": round(exec_s, 2),
                     "decision_s": round(decision_s, 2),
                     "sim_steps": sim_steps,
+                    "memory": info_step.get("memory"),
+                    **parse_meta,
                 })
                 print("Model chose to finish")
                 num_finishes += 1

@@ -87,7 +87,7 @@ def main(args: Args) -> None:
     for i in range(1, args.num_steps + 1):
         _random_step(env, rng)
         obs = env.get_observation()
-        rec = {"step": i, "reward": _jsonable(env.compute_reward()), "memory": _jsonable(obs.get("memory"))}
+        rec = {"step": i, "reward": _jsonable(env.compute_reward()), "memory": _jsonable(env.memory_state() if hasattr(env, "memory_state") else obs.get("memory"))}
         if i % args.save_every == 0 or i == args.num_steps:
             rec["images"] = _save_images(obs, out, f"step{i:03d}")
         log["steps"].append(rec)

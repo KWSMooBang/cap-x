@@ -9,7 +9,7 @@ from typing import Any, SupportsFloat
 import numpy as np
 from gymnasium import Env, spaces
 
-from capx.envs.base import BaseEnv, ObsType, get_env
+from capx.envs.base import BaseEnv, EpisodeTruncated, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
@@ -66,23 +66,24 @@ class CodeExecEnvConfig:
 class SimpleExecutor:
     """Minimal in-process code executor with full imports allowed.
 
-    Executes user code with globals: env (low-level env), APIS (name->api), INPUTS, RESULT.
-    The user code may import any installed package and can interact with `env` directly
-    for closed-loop control.
+    Executes user code with globals: APIS (name->api), INPUTS, RESULT, and env (low-level env)
+    when privileged. The user code may import any installed package.
     """
 
-    def __init__(self, env: BaseEnv, apis: dict[str, ApiBase]) -> None:
+    def __init__(self, env: BaseEnv, apis: dict[str, ApiBase], privileged: bool = False) -> None:
         self._env = env
         self._apis = apis
+        self._privileged = privileged
 
     def run(self, code: str, *, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
         g: dict[str, Any] = {
             "__name__": "__main__",
-            "env": self._env,
             "APIS": self._apis,
             "INPUTS": inputs or {},
             "RESULT": None,
         }
+        if self._privileged:
+            g["env"] = self._env
         try:
             exec(code, g, g)
             return {"ok": True, "result": g.get("RESULT")}
@@ -108,7 +109,7 @@ class CodeExecutionEnvBase(Env):
         self._apis: dict[str, ApiBase] = {n: get_api(n)(self.low_level_env) for n in cfg.apis}
         # for api in self._apis.values():
         #     api.set_env(self.low_level_env)
-        self._executor = SimpleExecutor(self.low_level_env, self._apis)
+        self._executor = SimpleExecutor(self.low_level_env, self._apis, privileged=cfg.privileged)
         self._step_count = 0
         self.action_space = spaces.Text(max_length=4096)
         self.observation_space = spaces.Dict({"task_prompt": spaces.Text(max_length=4096)})
@@ -164,7 +165,11 @@ class CodeExecutionEnvBase(Env):
         obs = self._get_observation()
         # Update dynamic obs while retaining previously defined variables
         self._exec_globals["obs"] = obs
-        self._exec_globals["env"] = self.low_level_env
+        # The low-level env (sim, task state) is only reachable from generated code when privileged.
+        if self.cfg.privileged:
+            self._exec_globals["env"] = self.low_level_env
+        else:
+            self._exec_globals.pop("env", None)
         self._exec_globals["APIS"] = self._apis
         # Ensure API helper functions remain bound/current
         for api in self._apis.values():
@@ -184,6 +189,9 @@ class CodeExecutionEnvBase(Env):
                 exec(code, self._exec_globals, self._exec_globals)
         except TrialTimeout:
             raise
+        except EpisodeTruncated as exc:
+            # The step budget is used up; step() reports truncated and the trial ends.
+            print(f"{exc}", file=tee_err)
         except BaseException:  # defensive; propagate minimal info
             ok = False
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
@@ -203,13 +211,14 @@ class CodeExecutionEnvBase(Env):
         """
         g: dict[str, Any] = {
             "__name__": "__main__",
-            "env": self.low_level_env,
             "APIS": self._apis,
             # Populated per-step/reset; keep reference stable across execs
             "INPUTS": {},
             # Users can set and reuse RESULT across steps if desired
             "RESULT": None,
         }
+        if self.cfg.privileged:
+            g["env"] = self.low_level_env
         # Bind helper functions from APIs into the global namespace for convenience
         for api in self._apis.values():
             for fn_name, fn in api.functions().items():
@@ -291,6 +300,7 @@ class CodeExecutionEnvBase(Env):
             task_completed = None
         terminated = reward == 1.0
 
+        # Read the low-level step count directly; generated code may have swallowed the env's error.
         truncated = getattr(self.low_level_env, "_sim_step_count", 0) >= getattr(
             self.low_level_env, "max_steps", 999999
         )  # type: ignore[arg-type]
@@ -307,6 +317,10 @@ class CodeExecutionEnvBase(Env):
             "task_prompt": self._task_prompt,
             "task_completed": task_completed,
         }
+        # Benchmark task-progress state (e.g. LIBERO-Mem subgoals), for evaluation logs only;
+        # it is not part of the observation the generated code sees.
+        if hasattr(self.low_level_env, "memory_state"):
+            info["memory"] = self.low_level_env.memory_state()
         return obs, reward, bool(terminated), bool(truncated), info
 
     def render(self, mode: str = "rgb_array"):

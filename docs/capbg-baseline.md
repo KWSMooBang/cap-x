@@ -111,6 +111,44 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 - After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
 - Generated code that loops forever inside a bare `except:` can still swallow every alarm.
 
+## Init states
+
+LIBERO-Mem tasks 0, 6, 7 and 8 use upstream init states; tasks 1, 2, 3, 4, 5 and 9 use the generated sets in
+`capx/integrations/libero_mem/init_states/` (see `docs/memory-benchmarks.md`). Each trial records `init_source`, and
+`analyze_pilot.py` reports success per init source, so report the two groups separately. Regenerate with
+`MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1 python scripts/gen_libero_mem_init_states.py --tasks 1 2 3 4 5 9 --num 50`
+(about 4 GB RAM per process; reruns with the same seed give the same states).
+
+## Step cap
+
+`max_steps` in the low-level env config is the step budget; the robosuite horizon is built from the same value.
+`FrankaLiberoEnv` (and LIBERO-Mem) raises `EpisodeTruncated` (a BaseException, so generated code cannot swallow
+it) before a sim step would exceed it. The sandbox stops the code, `env.step` reports `truncated` from the env's
+own step count, and the trial ends with a final `all_responses.json` entry
+`{"decision": "truncated", "reason": "step_cap"}` and `Truncated: True` in `summary.txt`.
+
+## Multi-turn decisions
+
+The original harness treated any reply without the literal `REGENERATE` as FINISH, so new code written without
+the keyword (or in Kimi-K3's raw tool-call format) was dropped and the trial ended. Replies are now classified
+by `parse_multi_turn_decision` in this order: `REGENERATE` keyword (original behavior, with the code after it
+normalized the same way); a fenced code block (also an unclosed one cut off by the token limit) or a tool-call
+`code` argument means regenerate, unless `FINISH` comes after the last code (e.g. quoting code that already
+ran), which finishes so that code is not run twice; `FINISH` with no code means finish; an empty reply is
+queried once more and finishes if it is empty again; anything else finishes. Each multi-turn entry in
+`all_responses.json` records `decision_source`, `decision_flags` (`finish_with_code`, `finish_after_code`,
+`unclosed_fence`) and `legacy_decision`, so runs can report format violations and how often the decision
+differs from the original parser. Every model reply entry also records `finish_reason` and `usage`:
+`finish_reason: length` means the reply hit `max_tokens`, and on Nebius reasoning tokens count against it (a
+reply cut during reasoning comes back with empty content).
+
+## Privileged information
+
+With `privileged: false` the generated code sees no ground-truth task state: LIBERO-Mem's subgoal tracker is
+only in `info["memory"]` (logged per turn in `all_responses.json`), and the sandbox has no `env` global. The
+sandbox runs in-process, so this is not full isolation (an API function's `__self__` or `APIS` still reaches the
+env); `analyze_pilot.py` flags trials whose code touches such state.
+
 ## Running on kubectl
 
 GPU pods are killed after 30 minutes without GPU use. Do `uv sync`, submodule checkout and other CPU-only work

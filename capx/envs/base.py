@@ -8,6 +8,14 @@ ObsType = TypeVar("ObsType")
 ActType = TypeVar("ActType")
 
 
+class EpisodeTruncated(BaseException):
+    """Raised by a low-level env when a sim step would exceed its step budget (max_steps).
+
+    A BaseException so that ``except Exception`` in generated code cannot swallow it and keep
+    looping; the code sandbox catches it and the trial ends as truncated (step cap).
+    """
+
+
 class BaseEnv(Env):
     """
     Base environment class for low level control environments.

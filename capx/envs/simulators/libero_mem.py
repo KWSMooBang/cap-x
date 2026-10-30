@@ -24,9 +24,10 @@ from .libero import FrankaLiberoEnv  # noqa: E402
 class FrankaLiberoMemEnv(FrankaLiberoEnv):
     """Franka LIBERO-Mem task env.
 
-    On top of the FrankaLiberoEnv observation, ``obs["memory"]`` (and ``info["memory"]`` on
-    reset) exposes LIBERO-Mem's sequential subgoal tracker: satisfied subgoals in order,
-    how many are required, and whether the final goal was overshot.
+    ``memory_state()`` (also ``info["memory"]`` on reset and after each code step) reports
+    LIBERO-Mem's sequential subgoal tracker: satisfied subgoals in order, how many are required,
+    and whether the final goal was overshot. It is ground-truth task progress, so it is kept out
+    of ``get_observation()``, which generated code can read.
     """
 
     def __init__(
@@ -60,16 +61,15 @@ class FrankaLiberoMemEnv(FrankaLiberoEnv):
         # Upstream eval resets progress after placing the init state and settling.
         self.handle.reset_progress()
         obs = self.get_observation()
-        info["memory"] = obs["memory"]
+        info["memory"] = self.memory_state()
+        info["init_source"] = self.handle.init_source
         return obs, info
 
     def task_completed(self) -> bool:
         return self.handle.task_success()
 
-    def get_observation(self) -> dict[str, Any]:
-        obs = super().get_observation()
-        obs["memory"] = self.handle.memory_state()
-        return obs
+    def memory_state(self) -> dict[str, Any]:
+        return self.handle.memory_state()
 
 
 __all__ = ["FrankaLiberoMemEnv"]
