@@ -85,8 +85,11 @@ class VdmHistoryMemory:
             omitted += 1
         if len(text) > self.max_chars:  # a single entry longer than the budget: keep its end
             keep = self.max_chars - len(self.header) - len("\n...")
-            text = self.header + "\n..." + text[len(text) - max(keep, 0):]
-        return text
+            if keep > 0:
+                text = self.header + "\n..." + text[len(text) - keep:]
+            else:  # budget smaller than the header: just the newest characters
+                text = text[len(text) - self.max_chars:] if self.max_chars > 0 else ""
+        return text or None
 
     def after_turn(self, turn: int, vdm_text: str | None = None) -> MemoryTurn:
         self.add(turn, vdm_text)
@@ -154,7 +157,7 @@ class BgOracleMemory:
         p = self.progress
         if p is None:
             return {}
-        return {"done": len(p.done), "remaining": p.remaining, "overshot": p.overshot}
+        return {"done": len(p.done), "remaining": p.remaining, "overshot": p.overshot, "known": p.known}
 
 
 def make_memory(mode: str = "none", **opts: Any) -> NoMemory | VdmHistoryMemory | BgOracleMemory:

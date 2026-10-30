@@ -250,16 +250,88 @@ def test_serialize_drops_oldest_events_first():
     assert "t20 akita_black_bowl_1" in short and "Progress:" in short and "Objects:" in short
 
 
-def test_serialize_hard_limit_keeps_signals():
+def test_serialize_never_cuts_progress_and_signals():
     src = FakeSource()
-    mem = BgOracleMemory(max_chars=500)
+    mem = BgOracleMemory(max_chars=10_000)
     mem.reset(source=src)
-    text = mem.after_turn(1).text
-    assert len(text) <= 500
-    assert "...[truncated]" in text
-    assert "Signals: S2" in text  # objects line is cut before signals
+    for t in range(1, 6):
+        src.move("akita_black_bowl_1", "plate_3" if t % 2 else "plate_1", complete_step=False)
+        mem.after_turn(t)
+    turn = mem.after_turn(6)  # nothing moved -> S2
+    full = turn.text
+    lines = {ln.split(":")[0]: ln for ln in full.split("\n")}
+    progress, signals = lines["Progress"], lines["Signals"]
+    fixed = len(lines["Belief graph (turn 6)"]) + len(progress) + len(signals) + 2
+
+    # Events go first (objects intact).
+    mem.max_chars = len(full) - 20
+    text = mem.render(turn.signals)
+    assert len(text) <= mem.max_chars and lines["Objects"] in text and "earlier omitted" in text
+
+    # Then the objects line is shortened; progress and signals stay whole.
+    mem.max_chars = fixed + 120
+    text = mem.render(turn.signals)
+    assert len(text) <= mem.max_chars
+    assert progress in text.split("\n") and signals in text.split("\n")
+    assert "...[truncated]" in text and "t5 akita" not in text
+
+    # Then objects and events are left out.
+    mem.max_chars = fixed + 5
+    text = mem.render(turn.signals)
+    assert text.split("\n") == ["Belief graph (turn 6):", progress, signals]
+
+    # Budget below title + progress + signals: returned over budget, never cut.
+    mem.max_chars = 50
+    assert mem.render(turn.signals).split("\n") == ["Belief graph (turn 6):", progress, signals]
+    assert serialize(BeliefGraph(), None, turn=0, max_chars=10).split("\n") == [
+        "Belief graph (turn 0):", "Signals: none"]
+
+
+def test_first_location_observation_is_not_a_move():
     g = BeliefGraph()
-    assert len(serialize(g, None, turn=0, max_chars=10)) <= 10
+    g.update(0, {("open", "drawer", None): True})
+    assert g.update(1, {("on", "drawer", "table"): True}) == []
+    assert [e.text for e in g.update(2, {("on", "drawer", "table"): False})] == [
+        "t2 drawer on table -> on nothing tracked"]
+
+
+# --- unknown progress / predicate order -------------------------------------------------------
+
+def test_unknown_progress_claims_nothing():
+    br = goal_branches(SWAP_GOAL)
+    p = Progress.from_completed(br, [(("on", "akita_black_bowl_2", "plate_1"),)])  # matches no branch
+    assert not p.known and p.remaining is None and not p.complete
+    line = progress_line(p)
+    assert "progress unknown" in line and "WARNING" in line and "verified complete" not in line
+    assert FinishGate().check(p) is None
+
+    src = FakeSource()
+    mem = BgOracleMemory()
+    mem.reset(source=src)
+    src.move("akita_black_bowl_2", "plate_1")  # tracker reports a step no branch starts with
+    t1 = mem.after_turn(1)
+    assert t1.signals == [] and "progress unknown" in t1.text  # no S2, no S5b
+    assert mem.check_finish() is None  # no S5a
+    assert mem.state()["known"] is False and mem.state()["remaining"] is None
+    t2 = mem.after_turn(2)
+    assert t2.signals == []
+
+
+def test_step_matching_ignores_predicate_order():
+    goal = [["sequence",
+             ["and", ["on", "a", "plate_1"], ["on", "b", "plate_2"]],
+             ["and", ["on", "c", "plate_3"]]]]
+    br = goal_branches(goal)
+    done_tracker = [["and", ["on", "b", "plate_2"], ["on", "a", "plate_1"]]]  # tracker order differs
+    from capx.belief.progress import _step
+
+    p = Progress.from_completed(br, [_step(s) for s in done_tracker])
+    assert p.known and p.remaining == 1
+    # Steps given in any order (not canonical) also match.
+    p2 = Progress.from_completed(br, [(("on", "b", "plate_2"), ("on", "a", "plate_1"))])
+    assert p2.known and p2.done == p.done
+    assert goal_branches([["And", ["On", "b", "x"], ["On", "a", "y"]]]) == goal_branches(
+        [["on", "a", "y"], ["on", "b", "x"]])
 
 
 # --- vdm_history / none ----------------------------------------------------------------------
@@ -280,6 +352,10 @@ def test_vdm_history_accumulates_and_trims():
     long = make_memory("vdm_history", max_chars=100)
     text = long.after_turn(1, "x" * 500).text
     assert len(text) <= 100 and text.endswith("x")
+    for cap in (5, 30, 62, 63):  # caps around and below the header length
+        tiny = make_memory("vdm_history", max_chars=cap)
+        assert len(tiny.after_turn(1, "y" * 200).text) <= cap
+    assert make_memory("vdm_history", max_chars=0).after_turn(1, "z").text is None
 
     mem.reset()
     assert mem.entries == []

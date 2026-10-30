@@ -8,8 +8,9 @@ Format:
     Signals: S2 no progress this turn ...
 
 When the text is longer than ``max_chars``, the oldest events are dropped first (replaced by a
-"(k earlier omitted)" marker); if it is still too long the objects line is shortened, and as a
-last resort the whole text is cut at ``max_chars``.
+"(k earlier omitted)" marker), then the objects line is shortened, then the objects and events
+lines are left out. The title, Progress and Signals lines are never cut; if they alone exceed
+``max_chars`` the text is returned over budget.
 """
 
 from __future__ import annotations
@@ -58,29 +59,32 @@ def serialize(
     subjects: Sequence[str] | None = None,
     current_truths: dict[Pred, bool] | None = None,
 ) -> str:
-    head = [f"Belief graph (turn {turn}):"]
-    if progress is not None:
-        head.append(progress_line(progress, current_truths))
-    head.append(objects_line(graph, subjects))
-    tail = signals_line(signals)
+    title = f"Belief graph (turn {turn}):"
+    prog = progress_line(progress, current_truths) if progress is not None else None
+    objects = objects_line(graph, subjects)
+    sig = signals_line(signals)
 
+    def compose(objects_text: str | None, events: list[Event], omitted: int) -> str:
+        lines = [title] + ([prog] if prog else [])
+        if objects_text is not None:
+            lines += [objects_text, events_line(events, omitted)]
+        return "\n".join(lines + [sig])
+
+    # 1. Drop the oldest events.
     events = list(graph.events)
     omitted = 0
-    while True:
-        text = "\n".join(head + [events_line(events, omitted), tail])
-        if len(text) <= max_chars or not events:
-            break
+    text = compose(objects, events, omitted)
+    while len(text) > max_chars and events:
         events.pop(0)
         omitted += 1
+        text = compose(objects, events, omitted)
+    # 2. Shorten the objects line.
     if len(text) > max_chars:
-        # Shorten the objects line first so progress and signals survive.
-        lines = text.split("\n")
-        obj_idx = len(head) - 1
-        budget = len(lines[obj_idx]) - (len(text) - max_chars) - len(TRUNCATION_MARK)
-        if budget > len("Objects: "):
-            lines[obj_idx] = lines[obj_idx][:budget] + TRUNCATION_MARK
-            text = "\n".join(lines)
+        budget = len(objects) - (len(text) - max_chars) - len(TRUNCATION_MARK)
+        objects = objects[: max(budget, len("Objects:"))] + TRUNCATION_MARK
+        text = compose(objects, events, omitted)
+    # 3. Drop objects and events entirely. Title, progress and signals are never cut, even if
+    #    they alone exceed max_chars.
     if len(text) > max_chars:
-        mark = TRUNCATION_MARK if max_chars > len(TRUNCATION_MARK) else ""
-        text = text[: max_chars - len(mark)] + mark
+        text = compose(None, events, omitted)
     return text

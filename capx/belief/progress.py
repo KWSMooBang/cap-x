@@ -4,6 +4,10 @@ A step is a conjunction of predicates (one ``(And ...)`` of a ``(Sequence ...)``
 ...) ...)`` goal has several branches; a branch stays possible while its prefix matches the completed
 steps. Delta (remaining) is the fewest steps left over the possible branches. Repeat tasks (the
 same step several times in a row, e.g. "place the bowl back 3 times") get a completion counter.
+
+Steps are canonical (sorted, de-duplicated predicates), so a step matches regardless of the
+predicate order inside ``(And ...)``. If the completed steps match no branch, progress is unknown:
+``remaining`` is None and no completion is claimed.
 """
 
 from __future__ import annotations
@@ -20,13 +24,18 @@ def _pred(p: Sequence[Any]) -> Pred:
     return tuple(str(x).lower() if i == 0 else str(x) for i, x in enumerate(p))
 
 
+def canonical_step(preds: Sequence[Sequence[Any]]) -> Step:
+    """Order-independent step: the same set of predicates gives the same tuple."""
+    return tuple(sorted({_pred(p) for p in preds}))
+
+
 def _step(node: Sequence[Any]) -> Step:
-    """``['and', p1, p2]`` or a bare predicate list -> step tuple."""
+    """``['and', p1, p2]`` or a bare predicate list -> canonical step."""
     if node and isinstance(node[0], str) and node[0].lower() == "and":
-        return tuple(_pred(p) for p in node[1:])
+        return canonical_step(node[1:])
     if node and isinstance(node[0], str):
-        return (_pred(node),)
-    return tuple(_pred(p) for p in node)
+        return canonical_step([node])
+    return canonical_step(node)
 
 
 def goal_branches(goal_state: Sequence[Any]) -> list[list[Step]]:
@@ -41,7 +50,9 @@ def goal_branches(goal_state: Sequence[Any]) -> list[list[Step]]:
         return [[_step(s) for s in seq[1:]] for seq in head[1:]]
     if op == "sequence":
         return [[_step(s) for s in head[1:]]]
-    return [[tuple(_pred(p) for p in goal_state)]]
+    if op == "and":
+        return [[_step(head)]]
+    return [[canonical_step(goal_state)]]
 
 
 def format_pred(p: Pred) -> str:
@@ -65,8 +76,15 @@ class Progress:
 
     @classmethod
     def from_completed(cls, branches: list[list[Step]], done: list[Step], overshot: bool = False) -> Progress:
+        branches = [[canonical_step(s) for s in b] for b in branches]
+        done = [canonical_step(s) for s in done]
         possible = [i for i, b in enumerate(branches) if b[: len(done)] == done]
-        return cls(branches=branches, done=list(done), overshot=overshot, possible=possible)
+        return cls(branches=branches, done=done, overshot=overshot, possible=possible)
+
+    @property
+    def known(self) -> bool:
+        """False when the completed steps match no goal branch (tracker and goal disagree)."""
+        return bool(self.possible)
 
     @property
     def total(self) -> int:
@@ -75,15 +93,15 @@ class Progress:
         return min(len(self.branches[i]) for i in idx)
 
     @property
-    def remaining(self) -> int:
-        """Delta: steps still to do (0 = all steps verified complete)."""
+    def remaining(self) -> int | None:
+        """Delta: steps still to do (0 = all steps verified complete); None if progress is unknown."""
         if not self.possible:
-            return max(self.total - len(self.done), 0)
+            return None
         return min(len(self.branches[i]) - len(self.done) for i in self.possible)
 
     @property
     def complete(self) -> bool:
-        return self.remaining == 0 and not self.overshot
+        return self.known and self.remaining == 0 and not self.overshot
 
     def next_steps(self) -> list[Step]:
         """Distinct next steps over the possible branches (several only for an undecided Or)."""
@@ -110,6 +128,12 @@ class Progress:
 
 def progress_line(progress: Progress, current_truths: dict[Pred, bool] | None = None) -> str:
     """One-line progress summary for the prompt."""
+    if not progress.known:
+        done_text = "; ".join(format_step(s) for s in progress.done)
+        return (
+            f"Progress: progress unknown (WARNING: the {len(progress.done)} completed step(s) [{done_text}] "
+            "match no branch of the goal; remaining steps cannot be determined)"
+        )
     done, total, rem = len(progress.done), progress.total, progress.remaining
     rep = progress.repeat_count()
     if rep is not None:

@@ -149,11 +149,16 @@ class BeliefGraph:
 
         Observed edges get source=obs and P=0.97/0.03. Edges not in ``observations`` keep their P
         and become source=mem (no time decay). Subjects whose location label changed produce an
-        Event; the first update (no earlier observation of the subject) produces none.
+        Event; a subject's first location observation produces none, even if other predicates of
+        it were observed before.
         """
         subjects = {k[1] for k in observations} | {k[1] for k in self.edges}
         before = {s: self.location(s) for s in subjects}
-        seen_before = {e.subject for e in self.edges.values() if e.source != "prior"}
+        # Subjects whose location was observed before; a first location observation is no move.
+        seen_before = {
+            e.subject for e in self.edges.values()
+            if e.source != "prior" and e.predicate in LOCATION_PREDICATES
+        }
 
         for edge in self.edges.values():
             if edge.key not in observations and edge.source == "obs":

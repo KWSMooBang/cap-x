@@ -46,15 +46,17 @@ class SignalDetector(Protocol):
 
 
 class ProgressStall:
-    """S2: the turn ended with Delta unchanged (and not zero, not overshot)."""
+    """S2: the turn ended with Delta unchanged (and not zero, not overshot, progress known)."""
 
     id = "S2"
 
     def detect(self, ctx: SignalContext) -> Signal | None:
-        if ctx.prev_progress is None or ctx.progress.remaining == 0 or ctx.progress.overshot:
+        if ctx.prev_progress is None or ctx.progress.overshot:
+            return None
+        if not (ctx.progress.known and ctx.prev_progress.known) or ctx.progress.remaining == 0:
             return None
         before, after = ctx.prev_progress.remaining, ctx.progress.remaining
-        if after < before:
+        if after < before:  # type: ignore[operator]
             return None
         return Signal(
             "S2",
@@ -87,7 +89,7 @@ def default_detectors(enabled: tuple[str, ...] | list[str] = ALL_SIGNALS) -> lis
 class FinishGate:
     """S5(a): reject FINISH while steps remain, at most ``max_rejections`` times per trial.
 
-    Not applied after an overshoot (the task can no longer succeed)."""
+    Not applied after an overshoot (the task can no longer succeed) or when progress is unknown."""
 
     def __init__(self, max_rejections: int = 1) -> None:
         self.max_rejections = max_rejections
@@ -95,8 +97,10 @@ class FinishGate:
 
     def check(self, progress: Progress) -> Signal | None:
         """A rejection signal if this FINISH should be refused, else None (accept)."""
-        # Overshot: the task can no longer succeed, so re-asking cannot help.
-        if progress.complete or progress.overshot or self.rejections >= self.max_rejections:
+        # Overshot: the task can no longer succeed, so re-asking cannot help. Unknown progress:
+        # remaining steps cannot be named, so do not override the model.
+        if (progress.complete or progress.overshot or not progress.known
+                or self.rejections >= self.max_rejections):
             return None
         self.rejections += 1
         steps = progress.remaining_steps()
