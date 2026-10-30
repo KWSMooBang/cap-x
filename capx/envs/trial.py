@@ -858,6 +858,7 @@ def _run_single_trial(
                     "exec_s": round(exec_s, 2),
                     "decision_s": round(decision_s, 2),
                     "sim_steps": sim_steps,
+                    "memory": info_step.get("memory"),
                 })
                 del code_blocks[code_block_idx:]
                 del code_block_metadata[code_block_idx:]
@@ -878,6 +879,7 @@ def _run_single_trial(
                     "exec_s": round(exec_s, 2),
                     "decision_s": round(decision_s, 2),
                     "sim_steps": sim_steps,
+                    "memory": info_step.get("memory"),
                 })
                 print("Model chose to finish")
                 num_finishes += 1

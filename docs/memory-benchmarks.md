@@ -21,9 +21,12 @@ uv sync --active --extra libero-mem --extra contactgraspnet
   `LIBERO_CONFIG_PATH` at that config, so a LIBERO-PRO install's config is never read.
 - Envs: `capx.envs.simulators.libero_mem.FrankaLiberoMemEnv(task_id=0..9)`, registered as
   `franka_libero_mem_<task_id>_low_level`. It uses the same API as LIBERO (`FrankaLiberoApi`).
-- Memory state: `obs["memory"]` (and `info["memory"]` on reset) holds the env's sequential-subgoal tracker:
+- Memory state: `env.memory_state()` (and `info["memory"]` on reset and after each code step) holds the
+  env's sequential-subgoal tracker:
   `satisfied_subgoals`, `num_satisfied_subgoals`, `num_subgoals` and `overshot`. As in upstream evaluation, the
   tracker advances on every sim step.
+  It is ground-truth progress, so it is not in `get_observation()` and generated code cannot read it (with
+  `privileged: false` the sandbox also has no `env` global). Trials log it per turn in `all_responses.json`.
 - Init states: upstream ships fixed init states for tasks 0, 6, 7 and 8 only (`scripts/__init_data`). The other
   tasks use random BDDL placement.
 
