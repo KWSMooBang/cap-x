@@ -40,7 +40,7 @@ from capx.utils.launch_utils import (
     _build_multi_turn_decision_prompt_legacy,
     _extract_code,
     _get_visual_feedback,
-    _parse_multi_turn_decision,
+    parse_multi_turn_decision,
     _save_trial_artifacts,
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
@@ -535,8 +535,9 @@ def _handle_multi_turn_step(
             differencing with multiview.
 
     Returns:
-        (decision, new_code, reasoning, multiturn_ensemble_entry)
-        where decision is "regenerate", "finish", or "continue".
+        (decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta)
+        where decision is "regenerate" or "finish" and parse_meta records how the reply was
+        classified (decision_source, decision_flags, legacy_decision).
     """
     use_wrist = config.get("use_wrist_camera", False)
 
@@ -604,25 +605,38 @@ def _handle_multi_turn_step(
         )
 
     # Query model
-    multiturn_ensemble_entry = None
-    if config["use_parallel_ensemble"]:
-        if config.get("use_multimodel", False):
-            print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
-            content = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
-        else:
-            print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
-            content = _query_single_model_ensemble(args, decision_prompt, args.model, is_multiturn=True)
-        multiturn_ensemble_entry = {
-            "ensemble_candidates_txt": content.get("ensemble_candidates_txt", ""),
-            "ensemble_synthesis_txt": content.get("ensemble_synthesis_txt", ""),
-        }
-    else:
-        content = _query_model(args, decision_prompt)
+    def query_decision():
+        if config["use_parallel_ensemble"]:
+            if config.get("use_multimodel", False):
+                print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
+                out = _query_model_ensemble(args, decision_prompt, is_multiturn=True)
+            else:
+                print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
+                out = _query_single_model_ensemble(args, decision_prompt, args.model, is_multiturn=True)
+            entry = {
+                "ensemble_candidates_txt": out.get("ensemble_candidates_txt", ""),
+                "ensemble_synthesis_txt": out.get("ensemble_synthesis_txt", ""),
+            }
+            return out, entry
+        return _query_model(args, decision_prompt), None
+
+    content, multiturn_ensemble_entry = query_decision()
+    parsed = parse_multi_turn_decision(content["content"])
+    if parsed.source == "empty":
+        # One more try for an empty reply; if it is empty again, finish.
+        print("Empty multi-turn reply; querying once more")
+        content, multiturn_ensemble_entry = query_decision()
+        parsed = parse_multi_turn_decision(content["content"])
+        if parsed.source == "empty":
+            parsed.source = "empty_retry"
 
     reasoning = content["reasoning"]
-    decision, new_code = _parse_multi_turn_decision(content["content"])
-
-    return decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt
+    parse_meta = {
+        "decision_source": parsed.source,
+        "decision_flags": parsed.flags,
+        "legacy_decision": parsed.legacy_decision,
+    }
+    return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
 
 # ---------------------------------------------------------------------------
@@ -831,7 +845,7 @@ def _run_single_trial(
                     )
 
             decision_start = time.time()
-            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt = _handle_multi_turn_step(
+            decision, new_code, mt_reasoning, mt_ensemble, decision_prompt, parse_meta = _handle_multi_turn_step(
                 env, obs, args, config, visual_differencing_args,
                 multi_turn_prompt, code_blocks, code_block_idx, info_step,
                 task_description, visual_feedback_imgs, visual_feedback_base64_history,
@@ -859,6 +873,7 @@ def _run_single_trial(
                     "decision_s": round(decision_s, 2),
                     "sim_steps": sim_steps,
                     "memory": info_step.get("memory"),
+                    **parse_meta,
                 })
                 del code_blocks[code_block_idx:]
                 del code_block_metadata[code_block_idx:]
@@ -880,6 +895,7 @@ def _run_single_trial(
                     "decision_s": round(decision_s, 2),
                     "sim_steps": sim_steps,
                     "memory": info_step.get("memory"),
+                    **parse_meta,
                 })
                 print("Model chose to finish")
                 num_finishes += 1

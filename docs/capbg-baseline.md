@@ -111,6 +111,17 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 - After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
 - Generated code that loops forever inside a bare `except:` can still swallow every alarm.
 
+## Multi-turn decisions
+
+The original harness treated any reply without the literal `REGENERATE` as FINISH, so new code written without
+the keyword (or in Kimi-K3's raw tool-call format) was dropped and the trial ended. Replies are now classified
+by `parse_multi_turn_decision` in this order: `REGENERATE` keyword (original behavior); a fenced code block
+(also an unclosed one cut off by the token limit) or a tool-call `code` argument means regenerate; `FINISH`
+with no code means finish; an empty reply is queried once more and finishes if it is empty again; anything
+else finishes. Each multi-turn entry in `all_responses.json` records `decision_source`, `decision_flags`
+(`finish_with_code`, `unclosed_fence`) and `legacy_decision`, so runs can report format violations and how
+often the decision differs from the original parser.
+
 ## Privileged information
 
 With `privileged: false` the generated code sees no ground-truth task state: LIBERO-Mem's subgoal tracker is
