@@ -203,9 +203,11 @@ def load_libero_mem_task(
         horizon=horizon,
         control_freq=control_freq,
         camera_depths=camera_depths,
-        # Upstream default passes camera names as segmentation levels; request instance
-        # masks so FrankaLiberoEnv exposes them as images["segmentation"].
-        camera_segmentations="instance",
+        # Upstream's default passes camera names as segmentation levels, so set it explicitly.
+        # No segmentation: with privileged=False a GT instance mask in images["segmentation"]
+        # would leak privileged state (LIBERO-PRO has none), and robosuite's per-pixel ID
+        # remapping made each control step ~20x slower.
+        camera_segmentations=None,
     )
     env.seed(0)
 
