@@ -55,8 +55,9 @@ class LaunchArgs:
     temperature: float = 1.0
     """Sampling temperature for code generation (higher = more random)."""
 
-    max_tokens: int = 2048 * 10
-    """Maximum number of tokens to generate in the model response."""
+    max_tokens: int | None = None
+    """Maximum number of tokens to generate in each model response (coding model and VDM). Overrides the
+    YAML ``max_tokens`` key; the default when neither is set is 20480."""
 
     reasoning_effort: str = "medium"
     """Effort level for reasoning models (if applicable). Options: minimal, low, medium, high."""

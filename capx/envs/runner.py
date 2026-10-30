@@ -25,6 +25,7 @@ from capx.envs.trial import (
     _annotate_code_blocks,
     _build_log_lines,
     _run_single_trial,
+    _save_turn_and_combined_videos,
 )
 from capx.utils.launch_utils import (
     TrialSummary,
@@ -344,7 +345,31 @@ def _run_single_trial_with_timeout(
         print(f"Trial {trial} aborted: model request timed out ({error!r})")
     else:
         print(f"Trial {trial} aborted: timeout ({error!r})")
-    return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, error)
+    return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, error, env=env)
+
+
+def _save_timeout_videos(
+    env: CodeExecutionEnvBase,
+    config: dict[str, Any],
+    trial: int,
+    pa: dict[str, Any],
+    info_step: dict[str, Any],
+    reward: float,
+) -> None:
+    """Save the frames recorded before a timeout: finished turns plus the turn that was cut off."""
+    if not config.get("record_video") or not hasattr(env, "get_video_frame_count"):
+        return
+    ranges = list(pa.get("turn_frame_ranges", []))
+    last_end = ranges[-1][1] if ranges else 0
+    count = env.get_video_frame_count()
+    if count > last_end:
+        ranges.append((last_end, count))
+    if not ranges:
+        return  # timed out before any frames (e.g. during the first model query)
+    try:
+        _save_turn_and_combined_videos(env, config, trial, info_step, reward, ranges)
+    except Exception as e:  # a failed video must not lose the trial summary
+        print(f"Trial {trial}: could not save timeout video ({e!r})")
 
 
 def _build_timeout_summary(
@@ -353,8 +378,9 @@ def _build_timeout_summary(
     pa: dict[str, Any],
     config: dict[str, Any],
     exc: BaseException,
+    env: CodeExecutionEnvBase | None = None,
 ) -> TrialSummary:
-    """Build a TrialSummary from partial artifacts after a timeout."""
+    """Build a TrialSummary from partial artifacts after a timeout (and save its video if env is given)."""
     raw_code = pa.get("raw_code", "")
     code_blocks = pa.get("code_blocks", [])
     code_block_metadata = pa.get("code_block_metadata", [])
@@ -392,6 +418,8 @@ def _build_timeout_summary(
         ensemble_data=pa.get("ensemble_data"),
         multiturn_ensemble_data=pa.get("multiturn_ensemble_data", []),
     )
+    if env is not None:
+        _save_timeout_videos(env, config, trial, pa, {**info_step, "sandbox_rc": 1}, reward)
 
     return TrialSummary(
         trial=trial,

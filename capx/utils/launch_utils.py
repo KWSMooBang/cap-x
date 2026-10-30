@@ -79,6 +79,9 @@ def run_server_proc(api_cfg) -> multiprocessing.Process:
     return proc
 
 
+DEFAULT_MAX_TOKENS = 2048 * 10
+
+
 def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     """Load YAML configuration and merge with command-line arguments.
 
@@ -114,6 +117,10 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         current_value = getattr(args, field, cli_default)
         if current_value == cli_default and field in configs_dict:
             setattr(args, field, configs_dict[field])
+
+    # max_tokens (coding model and VDM): CLI > YAML > the original 20480.
+    if getattr(args, "max_tokens", None) is None:
+        args.max_tokens = int(configs_dict.get("max_tokens", DEFAULT_MAX_TOKENS))
 
     # Build merged config dict (CLI args override YAML)
     merged_config = {

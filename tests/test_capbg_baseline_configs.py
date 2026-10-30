@@ -35,7 +35,9 @@ def test_all_benchmarks_covered():
 
 @pytest.mark.parametrize("path", BASELINE_CONFIGS, ids=lambda p: p.relative_to(BASELINE_DIR).as_posix())
 def test_baseline_config_resolves(path):
-    env_factory, config, api_servers = _load_config(LaunchArgs(config_path=str(path)))
+    args = LaunchArgs(config_path=str(path))
+    env_factory, config, api_servers = _load_config(args)
+    assert args.max_tokens == 32768
 
     assert config["use_parallel_ensemble"] is False
     assert config["use_multimodel"] is False
@@ -59,3 +61,18 @@ def test_ensemble_ablation_cli_override():
     _, config, _ = _load_config(args)
     assert config["use_parallel_ensemble"] is True
     assert config["use_multimodel"] is True
+
+
+def test_max_tokens_cli_overrides_yaml():
+    path = BASELINE_DIR / "libero_mem" / "task_06_swap_bowls.yaml"
+    args = LaunchArgs(config_path=str(path), max_tokens=4096)
+    _load_config(args)
+    assert args.max_tokens == 4096
+
+
+def test_max_tokens_default_without_yaml_key():
+    path = REPO_ROOT / "env_configs" / "libero" / "franka_libero_cap_agent0.yaml"
+    assert "max_tokens" not in yaml.safe_load(path.read_text())
+    args = LaunchArgs(config_path=str(path))
+    _load_config(args)
+    assert args.max_tokens == 20480
