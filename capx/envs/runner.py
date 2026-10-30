@@ -335,7 +335,10 @@ def _run_single_trial_with_timeout(
 
     if raise_on_timeout:
         raise TimeoutError(f"Trial {trial} timed out") from error
-    print(f"Trial {trial} timed out after {timeout_seconds} seconds")
+    if isinstance(error, TrialTimeout):
+        print(f"Trial {trial} timed out after {timeout_seconds} seconds")
+    else:
+        print(f"Trial {trial} aborted: model request timed out ({error!r})")
     return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, error)
 
 

@@ -69,6 +69,11 @@ OPENROUTER_MODELS = [
 ]
 OPENROUTER_SERVER_URL = "http://localhost:8110/chat/completions"
 
+# HTTP timeout for one model request (seconds). Reasoning models can take minutes per response.
+MODEL_REQUEST_TIMEOUT_S = 600
+# Extra attempts when a model request times out or the connection drops.
+MODEL_REQUEST_RETRIES = 2
+
 # ---------------------------------------------------------------------------
 # Ensemble configuration
 # ---------------------------------------------------------------------------
@@ -181,6 +186,39 @@ def _completions_to_responses_convert_prompt(prompt: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 
+def _post_chat(server_url: str, headers: dict[str, str], payload: dict) -> requests.Response:
+    """POST a model request until it gets a usable response.
+
+    Timeouts and dropped connections are retried MODEL_REQUEST_RETRIES times, then re-raised.
+    404/5xx responses keep being retried with a long backoff.
+    """
+    data = json.dumps(payload)
+    retry = 1
+    failures = 0
+    while True:
+        try:
+            response = requests.post(
+                server_url, headers=headers, data=data, timeout=MODEL_REQUEST_TIMEOUT_S
+            )
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            if failures >= MODEL_REQUEST_RETRIES:
+                raise
+            failures += 1
+            sleep_time = 10 * failures
+            print(
+                f"Model request failed ({exc!r}); "
+                f"retry {failures}/{MODEL_REQUEST_RETRIES} in {sleep_time} s"
+            )
+            time.sleep(sleep_time)
+            continue
+        if response.status_code not in [404, 500, 502, 503, 504]:
+            return response
+        sleep_time = 240 + random.uniform(-90, 90)
+        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
+        time.sleep(sleep_time)
+        retry += 1
+
+
 def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     """Query vLLM server for code generation.
 
@@ -247,19 +285,7 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
         headers["Authorization"] = f"Bearer {os.getenv('OPENAI_API_KEY')}"
     start_time = time.time()
 
-    # keep calling until it works
-    response = requests.post(
-        server_url, headers=headers, data=json.dumps(payload), timeout=200
-    )
-    retry = 1
-    while response.status_code in [404, 500, 502, 503, 504]:
-        sleep_time = 240 + random.uniform(-90, 90)
-        print(f"Retry {retry}. Model query failed with status code {response.status_code}. Error: {response.text}. Retrying in {sleep_time} seconds...")
-        time.sleep(sleep_time)
-        response = requests.post(
-            server_url, headers=headers, data=json.dumps(payload), timeout=200
-        )
-        retry += 1
+    response = _post_chat(server_url, headers, payload)
 
     end_time = time.time()
     print(f"Time taken to query model: {end_time - start_time:.2f} seconds")
@@ -341,7 +367,7 @@ def query_model_streaming(
         args.server_url,
         headers=headers,
         data=json.dumps(payload),
-        timeout=200,
+        timeout=MODEL_REQUEST_TIMEOUT_S,
         stream=True,
     ) as response:
         response.raise_for_status()
