@@ -32,7 +32,14 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     앙상블 끔·VDM 켬·multi-turn 켬, 생성기 scripts/gen_capbg_baseline_configs.py, docs/capbg-baseline.md
 1c. RoboMME control API (지금 apis: [] 라 cap-x 로 못 돌림)
 1d. LIBERO 설정 경로를 레포별로 분리 (이 서버의 ~/.libero/config.yaml 이 다른 프로젝트 RACA 를 가리킴)
-1e. [진행] kubectl 기준선 파일럿 — 사람이 baccus_cap-bg 에 직접 지시
+1e. [완료] kubectl 파일럿 3회 (EXPERIMENTS.md, 모두 discard — 하네스 문제)
+1f. [진행] 하네스 수정 4건 (2026-10-30 사람 승인, baccus_cap-bg 가 순서대로 쌓아 구현):
+    exp/no-privileged-obs (생성 코드에서 obs["memory"]·env 제거, info 로만 기록, 오염 검사) →
+    exp/decision-parse (REGENERATE 누락 코드 블록·tool-call·빈 응답 처리, decision_source 기록) →
+    exp/step-cap (max_steps 도달 시 삼킬 수 없는 예외로 종료) →
+    exp/libero-mem-init-states (task 1·2·3·4·5·9 init state 50개씩 생성, upstream 4개와 분리 보고)
+    원칙: 두 조건(기준선·BG)에 같은 하네스. BG 가 풀 문제(완료 판단·이력 기억)는 하네스에 넣지 않는다.
+1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 2. 기존 cap-x baseline 으로 두 benchmark 평가 (Belief Graph 없이)
 3. Belief Graph 모듈 설계·구현 (VDM 연동, code refinement 트리거)
 
