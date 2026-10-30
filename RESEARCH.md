@@ -56,6 +56,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     Phase A(capx/belief 독립 모듈) → exp/truncation 병합 후 Phase B(하네스 통합). 평가 설계(실험 규모·API 수준)는 비교 run 전 결정.
 1k. 모델 요청 재시도 목록에 HTTP 529(과부하)·429 추가 (지금은 404/500/502/503/504 만, 2026-10-30 비교 파일럿에서 529 로 trial 1건 손실).
 1l. FINISH 턴의 판단 프롬프트도 저장 (save_multiturn_prompts 가 regenerate 턴만 저장).
+2b. [진행] bg-est (L2 exp_cap-bg_bg-est, 2026-10-31 사람 요청): 정답 없이 API hook + SAM3 지각 + 검증형 VDM + LLM 목표 파싱으로 그래프 추정,
+    memory_mode=bg_est. 신호 S1·S2·S4·S5 (불확실하면 S5 억제). 평가 로그에 oracle 그림자 비교(정확도·진행 오차·이름 뒤바뀜). Phase A 모듈 → Phase B 통합.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
