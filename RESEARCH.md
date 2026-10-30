@@ -20,6 +20,10 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
   배경: 원래 runner 의 1000s SIGALRM timeout 이 sandbox(except BaseException)에 삼켜져 사실상 동작하지 않았음 → exp/trial-timeout 에서 수정.
   재시도 3회를 그대로 두면 timeout 난 trial 을 다시 굴려 성공률이 위로 편향됨. 종료 사유(success / FINISH 후 실패 / 턴 한도 / timeout)는 따로 집계한다.
   주의: 논문 수치도 이 버그가 있는 harness 에서 나왔을 가능성 → LIBERO-PRO 를 논문과 비교할 때 timeout 설정 차이를 적는다.
+- 2026-10-30: LIBERO-Mem 은 camera segmentation 관측을 끈다 (exp/libero-mem-noseg). 켜 두면 robosuite 의 픽셀별 ID 매핑 때문에
+  step 당 0.470s (LIBERO-PRO 0.023s) 였고, privileged=false 인데 GT instance mask 가 get_observation() 으로 노출됐음.
+  끈 뒤 0.025s/step. Oracle BG 가 정답이 필요하면 seg 가 아니라 sim state 를 직접 읽는다.
+  그 전 LIBERO-Mem run(20261029_mem_pilot_*, 5x5 run)은 'seg on (느린 경로)' 조건으로 기록.
 
 ## 백로그
 1. [완료·bg 병합 b9c0046] bench-setup: LIBERO-Mem·RoboMME submodule + uv extra + cap-x wrapper (RoboMME 카메라 렌더링은 kubectl 쪽에서 진행)
