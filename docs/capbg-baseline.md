@@ -111,6 +111,13 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 - After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
 - Generated code that loops forever inside a bare `except:` can still swallow every alarm.
 
+## Privileged information
+
+With `privileged: false` the generated code sees no ground-truth task state: LIBERO-Mem's subgoal tracker is
+only in `info["memory"]` (logged per turn in `all_responses.json`), and the sandbox has no `env` global. The
+sandbox runs in-process, so this is not full isolation (an API function's `__self__` or `APIS` still reaches the
+env); `analyze_pilot.py` flags trials whose code touches such state.
+
 ## Running on kubectl
 
 GPU pods are killed after 30 minutes without GPU use. Do `uv sync`, submodule checkout and other CPU-only work
