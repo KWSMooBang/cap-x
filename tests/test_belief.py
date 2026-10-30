@@ -342,23 +342,30 @@ def test_step_matching_ignores_predicate_order():
 def test_vdm_history_accumulates_and_trims():
     mem = make_memory("vdm_history", max_chars=150)
     assert isinstance(mem, VdmHistoryMemory)
-    assert mem.after_turn(1, None).text is None
-    t2 = mem.after_turn(2, "The bowl moved\n to plate 3.")
-    assert t2.text.endswith("turn 2: The bowl moved to plate 3.")
-    mem.after_turn(3, "Nothing changed.")
+    assert mem.after_turn(1, None).text is None  # no previous turns
+    assert mem.after_turn(2, "The bowl moved\n to plate 3.").text is None  # turn 1 had no VDM text
+    t3 = mem.after_turn(3, "Nothing changed.")
+    assert t3.text == "VDM history (previous turns, oldest first):\nturn 2: The bowl moved to plate 3."
     t4 = mem.after_turn(4, "The second bowl is now on plate 1.")
-    assert len(t4.text) <= 150
-    assert "turn 4: The second bowl" in t4.text and "turn 2:" not in t4.text
-    assert "earlier turns omitted" in t4.text
-    assert t4.signals == [] and mem.check_finish() is None
+    assert t4.text.endswith("turn 3: Nothing changed.") and "turn 4" not in t4.text  # this turn: VDM block
+    mem.after_turn(5, "The third bowl moved off the table and onto plate 2.")
+    t6 = mem.after_turn(6, "Nothing.")
+    assert len(t6.text) <= 150
+    assert "turn 5: The third bowl" in t6.text and "turn 2:" not in t6.text and "turn 6" not in t6.text
+    assert "earlier turns omitted" in t6.text
+    assert t6.signals == [] and mem.check_finish() is None
 
     long = make_memory("vdm_history", max_chars=100)
-    text = long.after_turn(1, "x" * 500).text
+    long.after_turn(1, "x" * 500)
+    text = long.after_turn(2, "later").text
     assert len(text) <= 100 and text.endswith("x")
-    for cap in (5, 30, 62, 63):  # caps around and below the header length
+    for cap in (5, 30, 43, 44):  # caps around and below the header length
         tiny = make_memory("vdm_history", max_chars=cap)
-        assert len(tiny.after_turn(1, "y" * 200).text) <= cap
-    assert make_memory("vdm_history", max_chars=0).after_turn(1, "z").text is None
+        tiny.after_turn(1, "y" * 200)
+        assert len(tiny.after_turn(2, "z").text) <= cap
+    zero = make_memory("vdm_history", max_chars=0)
+    zero.after_turn(1, "z")
+    assert zero.after_turn(2, "z").text is None
 
     mem.reset()
     assert mem.entries == []

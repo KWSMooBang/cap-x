@@ -182,19 +182,25 @@ def test_bg_oracle_initial_prompt_off_and_signals_off(tmp_path, monkeypatch):
     assert "Signals: none" in responses[1]["memory_text"]
 
 
-def test_vdm_history_accumulates_across_turns(tmp_path, monkeypatch):
+def test_vdm_history_holds_previous_turns_only(tmp_path, monkeypatch):
     model, responses, _ = run_scenario(tmp_path, monkeypatch, memory_mode="vdm_history")
     golden = json.loads(GOLDEN.read_text())
     assert json.loads(json.dumps(model.prompts[0])) == golden[0]  # no initial memory for vdm_history
+    assert responses[1]["memory_text"] is None  # turn 1: no previous turns
+    # Turn 3 (prompt 4): turns 1-2 in the history, turn 3's description only in the VDM block.
     last = model.prompts[4][-1]["content"][0]["text"]
-    assert "turn 1: VDM description 1" in last and "turn 3: VDM description 3" in last
+    history = last[last.index("VDM history (previous turns, oldest first):"):last.index("Based on the code")]
+    assert "turn 1: VDM description 1" in history and "turn 2: VDM description 2" in history
+    assert "VDM description 3" not in history and last.count("VDM description 3") == 1
     assert last.index("VDM description 3: the bowl moved.\n") < last.index("VDM history")
     assert {r["memory_mode"] for r in responses} == {"vdm_history"}
     # Apart from the memory block, the prompts are those of memory_mode none.
     for got, base in zip(model.prompts[1:], golden[1:], strict=True):
         text = got[-1]["content"][0]["text"]
-        start, end = text.index("VDM history"), text.index("Based on the code")
-        assert text[:start] + text[end:] == base[-1]["content"][0]["text"]
+        if "VDM history" in text:
+            start, end = text.index("VDM history"), text.index("Based on the code")
+            text = text[:start] + text[end:]
+        assert text == base[-1]["content"][0]["text"]
 
 
 def test_builder_without_memory_is_unchanged():

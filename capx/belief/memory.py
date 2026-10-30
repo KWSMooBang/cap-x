@@ -2,7 +2,7 @@
 
 memory_mode:
   none        -- the cap-x baseline: no memory block (prompts unchanged).
-  vdm_history -- every turn's VDM description, kept with its turn number (unstructured text memory).
+  vdm_history -- the VDM descriptions of all previous turns, with turn numbers (unstructured text memory).
   bg_oracle   -- Belief Graph built from simulator ground truth, plus S2/S5 signals.
 
 All three expose the same calls, so the harness does not branch on the mode:
@@ -58,10 +58,13 @@ class NoMemory:
 
 
 class VdmHistoryMemory:
-    """Accumulates VDM descriptions as ``turn k: ...``; the oldest are dropped past ``max_chars``."""
+    """Accumulates VDM descriptions as ``turn k: ...``; the oldest are dropped past ``max_chars``.
+
+    The text for turn k holds turns before k only: the decision prompt already shows turn k's VDM
+    description in its own block."""
 
     mode = "vdm_history"
-    header = "VDM history (what changed in each turn so far, oldest first):"
+    header = "VDM history (previous turns, oldest first):"
 
     def __init__(self, max_chars: int = DEFAULT_MAX_CHARS) -> None:
         self.max_chars = max_chars
@@ -98,8 +101,11 @@ class VdmHistoryMemory:
         return text or None
 
     def after_turn(self, turn: int, vdm_text: str | None = None, executed: bool = True) -> MemoryTurn:
+        """History of the turns before ``turn`` (this turn's VDM text is already in the prompt's VDM
+        block); ``vdm_text`` is then stored for later turns."""
+        text = self.render()
         self.add(turn, vdm_text)
-        return MemoryTurn(self.render())
+        return MemoryTurn(text)
 
     def check_finish(self) -> Signal | None:
         return None

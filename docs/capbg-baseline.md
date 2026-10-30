@@ -171,7 +171,7 @@ YAMLs as they are (`memory_mode` is not in them, so it defaults to `none`):
 | `--memory-mode` | What the decision prompt gets |
 | --- | --- |
 | `none` (default) | The cap-x baseline. Every prompt is byte-identical to the harness before memory existed (`tests/test_memory_mode.py` checks this against a recorded fixture). |
-| `vdm_history` | Every turn's VDM description so far, as `turn k: ...` (unstructured text memory). |
+| `vdm_history` | The VDM descriptions of all previous turns, as `turn k: ...` (unstructured text memory). The current turn's description is already in the VDM block, so the history leaves it out. |
 | `bg_oracle` | A Belief Graph built from LIBERO-Mem **simulator ground truth** (`capx/belief/`): progress over the BDDL goal steps, object positions and supports, location-change events, plus the S2 / S5 signals below. This is an upper bound, not a deployable method. |
 
 The memory block goes after the VDM description and before the REGENERATE / FINISH instructions. Options (CLI
