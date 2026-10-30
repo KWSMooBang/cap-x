@@ -1,5 +1,26 @@
 # cap-bg EXPERIMENTS
 
+## 20261030_mem10x5_capx (2026-10-30) — keep (첫 유효 기준선 파일럿, 단 floor effect)
+- 실행: kubectl baccus_cap-bg, 06:57–08:48 UTC. pod 3 × (A100, CPU 18, 40Gi), worker 3 (worker 5 는 영상 프레임 누적으로 OOM → 재시작,
+  중단분 _aborted_w5/). GPU 약 6 GPU-h (재시작 전 포함).
+- 코드: bg 808bc8e (하네스 수정 전부 반영: init state, timeout, model retry, seg off, no privileged obs, decision parse, step cap, 생성 init).
+- 설정: env_configs/capbg_baseline/libero_mem task_00..09 × 5. Kimi-K3 + Qwen3.8-27B VDM (Nebius), 앙상블 끔, VDM 켬, 영상 on,
+  step 8000 / wall 3600 / retries 1, max_tokens 20480.
+- 결과 (baccus 보고 원문): 성공 2/50 (task_00 1/5, task_08 1/5) · 2/50 (API timeout 0) · 2/49 (timeout 1건 제외).
+  init_source 별: upstream(task 0·6·7·8) 2/20, 평균 하위 목표 진행률 0.10 / capbg_generated(task 1–5·9) 0/30, 진행률 0.32 / 전체 0.23.
+  종료 사유: step_cap 34, finish_but_fail 6, turn_limit 5, success 2, misparsed_finish 1, empty_response 1, timeout 1, api_timeout 0.
+  decision_source (coding 응답 293): keyword 228, finish_keyword 8, code_block 5, tool_call 1, fallback 1, empty_retry 1.
+  원래 파서였다면 판정이 달랐을 턴 5. unclosed_fence 17. finish_reason=length 17/293 (5.8%). 오염 검사 0/50.
+  토큰 (coding): prompt 3.24M, completion 2.57M (reasoning 2.08M). 호출 599회 (coding+VDM). 카탈로그 단가 기준 coding 약 48달러 (정확한 금액은 Nebius 콘솔).
+- 판단: keep — 하네스 문제 없이 얻은 첫 기준선. 다만
+  (1) 성공률 4% 로 floor effect → BG 와의 차이를 성공률로는 보기 어려움. 하위 목표 진행률·실패 유형이 주 지표가 되어야 함.
+  (2) step_cap 이 34/50 으로 주 종료 사유 → 8000 step 이 반복·교체 과제에 충분한지 먼저 확인 필요 (하위 목표당 사용 step).
+  (3) 잘린 응답(length) 의 미종결 코드가 실행됨: unclosed_fence 17건, 그중 task_02 tr1 은 무한 루프로 3600s timeout (영상 없음).
+  (4) task_03 1건은 펜스 없는 raw 코드가 fallback → finish 처리.
+- next: 실패 유형 분석 (턴별 sim_steps·진행 상태·overshot + 영상) → step 예산 판단 → 잘림 처리·max_tokens 결정 후 BG 비교 run.
+- 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261030_mem10x5_capx/{RESULTS.md,ANALYSIS.md},
+  로그 /workspace/cap-bg/logs/20261030_mem10x5_capx/, 영상 .../moonshotai_Kimi-K3/<task>/trial_*/video_combined.mp4 (49/50)
+
 ## 20261029_mem5x5_step8000 (2026-10-30) — discard (하네스 버그 3건), 관찰은 keep
 - 실행: kubectl baccus_cap-bg. 코드 52c119f (bg 2e59b74 + exp/libero-mem-egl + exp/trial-timeout).
   camera seg on (느린 경로, 약 2 step/s/worker). OOM 2회·vLLM 중복 1회로 task_06/07 은 재실행분만 집계 (부분 산출물 _oom_partial/).
