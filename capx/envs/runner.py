@@ -282,6 +282,14 @@ def _run_trial_batch(
 # Timeout wrapper
 # ---------------------------------------------------------------------------
 
+def _is_requests_timeout(exc: BaseException) -> bool:
+    try:
+        import requests
+    except ImportError:
+        return False
+    return isinstance(exc, requests.exceptions.Timeout)
+
+
 def _run_single_trial_with_timeout(
     env: CodeExecutionEnvBase,
     trial: int,
@@ -312,12 +320,7 @@ def _run_single_trial_with_timeout(
         )
     except BaseException as exc:
         signal.alarm(0)
-        is_timeout = timed_out or isinstance(exc, TimeoutError)
-        try:
-            import requests as _requests
-            is_timeout = is_timeout or isinstance(exc, _requests.exceptions.Timeout)
-        except Exception:
-            pass
+        is_timeout = timed_out or isinstance(exc, TimeoutError) or _is_requests_timeout(exc)
 
         if not is_timeout:
             raise
@@ -335,10 +338,12 @@ def _run_single_trial_with_timeout(
 
     if raise_on_timeout:
         raise TimeoutError(f"Trial {trial} timed out") from error
-    if isinstance(error, TrialTimeout):
+    if timed_out or isinstance(error, TrialTimeout):
         print(f"Trial {trial} timed out after {timeout_seconds} seconds")
-    else:
+    elif _is_requests_timeout(error):
         print(f"Trial {trial} aborted: model request timed out ({error!r})")
+    else:
+        print(f"Trial {trial} aborted: timeout ({error!r})")
     return _build_timeout_summary(trial, timeout_seconds, partial_artifacts, config, error)
 
 
