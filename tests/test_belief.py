@@ -280,9 +280,12 @@ def test_serialize_never_cuts_progress_and_signals():
     text = mem.render(turn.signals)
     assert text.split("\n") == ["Belief graph (turn 6):", progress, signals]
 
-    # Budget below title + progress + signals: returned over budget, never cut.
+    assert mem.state()["over_budget"] is False
+
+    # Budget below title + progress + signals: returned over budget, never cut, and flagged.
     mem.max_chars = 50
     assert mem.render(turn.signals).split("\n") == ["Belief graph (turn 6):", progress, signals]
+    assert mem.state()["over_budget"] is True
     assert serialize(BeliefGraph(), None, turn=0, max_chars=10).split("\n") == [
         "Belief graph (turn 0):", "Signals: none"]
 

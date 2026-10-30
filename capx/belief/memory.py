@@ -118,6 +118,7 @@ class BgOracleMemory:
         self.estimator: OracleEstimator | None = None
         self.progress: Progress | None = None
         self.turn = 0
+        self.over_budget = False
 
     def reset(self, low_level_env: Any = None, source: GroundTruthSource | None = None) -> None:
         if source is None:
@@ -130,12 +131,15 @@ class BgOracleMemory:
 
     def render(self, signals: list[Signal] = ()) -> str:  # type: ignore[assignment]
         assert self.estimator is not None, "reset() first"
-        return serialize(
+        text = serialize(
             self.estimator.graph, self.progress, signals,
             turn=self.turn, max_chars=self.max_chars,
             subjects=self.estimator.source.movable_objects(),
             current_truths=self.estimator.current_truths(),
         )
+        # Title, Progress and Signals alone exceeded max_chars (serialize never cuts them).
+        self.over_budget = len(text) > self.max_chars
+        return text
 
     def initial_text(self) -> str | None:
         return self.render()
@@ -157,7 +161,8 @@ class BgOracleMemory:
         p = self.progress
         if p is None:
             return {}
-        return {"done": len(p.done), "remaining": p.remaining, "overshot": p.overshot, "known": p.known}
+        return {"done": len(p.done), "remaining": p.remaining, "overshot": p.overshot, "known": p.known,
+                "over_budget": self.over_budget}
 
 
 def make_memory(mode: str = "none", **opts: Any) -> NoMemory | VdmHistoryMemory | BgOracleMemory:
