@@ -14,7 +14,10 @@
   (2) _parse_multi_turn_decision 이 'REGENERATE' 가 없으면 무조건 FINISH → FINISH 종료 9개 중 6개가 실제로는 코드(5)·빈 응답(1). 미수정
   (3) 모델 HTTP 200s timeout → exp/model-request-retry 로 해결(bg 0452124)
   (4) 생성 코드가 robosuite 'terminated episode' ValueError 를 삼키면 step cap 이 강제되지 않음 (task_08 trial2: 8000 step 도달 후 3600s timeout). 미수정
-- next: (2)(4) 수정 후 bg 기준으로 LIBERO-Mem task 0–9 기준선 재실행.
+  (5) init state 가 없는 LIBERO-Mem task(1·2·3·4·5·9)는 raw BDDL reset 이라 시작 장면이 물리적으로 깨짐
+      (plate region 3 이 1·2 를 포함 → 접시 겹침 → 병·그릇 넘어짐). task_02 trial 1·2·4·5 는 깨진 장면에서 시작 → 무효.
+      ferrari-dev 실측: task 2 raw reset 10회 중 8회에서 20° 넘게 기운 물체. upstream 은 contact 0 + 사람 검수로 만든 init 을 task 0·6·7·8 에만 제공.
+- next: (2)(4)(5) 수정 후 bg 기준으로 LIBERO-Mem task 0–9 기준선 재실행.
 - 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261029_mem5x5_step8000/{RESULTS.md,ANALYSIS.md},
   로그 /workspace/cap-bg/logs/20261029_mem5x5_step8000/, 뷰어 데이터 /workspace/cap-bg/viewer/20261029_mem5x5_step8000/,
   뷰어 https://claude.ai/artifact/3DhmnW2RMeki3S4QnzQJLg (사람 계정 private)
