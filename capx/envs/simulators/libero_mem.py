@@ -62,6 +62,7 @@ class FrankaLiberoMemEnv(FrankaLiberoEnv):
         self.handle.reset_progress()
         obs = self.get_observation()
         info["memory"] = self.memory_state()
+        info["init_source"] = self.handle.init_source
         return obs, info
 
     def task_completed(self) -> bool:

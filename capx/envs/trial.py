@@ -674,7 +674,7 @@ def _run_single_trial(
     use_wrist = config.get("use_wrist_camera", False)
 
     # --- 1. Reset environment ---
-    obs, _ = env.reset(options={"trial": trial}, seed=trial)
+    obs, reset_info = env.reset(options={"trial": trial}, seed=trial)
     # Reset the SIGALRM timer AFTER env.reset() so the timeout only covers
     # actual task execution, not scene loading / cuRobo JIT compilation.
     import signal
@@ -790,6 +790,8 @@ def _run_single_trial(
         "reasoning": reasoning if reasoning is not None else "",
         "query_s": round(initial_query_s, 2),
         **response_meta,
+        "init_source": reset_info.get("init_source"),
+        "reset_memory": reset_info.get("memory"),
     })
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:

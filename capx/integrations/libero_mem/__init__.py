@@ -74,6 +74,8 @@ def ensure_libero_mem_importable() -> None:
 @dataclass
 class LiberoMemHandle(LiberoHandle):
     num_subgoals: int = 1
+    # Where init_states came from: upstream | capbg_generated | random (BDDL placement on reset).
+    init_source: str = "random"
 
     def reset(self, seed: int | None = None) -> tuple[Any, dict[str, Any]]:
         obs, info = super().reset(seed=seed)
@@ -166,16 +168,29 @@ def patch_robosuite_egl_context() -> None:
     egl_context.EGLGLContext.__del__ = __del__
 
 
-def _load_init_states(task_name: str) -> Any:
-    """Pregenerated init states. Upstream only ships these for a few tasks (scripts/__init_data);
-    for the rest, BDDL placement sampling on reset is used."""
+# Init states generated in cap-x (scripts/gen_libero_mem_init_states.py) for tasks upstream ships none for.
+GENERATED_INIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "init_states")
+
+
+def _load_init_states(task_name: str) -> tuple[Any, str]:
+    """Pregenerated init states and their source.
+
+    Upstream ships these for a few tasks only (scripts/__init_data); cap-x generates the rest with the
+    same acceptance idea (GENERATED_INIT_DIR). Without either, reset uses BDDL placement sampling,
+    which often spawns overlapping plates that topple objects.
+    """
     import torch
 
-    path = os.path.join(LIBERO_MEM_ROOT, "scripts", "__init_data", f"{task_name}.pruned_init")
-    if not os.path.exists(path):
-        print(f"Warning: no LIBERO-Mem init states for {task_name}; using random BDDL placement")
-        return None
-    return torch.load(path)
+    upstream = os.path.join(LIBERO_MEM_ROOT, "scripts", "__init_data", f"{task_name}.pruned_init")
+    # Both are pickled numpy arrays from trusted sources (submodule, this repo); torch>=2.6 defaults
+    # to weights_only=True, which rejects them unless something else has patched torch.load.
+    if os.path.exists(upstream):
+        return torch.load(upstream, weights_only=False), "upstream"
+    generated = os.path.join(GENERATED_INIT_DIR, f"{task_name}.pruned_init")
+    if os.path.exists(generated):
+        return torch.load(generated, weights_only=False), "capbg_generated"
+    print(f"Warning: no LIBERO-Mem init states for {task_name}; using random BDDL placement")
+    return None, "random"
 
 
 def load_libero_mem_task(
@@ -211,13 +226,15 @@ def load_libero_mem_task(
     )
     env.seed(0)
 
+    init_states, init_source = _load_init_states(task.name)
     return LiberoMemHandle(
         env=env,
         suite_name=SUITE_NAME,
         task_id=task_id,
         task_language=_extract_language_from_bddl(bddl_file_path) or task.language,
-        init_states=_load_init_states(task.name),
+        init_states=init_states,
         num_subgoals=env.env.get_goal_sequence_len(),
+        init_source=init_source,
     )
 
 

@@ -27,8 +27,13 @@ uv sync --active --extra libero-mem --extra contactgraspnet
   tracker advances on every sim step.
   It is ground-truth progress, so it is not in `get_observation()` and generated code cannot read it (with
   `privileged: false` the sandbox also has no `env` global). Trials log it per turn in `all_responses.json`.
-- Init states: upstream ships fixed init states for tasks 0, 6, 7 and 8 only (`scripts/__init_data`). The other
-  tasks use random BDDL placement.
+- Init states: upstream ships fixed init states for tasks 0, 6, 7 and 8 only (`scripts/__init_data`). Raw BDDL
+  placement for the other tasks often spawns overlapping plates that topple the bowl or bottle (8 of 10 resets in
+  task 2), so cap-x ships generated sets for tasks 1, 2, 3, 4, 5 and 9 in `capx/integrations/libero_mem/init_states/`
+  (50 each, made by `scripts/gen_libero_mem_init_states.py`; criteria and pass rates in the `.json` next to each
+  file). `_load_init_states` prefers upstream, then the generated file; `info["init_source"]` (and the initial entry
+  of `all_responses.json`) records `upstream`, `capbg_generated` or `random`. Tasks 1-5 share one scene definition,
+  so their generated sets are identical; report the generated tasks as their own group.
 
 Smoke test (CPU rendering):
 

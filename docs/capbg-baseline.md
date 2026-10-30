@@ -111,6 +111,14 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 - After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
 - Generated code that loops forever inside a bare `except:` can still swallow every alarm.
 
+## Init states
+
+LIBERO-Mem tasks 0, 6, 7 and 8 use upstream init states; tasks 1, 2, 3, 4, 5 and 9 use the generated sets in
+`capx/integrations/libero_mem/init_states/` (see `docs/memory-benchmarks.md`). Each trial records `init_source`, and
+`analyze_pilot.py` reports success per init source, so report the two groups separately. Regenerate with
+`MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1 python scripts/gen_libero_mem_init_states.py --tasks 1 2 3 4 5 9 --num 50`
+(about 4 GB RAM per process; reruns with the same seed give the same states).
+
 ## Step cap
 
 `max_steps` in the low-level env config is the step budget; the robosuite horizon is built from the same value.
