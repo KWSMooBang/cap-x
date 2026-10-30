@@ -24,6 +24,7 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
   step 당 0.470s (LIBERO-PRO 0.023s) 였고, privileged=false 인데 GT instance mask 가 get_observation() 으로 노출됐음.
   끈 뒤 0.025s/step. Oracle BG 가 정답이 필요하면 seg 가 아니라 sim state 를 직접 읽는다.
   그 전 LIBERO-Mem run(20261029_mem_pilot_*, 5x5 run)은 'seg on (느린 경로)' 조건으로 기록.
+- 2026-10-30: 모든 run 은 영상을 항상 녹화한다 (사람 결정). 실패 유형 분류에 필요. 메모리 부족이면 worker 수를 줄이고 영상은 유지.
 
 ## 백로그
 1. [완료·bg 병합 b9c0046] bench-setup: LIBERO-Mem·RoboMME submodule + uv extra + cap-x wrapper (RoboMME 카메라 렌더링은 kubectl 쪽에서 진행)
