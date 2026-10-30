@@ -40,6 +40,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     exp/libero-mem-init-states (task 1·2·3·4·5·9 init state 50개씩 생성, upstream 4개와 분리 보고)
     원칙: 두 조건(기준선·BG)에 같은 하네스. BG 가 풀 문제(완료 판단·이력 기억)는 하네스에 넣지 않는다.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
+1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
+    (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
 2. 기존 cap-x baseline 으로 두 benchmark 평가 (Belief Graph 없이)
 3. Belief Graph 모듈 설계·구현 (VDM 연동, code refinement 트리거)
 
