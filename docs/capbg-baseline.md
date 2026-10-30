@@ -163,6 +163,50 @@ That turn counts toward the turn limit, so repeated truncation cannot loop forev
 therefore only appears when the API reports no `finish_reason` or a reply ends in an open fence for another
 reason.
 
+## Memory conditions (`memory_mode`)
+
+The same baseline configs run every memory condition. Choose the condition on the CLI and leave the generated
+YAMLs as they are (`memory_mode` is not in them, so it defaults to `none`):
+
+| `--memory-mode` | What the decision prompt gets |
+| --- | --- |
+| `none` (default) | The cap-x baseline. Every prompt is byte-identical to the harness before memory existed (`tests/test_memory_mode.py` checks this against a recorded fixture). |
+| `vdm_history` | The VDM descriptions of all previous turns, as `turn k: ...` (unstructured text memory). The current turn's description is already in the VDM block, so the history leaves it out. |
+| `bg_oracle` | A Belief Graph built from LIBERO-Mem **simulator ground truth** (`capx/belief/`): progress over the BDDL goal steps, object positions and supports, location-change events, plus the S2 / S5 signals below. This is an upper bound, not a deployable method. |
+
+The memory block goes after the VDM description and before the REGENERATE / FINISH instructions. Options (CLI
+flag or YAML key of the same name; CLI wins):
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `memory_max_chars` | 3000 | Budget of the memory block. `vdm_history` drops the oldest turns. `bg_oracle` drops the oldest events, then shortens and finally leaves out the objects line, but never cuts the Progress and Signals lines (`memory_state.over_budget` marks when those alone exceed the budget). |
+| `memory_signals` | `S2,S5` | `bg_oracle` signals (`none` turns them off). S2: an executed turn left the number of remaining steps unchanged. The prompt says "no progress this turn" and asks the model to rethink. S5b: every step is verified complete. The prompt says so, and the model still decides FINISH (the harness never ends a trial by itself). S5a: a FINISH while steps remain is rejected and the same prompt is asked again with the reply and the remaining steps appended. That answer stands. |
+| `memory_max_finish_rejections` | 1 | S5a rejections per trial. |
+| `memory_in_initial_prompt` | true | `bg_oracle`: also append the turn-0 graph to the first code-generation prompt. |
+
+Example (LIBERO-Mem task 6, oracle condition):
+
+```bash
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path env_configs/capbg_baseline/libero_mem/task_06_swap_bowls.yaml \
+    --memory-mode bg_oracle --output-dir outputs/capbg_bg_oracle/task_06_swap_bowls ...  # model flags as above
+```
+
+Use a separate `--output-dir` per condition. The generated YAMLs all point to the same default directory.
+
+A turn that ran no code (`truncated_skip`) still updates the memory, so its text keeps the current turn
+number, but it never fires S2. The next executed turn is compared with the last executed one.
+
+Logs in `all_responses.json`: the initial entry has `memory_mode`, `memory_initial_text` (exactly what was
+appended to the first prompt, or null) and `memory_state`. Every decision entry has `memory_mode`, `memory_text`
+(exactly what the prompt got), `memory_signals` (`[{id, reason, text}]`), `memory_state` (`bg_oracle`: `done`,
+`remaining`, `overshot`, `known`, `over_budget`) and `s5_rejected`. A rejected FINISH also records `s5_rejection`,
+`s5_first_reply` (the rejected reply with its parse metadata) and `s5_rejection_prompt_tail` (the two appended
+messages). The entry's decision fields describe the second answer.
+
+`bg_oracle` reads ground truth through the harness's own `env.low_level_env` reference. Generated code still
+gets no memory or env object (exposing a belief API to code is out of scope).
+
 ## Privileged information
 
 With `privileged: false` the generated code sees no ground-truth task state: LIBERO-Mem's subgoal tracker is

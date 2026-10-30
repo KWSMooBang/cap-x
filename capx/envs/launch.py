@@ -122,6 +122,23 @@ class LaunchArgs:
     use_multimodel: bool | None = None
     """Whether to use multimodel for parallel ensembling."""
 
+    # Memory condition (capx.belief); each overrides the YAML key of the same name
+    memory_mode: str | None = None
+    """Memory in the multi-turn decision prompt: none (cap-x baseline, default), vdm_history (every
+    turn's VDM description) or bg_oracle (Belief Graph from simulator ground truth + S2/S5 signals)."""
+
+    memory_max_chars: int | None = None
+    """Character budget of the memory block (default 3000)."""
+
+    memory_signals: str | None = None
+    """bg_oracle signals, comma-separated: "S2,S5" (default) or "none"."""
+
+    memory_in_initial_prompt: bool | None = None
+    """bg_oracle: also put the initial Belief Graph into the first code-generation prompt (default True)."""
+
+    memory_max_finish_rejections: int | None = None
+    """bg_oracle S5(a): how many FINISH replies to reject per trial while steps remain (default 1)."""
+
     # Web UI configuration
     web_ui: bool | None = None
     """Launch the interactive web UI instead of running trials in headless CLI mode."""
