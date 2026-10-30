@@ -24,6 +24,9 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
   step 당 0.470s (LIBERO-PRO 0.023s) 였고, privileged=false 인데 GT instance mask 가 get_observation() 으로 노출됐음.
   끈 뒤 0.025s/step. Oracle BG 가 정답이 필요하면 seg 가 아니라 sim state 를 직접 읽는다.
   그 전 LIBERO-Mem run(20261029_mem_pilot_*, 5x5 run)은 'seg on (느린 경로)' 조건으로 기록.
+- 2026-10-30: 비교 run 평가 설계 — CaP-Agent0 API(FrankaLiberoApiReducedSkillLibrary) 그대로 유지 (사람 결정 '그대로').
+  정답 위치 API 진단 실험은 하지 않음. 주 지표는 하위 목표 진행률·기억 관련 실패 비율·완료 후 계속 행동 비율.
+- 2026-10-30: 판단 프롬프트에 목표 문장이 채워지지 않는 원본 버그('Goal: {libero_environment_goal}')를 모든 조건에 고친다 (사람 승인).
 - 2026-10-30: 모든 run 은 영상을 항상 녹화한다 (사람 결정). 실패 유형 분류에 필요. 메모리 부족이면 worker 수를 줄이고 영상은 유지.
 
 ## 백로그
@@ -47,7 +50,7 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 1j. [완료·bg 병합 660d1a9] exp/truncation (2026-10-30 사람 결정, baccus_cap-bg): finish_reason=length 응답은 실행 안 함(재질의 1회, 또 잘리면 피드백만),
     max_tokens 32768 (YAML 지원, coding·VDM 공통, 원본 기본값 20480 과 다름), timeout trial 도 영상 저장.
     이번엔 안 함: task 5 step 상한, 영상 프레임 디스크 스트리밍(1i), raw 코드 파서 보완.
-2a. [진행] oracle-bg (L2 exp_cap-bg_oracle-bg): memory_mode none / vdm_history / bg_oracle, 정답 그래프 직렬화 + S2(정체)·S5(완료 검증).
+2a. [완료·bg 병합 cae13af] oracle-bg (L2 exp_cap-bg_oracle-bg): memory_mode none / vdm_history / bg_oracle, 정답 그래프 직렬화 + S2(정체)·S5(완료 검증).
     Phase A(capx/belief 독립 모듈) → exp/truncation 병합 후 Phase B(하네스 통합). 평가 설계(실험 규모·API 수준)는 비교 run 전 결정.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
