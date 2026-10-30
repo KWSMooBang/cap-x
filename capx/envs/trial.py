@@ -56,6 +56,11 @@ MULTITURN_LIMIT = 10
 # Wall-clock budget per trial attempt in seconds, counted from after env.reset(); the
 # ``trial_timeout_s`` config key overrides it.
 TRIAL_TIMEOUT_SECONDS = 1000
+# A reply with finish_reason "length" is never executed: it is queried once more, and if that is cut off
+# too, the turn runs no code and the next decision prompt gets this text in place of the console stderr.
+TRUNCATED_REPLY_FEEDBACK = (
+    "Your previous reply was cut off by the output token limit and was not executed. Reply more concisely."
+)
 
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
@@ -68,6 +73,8 @@ def _annotate_code_blocks(
     """Join code blocks into a single string with ``# Code block N`` headers."""
     annotated = []
     for i, (block, metadata) in enumerate(zip(code_blocks, code_block_metadata, strict=False)):
+        if metadata.get("skipped") == "truncated":
+            block = "# (reply cut off by the output token limit; nothing executed)"
         annotated.append(f"# Code block {i}\n{block}")
     return "\n\n".join(annotated)
 
@@ -478,28 +485,39 @@ def _query_initial_code(
 
     Returns:
         (raw_code, reasoning, ensemble_data, response_meta) where response_meta holds the reply's
-        finish_reason and token usage when the API reports them.
+        finish_reason and token usage when the API reports them. A reply cut off at max_tokens is
+        queried once more; response_meta then has truncation "retry" (the second reply is used) or
+        "skip" (cut off again: the caller must not execute it) and the first reply's usage.
     """
     # Save the initial prompt
     with open(os.path.join(config["output_dir"], "initial_prompt.txt"), "w") as f:
         f.write(str(obs["full_prompt"]))
 
-    ensemble_data = None
-    if config["use_parallel_ensemble"]:
+    def query():
+        if not config["use_parallel_ensemble"]:
+            return _query_model(args, obs["full_prompt"]), None
         if config.get("use_multimodel", False):
             print("RUNNING MULTIMODEL ENSEMBLE QUERY")
             out = _query_model_ensemble(args, obs["full_prompt"], is_multiturn=False)
         else:
             print("RUNNING SINGLE MODEL ENSEMBLE QUERY")
             out = _query_single_model_ensemble(args, obs["full_prompt"], args.model, is_multiturn=False)
-        ensemble_data = {
+        return out, {
             "ensemble_candidates_txt": out["ensemble_candidates_txt"],
             "ensemble_synthesis_txt": out["ensemble_synthesis_txt"],
         }
-    else:
-        out = _query_model(args, obs["full_prompt"])
+
+    out, ensemble_data = query()
+    truncation = None
+    if out.get("finish_reason") == "length":
+        print("Initial reply hit max_tokens; querying once more")
+        first_usage = out.get("usage")
+        out, ensemble_data = query()
+        truncation = "skip" if out.get("finish_reason") == "length" else "retry"
 
     response_meta = {"finish_reason": out.get("finish_reason"), "usage": out.get("usage")}
+    if truncation is not None:
+        response_meta.update(truncation=truncation, truncated_first_usage=first_usage)
     return out["content"], out["reasoning"], ensemble_data, response_meta
 
 
@@ -538,8 +556,9 @@ def _handle_multi_turn_step(
 
     Returns:
         (decision, new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta)
-        where decision is "regenerate" or "finish" and parse_meta records how the reply was
-        classified (decision_source, decision_flags, legacy_decision).
+        where decision is "regenerate", "finish" or "truncated_skip" (the reply was cut off at
+        max_tokens twice and must not be acted on) and parse_meta records how the reply was
+        classified (decision_source, decision_flags, legacy_decision, truncation).
     """
     use_wrist = config.get("use_wrist_camera", False)
 
@@ -623,9 +642,17 @@ def _handle_multi_turn_step(
         return _query_model(args, decision_prompt), None
 
     content, multiturn_ensemble_entry = query_decision()
+    truncation = None
+    first_usage = None
+    if content.get("finish_reason") == "length":
+        # Cut off at max_tokens (on Nebius possibly mid-reasoning, with empty content): ask once more.
+        print("Multi-turn reply hit max_tokens; querying once more")
+        first_usage = content.get("usage")
+        content, multiturn_ensemble_entry = query_decision()
+        truncation = "retry"
     parsed = parse_multi_turn_decision(content["content"])
     first_finish_reason = None
-    if parsed.source == "empty":
+    if parsed.source == "empty" and content.get("finish_reason") != "length":
         # One more try for an empty reply; if it is empty again, finish.
         print("Empty multi-turn reply; querying once more")
         first_finish_reason = content.get("finish_reason")
@@ -633,6 +660,10 @@ def _handle_multi_turn_step(
         parsed = parse_multi_turn_decision(content["content"])
         if parsed.source == "empty":
             parsed.source = "empty_retry"
+    if content.get("finish_reason") == "length":
+        # Cut off again: run nothing; the next turn tells the model (unclosed_fence never applies here).
+        truncation = "skip"
+        parsed.decision, parsed.new_code, parsed.source, parsed.flags = "truncated_skip", None, "truncated_skip", []
 
     reasoning = content["reasoning"]
     parse_meta = {
@@ -644,6 +675,8 @@ def _handle_multi_turn_step(
     }
     if parsed.source == "empty_retry" or first_finish_reason is not None:
         parse_meta["empty_first_finish_reason"] = first_finish_reason
+    if truncation is not None:
+        parse_meta.update(truncation=truncation, truncated_first_usage=first_usage)
     return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
 
@@ -776,12 +809,20 @@ def _run_single_trial(
             "num_code_blocks": 0,
             "ensemble_data": ensemble_data,
             "multiturn_ensemble_data": multiturn_ensemble_data,
+            "turn_frame_ranges": turn_frame_ranges,
         })
 
     # Parse initial code into blocks
-    initial_blocks = _extract_code(raw_code)
-    code_blocks.extend(initial_blocks)
-    code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
+    if response_meta.get("truncation") == "skip":
+        # Cut off twice: run nothing and go to the first decision turn with the truncation feedback.
+        initial_blocks = []
+        code_blocks.append("")
+        code_block_metadata.append({"generation": 0, "regenerated": False, "skipped": "truncated"})
+        response_meta["decision_source"] = "truncated_skip"
+    else:
+        initial_blocks = _extract_code(raw_code)
+        code_blocks.extend(initial_blocks)
+        code_block_metadata.extend([{"generation": 0, "regenerated": False}] * len(initial_blocks))
     all_responses.append({
         "block_idx": [0],
         "code_blocks": initial_blocks,
@@ -815,13 +856,19 @@ def _run_single_trial(
 
     while code_block_idx < len(code_blocks) and code_block_idx <= MULTITURN_LIMIT:
         code = code_blocks[code_block_idx]
+        skipped = code_block_metadata[code_block_idx].get("skipped") == "truncated"
         code_block_idx += 1
 
         # Record frame index before step
         frame_start = env.get_video_frame_count() if recording_frames else 0
 
         exec_start = time.time()
-        obs_next, reward, terminated, truncated, info_step = env.step(code)
+        if skipped:
+            # The reply was cut off twice: this turn runs nothing (it still counts toward MULTITURN_LIMIT).
+            obs_next = obs
+            info_step = {**info_step, "stdout": "", "stderr": TRUNCATED_REPLY_FEEDBACK}
+        else:
+            obs_next, reward, terminated, truncated, info_step = env.step(code)
         exec_s = time.time() - exec_start
         # Cumulative low-level sim steps; the episode is truncated at the env's max_steps (horizon).
         sim_steps = getattr(getattr(env, "low_level_env", None), "_sim_step_count", None)
@@ -912,6 +959,27 @@ def _run_single_trial(
                 num_regenerations += 1
                 if partial_artifacts is not None:
                     partial_artifacts["num_regenerations"] = num_regenerations
+
+            elif decision == "truncated_skip":
+                print("Reply cut off by the output token limit twice; not executing it")
+                all_responses.append({
+                    "multi_turn_prompt": decision_prompt if config.get("save_multiturn_prompts", False) else None,
+                    "block_idx": [code_block_idx],
+                    "code_blocks": [],
+                    "decision": "truncated_skip",
+                    "reasoning": mt_reasoning if mt_reasoning is not None else "",
+                    "exec_s": round(exec_s, 2),
+                    "decision_s": round(decision_s, 2),
+                    "sim_steps": sim_steps,
+                    "memory": info_step.get("memory"),
+                    **parse_meta,
+                })
+                del code_blocks[code_block_idx:]
+                del code_block_metadata[code_block_idx:]
+                code_blocks.append("")
+                code_block_metadata.append(
+                    {"generation": num_regenerations, "regenerated": False, "skipped": "truncated"}
+                )
 
             elif decision == "finish":
                 all_responses.append({

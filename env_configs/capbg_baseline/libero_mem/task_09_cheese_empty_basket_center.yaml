@@ -74,6 +74,9 @@ use_video_differencing: false
 use_wrist_camera: false
 record_video: true
 save_multiturn_prompts: true
+# Per-reply token limit for the coding model and the VDM (CLI --max-tokens overrides). Upstream default is
+# 20480; raised because Nebius counts reasoning tokens against it and cut-off replies were common.
+max_tokens: 32768
 output_dir: ./outputs/capbg_baseline/libero_mem/task_09_cheese_empty_basket_center
 
 trials: 50

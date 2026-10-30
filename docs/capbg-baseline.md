@@ -27,6 +27,7 @@ Every config sets these values explicitly instead of relying on defaults:
 | `use_img_differencing` | `true` |
 | `use_visual_feedback`, `use_video_differencing`, `use_wrist_camera` | `false` |
 | `record_video`, `save_multiturn_prompts` | `true` |
+| `max_tokens` | `32768` (coding model and VDM; upstream default 20480, see below) |
 | `prompt`, `multi_turn_prompt` | copied verbatim from the CaP-Agent0 YAML |
 | `apis` | `FrankaLiberoApiReducedSkillLibrary` |
 | `api_servers` | pyroki 8116, contact_graspnet 8115, sam3 8114 (same as CaP-Agent0) |
@@ -37,6 +38,14 @@ Every config sets these values explicitly instead of relying on defaults:
 subclass with the same cameras and control methods. The API only uses `get_observation` and
 `move_to_joints_*`. Its SAM3, GraspNet, pyroki and Molmo clients are HTTP clients, so they need no server when
 the API is created. Each server only has to be up when the generated code calls it.
+
+**`max_tokens`:** the YAML `max_tokens` key sets the per-reply token limit for both the coding model and the
+VDM; `--max-tokens` on the CLI overrides it, and without either the original default 20480 applies. The
+baseline uses 32768, not 20480: on Nebius reasoning tokens count against the limit, and in the LIBERO-Mem 10×5
+pilot (`max_tokens` 20480) Kimi-K3 replies hit it often (17 replies ran with an unclosed code fence and one
+ended a trial with an infinite loop). Checked on Nebius (2026-10-30): both Kimi-K3 and Qwen3.8-27B accept it, and
+a long Kimi-K3 reply ran to exactly 32768 completion tokens before stopping with `finish_reason: length`. Nebius
+does not reject larger values either, so acceptance alone says nothing about the server-side cap.
 
 **Ensemble ablation:** use the same configs and turn the ensemble on from the CLI with
 `--use-parallel-ensemble True --use-multimodel True`.
@@ -111,6 +120,9 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 - After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
 - Generated code that loops forever inside a bare `except:` can still swallow every alarm.
 
+A timed-out trial still saves its video (per-turn videos plus `video_combined.mp4`, including the turn that was
+cut off) from the frames recorded so far; if no frames were recorded, no video is written.
+
 ## Init states
 
 LIBERO-Mem tasks 0, 6, 7 and 8 use upstream init states; tasks 1, 2, 3, 4, 5 and 9 use the generated sets in
@@ -141,6 +153,15 @@ queried once more and finishes if it is empty again; anything else finishes. Eac
 differs from the original parser. Every model reply entry also records `finish_reason` and `usage`:
 `finish_reason: length` means the reply hit `max_tokens`, and on Nebius reasoning tokens count against it (a
 reply cut during reasoning comes back with empty content).
+
+A reply with `finish_reason: length` is never executed or parsed (the initial code and multi-turn decisions
+alike): the same prompt is queried once more, and the entry records `truncation: retry` and the first reply's
+`truncated_first_usage`. If the second reply is cut off too (`truncation: skip`, `decision_source:
+truncated_skip`), no code runs; the next turn runs nothing and its decision prompt shows "Your previous reply was
+cut off by the output token limit and was not executed. Reply more concisely." in place of the console stderr.
+That turn counts toward the turn limit, so repeated truncation cannot loop forever. The `unclosed_fence` flag
+therefore only appears when the API reports no `finish_reason` or a reply ends in an open fence for another
+reason.
 
 ## Privileged information
 
