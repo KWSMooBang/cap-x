@@ -3,6 +3,7 @@ vdm_history and bg_oracle add their block to the decision prompt; S5(a) rejects 
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -14,12 +15,26 @@ from PIL import Image
 
 import capx.envs.trial as trial_mod
 from capx.belief import memory as memory_mod
+from capx.envs.tasks.base import CodeExecEnvConfig, CodeExecutionEnvBase
 from capx.envs.trial import _run_single_trial
 from capx.utils.launch_utils import _build_multi_turn_decision_prompt, _memory_config
 from tests.test_belief import FakeSource
-from tests.test_truncation import CUT, MULTI_TURN_PROMPT, STEP_ONCE, FakeModel, make_config, make_env, reply
+from tests.test_truncation import CUT, MULTI_TURN_PROMPT, STEP_ONCE, FakeEnv, FakeModel, make_config, reply
 
 GOLDEN = Path(__file__).parent / "fixtures" / "memory_none_prompts.json"
+# The same scenario on the harness before the goal fix: decision prompts kept 'Goal: {libero_environment_goal}'.
+GOLDEN_PRE_GOAL_FIX = Path(__file__).parent / "fixtures" / "memory_none_prompts_pre_goal_fix.json"
+
+GOAL = "swap the 2 bowls on their plates using the empty plate"
+PLACEHOLDER = "{libero_environment_goal}"
+
+
+def make_env() -> CodeExecutionEnvBase:
+    """Fake env with a LIBERO-style prompt; its handle carries the task language like LIBERO's."""
+    cfg = CodeExecEnvConfig(low_level=FakeEnv(), apis=[], privileged=True, prompt=f"test\nGoal: {PLACEHOLDER}")
+    env = CodeExecutionEnvBase(cfg)
+    env.low_level_env.handle = SimpleNamespace(task_language=GOAL)
+    return env
 
 # initial code; regenerate; a decision cut off twice (skipped turn); FINISH.
 SCENARIO = [
@@ -72,6 +87,61 @@ def test_none_prompts_match_pre_memory_harness(tmp_path, monkeypatch):
         GOLDEN.write_text(json.dumps(prompts, indent=1))
     assert len(prompts) == 5
     assert prompts == json.loads(GOLDEN.read_text())
+
+
+def _user_text(prompt) -> str:
+    return "".join(c.get("text", "") for m in prompt if m["role"] == "user" for c in m["content"])
+
+
+def test_goal_fix_changes_only_goal_line():
+    """The goal fix changes only the decision prompts' Goal line (placeholder -> goal)."""
+    after, before = json.loads(GOLDEN.read_text()), json.loads(GOLDEN_PRE_GOAL_FIX.read_text())
+    assert len(after) == len(before) == 5
+    assert after[0] == before[0]  # first code-generation prompt was already filled
+    assert f"Goal: {GOAL}" in _user_text(after[0])
+    for a, b in zip(after[1:], before[1:], strict=True):
+        a_lines, b_lines = _user_text(a).split("\n"), _user_text(b).split("\n")
+        assert len(a_lines) == len(b_lines)
+        diff = [(x, y) for x, y in zip(a_lines, b_lines) if x != y]
+        assert diff == [(f"Goal: {GOAL}", f"Goal: {PLACEHOLDER}")]
+
+
+@pytest.mark.parametrize("mode", ["none", "vdm_history", "bg_oracle"])
+def test_goal_in_every_prompt(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(memory_mod, "LiberoMemSource", StepDrivenSource)
+    # bg_oracle: the first FINISH is rejected (S5a), so the re-ask prompt is covered too.
+    replies = [reply(STEP_ONCE), reply("FINISH"), TWO_STEPS, reply("FINISH")] if mode == "bg_oracle" else SCENARIO
+    model, _, _ = run_scenario(tmp_path, monkeypatch, replies, memory_mode=mode)
+    assert len(model.prompts) >= 4
+    for prompt in model.prompts:
+        assert PLACEHOLDER not in json.dumps(prompt)
+        assert _user_text(prompt).count(f"Goal: {GOAL}") == 1
+
+
+def test_fill_prompt_goal_starts_from_template_each_trial():
+    env = make_env()
+    env.fill_prompt_goal("first goal")
+    assert "Goal: first goal" in _user_text(env._get_observation()["full_prompt"])
+    env.reset(seed=1)
+    assert f"Goal: {PLACEHOLDER}" in _user_text(env._get_observation()["full_prompt"])  # reset restores the template
+    env.fill_prompt_goal("second goal")
+    text = _user_text(env._get_observation()["full_prompt"])
+    assert "Goal: second goal" in text and "first goal" not in text
+    env.fill_prompt_goal("third goal")  # also without a reset in between
+    assert "Goal: third goal" in _user_text(env._get_observation()["full_prompt"])
+
+
+def test_prompt_without_goal_placeholder_is_unchanged():
+    from tests.test_truncation import make_env as make_plain_env
+
+    env = make_plain_env()
+    before = copy.deepcopy(env._get_observation()["full_prompt"])
+    env.low_level_env.handle = SimpleNamespace(task_language=GOAL)
+    obs, _ = env.reset(seed=0)
+    obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
+    trial_mod._patch_libero_goal(env, obs)
+    assert obs["full_prompt"] == before
+    assert env._get_observation()["full_prompt"] == before
 
 
 # --- bg_oracle / vdm_history through the trial loop -------------------------------------------

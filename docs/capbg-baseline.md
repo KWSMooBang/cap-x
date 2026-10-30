@@ -163,6 +163,12 @@ That turn counts toward the turn limit, so repeated truncation cannot loop forev
 therefore only appears when the API reports no `finish_reason` or a reply ends in an open fence for another
 reason.
 
+**Goal in decision prompts (differs from the original cap-x):** the original harness filled
+`{libero_environment_goal}` only in the first prompt, so every decision prompt said `Goal:
+{libero_environment_goal}`. `_patch_libero_goal` now also fills the env's own prompt (from the unfilled template,
+restored on `reset()`), so all memory modes see the same goal line in every prompt; the first prompt and the VDM
+task description are unchanged.
+
 ## Memory conditions (`memory_mode`)
 
 The same baseline configs run every memory condition. Choose the condition on the CLI and leave the generated

@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import io
 import sys
 import traceback
@@ -130,6 +131,8 @@ class CodeExecutionEnvBase(Env):
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": [{"type": "text", "text": self._get_complete_prompt()}]},
         ]
+        # Unfilled prompt; reset() restores it and fill_prompt_goal() formats a copy of it.
+        self._full_prompt_template = copy.deepcopy(self._full_prompt)
 
         # Persistent execution namespace to retain variables across steps
         self._exec_globals: dict[str, Any] = {}
@@ -245,6 +248,21 @@ class CodeExecutionEnvBase(Env):
                 return get_env(src, privileged=privileged, enable_render=enable_render, viser_debug=viser_debug)
         return src
 
+    def fill_prompt_goal(self, goal: str) -> None:
+        """Fill ``{libero_environment_goal}`` in the env's own prompt.
+
+        Multi-turn decision prompts are built from the observation ``step()`` returns, which
+        carries this prompt, so filling it here puts the goal in every prompt of the trial.
+        Formats the unfilled template each time, so goals never build up across trials.
+        A prompt without the placeholder is left unchanged.
+        """
+        text = self._full_prompt_template[-1]["content"][0]["text"]
+        if "libero_environment_goal" not in text:
+            return
+        prompt = copy.deepcopy(self._full_prompt_template)
+        prompt[-1]["content"][0]["text"] = text.format(libero_environment_goal=goal)
+        self._full_prompt = prompt
+
     def _get_observation(self) -> dict[str, Any]:
         """
         Gets the observation of the environment. This should be consistent for all environments, where observation from low level environment
@@ -273,6 +291,7 @@ class CodeExecutionEnvBase(Env):
             tuple[ObsType, dict[str, Any]]: A tuple containing the observation and info.
         """
         self._step_count = 0
+        self._full_prompt = copy.deepcopy(self._full_prompt_template)
         obs, info = self.low_level_env.reset(seed=seed, options=options)
         obs.update(self._get_observation())
         # Reinitialize globals for a fresh episode and prime INPUTS with the reset observation
