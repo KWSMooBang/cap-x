@@ -122,6 +122,12 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "num_workers": args.num_workers
         if args.num_workers is not None
         else configs_dict.get("num_workers", 1),
+        "trial_timeout_s": args.trial_timeout_s
+        if args.trial_timeout_s is not None
+        else configs_dict.get("trial_timeout_s"),
+        "max_trial_retries": args.max_trial_retries
+        if args.max_trial_retries is not None
+        else configs_dict.get("max_trial_retries"),
         "record_video": args.record_video
         if args.record_video is not None
         else configs_dict.get("record_video", False),

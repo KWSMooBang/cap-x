@@ -9,7 +9,7 @@
 #   .venv-molmo/bin/python capx/serving/vllm_server.py --model allenai/Molmo2-8B --port 8122 \
 #       --max-model-len 16384 --max-num-batched-tokens 16384
 #
-# Requires: uv sync --active --extra libero-mem --extra contactgraspnet (.venv-libero-mem); MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1
+# Requires: uv sync --active --extra libero-mem --extra contactgraspnet (.venv-libero-mem); GPU: MUJOCO_GL=egl PYOPENGL_PLATFORM=egl; CPU only: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1
 # Run: uv run --no-sync --active capx/envs/launch.py --config-path env_configs/capbg_baseline/libero_mem/task_03_bottle_3_times.yaml --model <MODEL> ...
 
 env:
