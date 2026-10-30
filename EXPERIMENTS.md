@@ -1,5 +1,24 @@
 # cap-bg EXPERIMENTS
 
+## 20261029_mem5x5_step8000 (2026-10-30) — discard (하네스 버그 3건), 관찰은 keep
+- 실행: kubectl baccus_cap-bg. 코드 52c119f (bg 2e59b74 + exp/libero-mem-egl + exp/trial-timeout).
+  camera seg on (느린 경로, 약 2 step/s/worker). OOM 2회·vLLM 중복 1회로 task_06/07 은 재실행분만 집계 (부분 산출물 _oom_partial/).
+- 설정: env_configs/capbg_baseline/libero_mem task_00/02/06/07/08 × 5. Kimi-K3 + Qwen3.8-27B VDM (Nebius), 앙상블 끔, VDM 켬.
+  예산: step 8000(주) / wall 3600s / retries 1. 영상: task 0·2·7 on, 6·8 off.
+- 결과 (baccus 보고 원문): 성공 1/25 (전부 집계) · 1/23 (API timeout 제외) · 1/10 (모든 timeout 제외). 성공은 task_00 trial5 하나.
+  종료 사유: timeout 13, misparsed_finish 5, api_timeout 2, finish_but_fail 2, empty_response 1, step_cap 1.
+  task_00: 성공 1 / finish_but_fail 1 / timeout 3 · task_02: finish_but_fail 1 / misparsed 1 / timeout 3 ·
+  task_06: misparsed 3 / timeout 2 · task_07: misparsed 1 / timeout 3 / api 1 · task_08: empty 1 / step_cap 1 / timeout 2 / api 1
+- 판단: discard. 결과를 가린 하네스 문제:
+  (1) seg 관측 때문에 sim 이 느려 step cap 대신 wall timeout 이 걸림 → exp/libero-mem-noseg 로 해결(bg 0452124)
+  (2) _parse_multi_turn_decision 이 'REGENERATE' 가 없으면 무조건 FINISH → FINISH 종료 9개 중 6개가 실제로는 코드(5)·빈 응답(1). 미수정
+  (3) 모델 HTTP 200s timeout → exp/model-request-retry 로 해결(bg 0452124)
+  (4) 생성 코드가 robosuite 'terminated episode' ValueError 를 삼키면 step cap 이 강제되지 않음 (task_08 trial2: 8000 step 도달 후 3600s timeout). 미수정
+- next: (2)(4) 수정 후 bg 기준으로 LIBERO-Mem task 0–9 기준선 재실행.
+- 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261029_mem5x5_step8000/{RESULTS.md,ANALYSIS.md},
+  로그 /workspace/cap-bg/logs/20261029_mem5x5_step8000/, 뷰어 데이터 /workspace/cap-bg/viewer/20261029_mem5x5_step8000/,
+  뷰어 https://claude.ai/artifact/3DhmnW2RMeki3S4QnzQJLg (사람 계정 private)
+
 ## 20261029_mem_pilot_ensoff_t1800 (2026-10-30) — discard (예산 문제로 판정 불가), 관찰은 keep
 - 실행: kubectl baccus_cap-bg, A100 1장 · CPU 16, EGL, worker 5. 비용 약 8달러.
 - 코드: 17b71ae (= bg 2e59b74 + exp/libero-mem-egl 0b3fc22 + exp/trial-timeout 17b71ae)
