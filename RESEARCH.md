@@ -44,7 +44,7 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     같은 seed 로 같은 50개 배치가 나옴 → 그대로 사용 (같은 장면에서 지시만 다른 통제된 비교; task 0 은 upstream 세트).
 1i. 영상 프레임을 메모리에 쌓지 않고 디스크로 바로 쓰기 (800x512 프레임이 4 step 마다 trial 끝까지 RAM 에 쌓여 worker 당 수 GB →
     40Gi pod 에서 worker 5 가 OOM, 2026-10-30 파일럿은 worker 3 으로 대응). 에이전트가 보는 VDM 이미지와는 별개 경로라 결과엔 영향 없음.
-1j. [진행] exp/truncation (2026-10-30 사람 결정, baccus_cap-bg): finish_reason=length 응답은 실행 안 함(재질의 1회, 또 잘리면 피드백만),
+1j. [완료·bg 병합 660d1a9] exp/truncation (2026-10-30 사람 결정, baccus_cap-bg): finish_reason=length 응답은 실행 안 함(재질의 1회, 또 잘리면 피드백만),
     max_tokens 32768 (YAML 지원, coding·VDM 공통, 원본 기본값 20480 과 다름), timeout trial 도 영상 저장.
     이번엔 안 함: task 5 step 상한, 영상 프레임 디스크 스트리밍(1i), raw 코드 파서 보완.
 2a. [진행] oracle-bg (L2 exp_cap-bg_oracle-bg): memory_mode none / vdm_history / bg_oracle, 정답 그래프 직렬화 + S2(정체)·S5(완료 검증).
