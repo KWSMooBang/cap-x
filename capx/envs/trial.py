@@ -849,6 +849,8 @@ def _run_single_trial(
                 "exec_s": round(exec_s, 2),
                 "sim_steps": sim_steps,
                 "memory": info_step.get("memory"),
+                # The block that hit the cap may still have completed the task (summary keeps it).
+                "task_completed": info_step.get("task_completed"),
             })
             print(f"Episode truncated at {sim_steps} sim steps (step cap)")
             break
