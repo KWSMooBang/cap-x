@@ -12,7 +12,7 @@ from robosuite.utils.camera_utils import get_real_depth_map
 from robot_descriptions.loaders.yourdfpy import load_robot_description
 from viser.extras import ViserUrdf
 
-from capx.envs.base import BaseEnv
+from capx.envs.base import BaseEnv, EpisodeTruncated
 from capx.integrations.libero import load_libero_task
 from capx.utils.camera_utils import obs_get_rgb
 from capx.utils.depth_utils import depth_color_to_pointcloud
@@ -240,6 +240,7 @@ class FrankaLiberoEnv(BaseEnv):
             action[-1] = 1.0 - action[-1] * 2.0
 
             # Step the environment
+            self._check_step_budget()
             self._current_obs, self._current_reward, self._current_done, self._current_info = (
                 self.handle.step(action)
             )
@@ -263,6 +264,11 @@ class FrankaLiberoEnv(BaseEnv):
 
             steps += 1
 
+    def _check_step_budget(self) -> None:
+        """Stop the episode at max_steps sim steps (also the robosuite horizon) before stepping past it."""
+        if self._sim_step_count >= self.max_steps:
+            raise EpisodeTruncated(f"Episode truncated: reached max_steps={self.max_steps} sim steps")
+
     def _set_gripper(self, fraction: float) -> None:
         """Set gripper opening fraction.
 
@@ -278,6 +284,7 @@ class FrankaLiberoEnv(BaseEnv):
         # Map gripper: 1.0 (open) -> -1.0, 0.0 (closed) -> 1.0
         action[-1] = 1.0 - action[-1] * 2.0
 
+        self._check_step_budget()
         self._current_obs, self._current_reward, self._current_done, self._current_info = (
             self.handle.step(action)
         )

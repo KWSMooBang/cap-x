@@ -838,11 +838,23 @@ def _run_single_trial(
 
         obs = obs_next
 
+        # Step cap: env.step reports truncated from the env's own step count (stderr matching only as
+        # a fallback for envs without one).
+        if truncated or "terminated episode" in info_step["stderr"]:
+            truncated = True
+            all_responses.append({
+                "decision": "truncated",
+                "reason": "step_cap",
+                "block_idx": [code_block_idx],
+                "exec_s": round(exec_s, 2),
+                "sim_steps": sim_steps,
+                "memory": info_step.get("memory"),
+            })
+            print(f"Episode truncated at {sim_steps} sim steps (step cap)")
+            break
+
         # Multi-turn decision
         if multi_turn_prompt:
-            if "terminated episode" in info_step["stderr"]:
-                truncated = True
-                break
 
             # Get turn frames for video differencing
             turn_frames = None

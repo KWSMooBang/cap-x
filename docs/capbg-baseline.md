@@ -111,6 +111,14 @@ Known limitations of the SIGALRM timeout (the robust fix is killing the worker p
 - After the deadline the alarm re-fires every 2 s, so it can interrupt cleanup code (`finally` blocks) in the trial.
 - Generated code that loops forever inside a bare `except:` can still swallow every alarm.
 
+## Step cap
+
+`max_steps` in the low-level env config is the step budget; the robosuite horizon is built from the same value.
+`FrankaLiberoEnv` (and LIBERO-Mem) raises `EpisodeTruncated` (a BaseException, so generated code cannot swallow
+it) before a sim step would exceed it. The sandbox stops the code, `env.step` reports `truncated` from the env's
+own step count, and the trial ends with a final `all_responses.json` entry
+`{"decision": "truncated", "reason": "step_cap"}` and `Truncated: True` in `summary.txt`.
+
 ## Multi-turn decisions
 
 The original harness treated any reply without the literal `REGENERATE` as FINISH, so new code written without

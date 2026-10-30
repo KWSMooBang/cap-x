@@ -9,7 +9,7 @@ from typing import Any, SupportsFloat
 import numpy as np
 from gymnasium import Env, spaces
 
-from capx.envs.base import BaseEnv, ObsType, get_env
+from capx.envs.base import BaseEnv, EpisodeTruncated, ObsType, get_env
 from capx.envs.configs.instantiate import instantiate as cfg_instantiate
 from capx.envs.configs.loader import DictLoader
 from capx.integrations.base_api import ApiBase, get_api
@@ -189,6 +189,9 @@ class CodeExecutionEnvBase(Env):
                 exec(code, self._exec_globals, self._exec_globals)
         except TrialTimeout:
             raise
+        except EpisodeTruncated as exc:
+            # The step budget is used up; step() reports truncated and the trial ends.
+            print(f"{exc}", file=tee_err)
         except BaseException:  # defensive; propagate minimal info
             ok = False
             # Always print full traceback to the redirected stderr (tee -> console and buffer)
@@ -297,6 +300,7 @@ class CodeExecutionEnvBase(Env):
             task_completed = None
         terminated = reward == 1.0
 
+        # Read the low-level step count directly; generated code may have swallowed the env's error.
         truncated = getattr(self.low_level_env, "_sim_step_count", 0) >= getattr(
             self.low_level_env, "max_steps", 999999
         )  # type: ignore[arg-type]
