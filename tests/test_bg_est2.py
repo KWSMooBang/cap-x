@@ -138,6 +138,25 @@ def test_declaration_vs_api_records():
     assert d.valid and d.applied  # released over no tracked support: a possible failed place, not a mismatch
     d = check_records(parse_declaration("# Subtask: place(bowl_B, plate_B)", NAMES), RecordFacts(closed=True))
     assert d.valid and not d.applied  # open_gripper never ran: Effects not applied
+    # Grasp missed, open_gripper ran with nothing in hand (LIBERO-Mem task 9 CPU check): not applied.
+    d = check_records(parse_declaration("# Subtask: put_in(bowl_A, plate_B)", NAMES),
+                      RecordFacts(closed=True, opened=True, grasped=[], released=[]))
+    assert d.valid and not d.applied
+    d = check_records(parse_declaration("# Subtask: pick(bowl_A, plate_A)", NAMES), RecordFacts(closed=True, grasped=[]))
+    assert d.valid and not d.applied
+
+
+def test_missed_grasp_counts_nothing():
+    world = swap_world()
+    est, rec, vdm, _, _ = setup(world, SWAP2_GOAL, SWAP)
+    world.api["open_gripper"]()
+    world.api["goto_pose"](np.array([0.6, 0.3, 0.02]))  # nothing here
+    world.api["close_gripper"]()
+    world.api["goto_pose"](np.array([0.5, 0.2, 0.15]))
+    world.api["open_gripper"]()
+    r = turn(est, world, rec, 1, place_code("bowl_A", "plate_C"))
+    assert not r.declaration["applied"] and len(r.progress.done) == 0 and not est.pending
+    assert est.graph.edges[("on", "bowl_A", "plate_A")].holds
 
 
 # --- subtasks / goal --------------------------------------------------------------------------------

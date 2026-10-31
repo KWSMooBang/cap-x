@@ -714,7 +714,7 @@ class BeliefEstimatorV2(BeliefEstimator):
                 continue
             s1.append(f"declared {key_text(key)} {int(after)} after {decl.subtask_text}, but the "
                       f"{'robot state' if self.origin.get(key) == 'robot' else 'camera'} shows {int(not after)}")
-        result.s1_items = s1
+        result.s1_items = list(dict.fromkeys(s1))  # a count withdrawn in two passes is listed once
 
         self.loc = final
         self.turn = turn

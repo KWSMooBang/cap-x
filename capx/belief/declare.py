@@ -175,5 +175,12 @@ def check_records(d: Declaration, facts: RecordFacts) -> Declaration:
     elif d.op == "place_region" and facts.released and all(r[0] != obj for r in facts.released):
         d.dropped = f"{d.subtask_text} declared but the gripper released {facts.released[-1][0]}"
     if d.dropped is None:
-        d.applied = trig is not None and (facts.closed if trig == "close_gripper" else facts.opened)
+        # The operator's call must have acted on the declared object: a pick needs it grasped, a place
+        # needs it released (an open_gripper with nothing in hand, e.g. after a missed grasp, is not one).
+        if trig == "close_gripper":
+            d.applied = facts.closed and (obj in facts.grasped)
+        elif trig == "open_gripper":
+            d.applied = facts.opened and any(r[0] == obj for r in facts.released)
+        else:
+            d.applied = False
     return d
