@@ -559,6 +559,18 @@ simulator, no keys); `query` sends them to the VDM as M5 prompts (`OBSERVE_VDM_U
 `OBSERVE_VDM_API_KEY`) and writes `results.jsonl`, `table.md` (accuracy per predicate × condition × truth, `?`
 rate). `LIBERO_MEM_ROOT` points scene making at another LIBERO-Mem checkout (for its init states).
 
+### CPU check (2026-11-01)
+
+One LIBERO-Mem trial each on CPU (OSMesa), `perception=sim_fake_for_tests`, a fake coding model (writes the next
+planned subtask as rim-grasp code with `# Subtask` / `# Effect`) and a fake Observe VDM that answers from
+simulator truth (`?` for objects the fake detector missed). Not an evaluation: it checks the pipeline.
+
+| Task | Result | bg_est2 |
+| --- | --- | --- |
+| 06 swap | success, 3 blocks | goal_match_normalized true, step error 0 every turn, Observe 22/22 right, 3/3 blocks declared, 6/6 Effects right, S5b right. Turn 2: bowl_B hidden by the arm → `?` → place pending, step pending, confirmed in turn 3. |
+| 02 repeat ×3 | not completed (fake code) | a place that left the bowl on the plate rim judged failed (S1, oracle agrees), count withdrawn; 3 repetitions counted, the last pending under the arm (S4, S5b suppressed). |
+| 08 / 09 baskets | not completed (fake top grasp of the cheese misses) | every missed grasp → pick failed + S1 / S2 (9/9 right each); no step counted (found and fixed: an `open_gripper` after a missed grasp used to apply the declared put_in Effect). 08: one basket missed by the fake detector at turn 0 → goal with one basket, later an alias swap. |
+
 ### Known limitations (v2)
 
 - The VDM is the main observer of relations; its accuracy on marked LIBERO images is not yet measured
