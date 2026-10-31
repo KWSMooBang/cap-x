@@ -46,7 +46,8 @@ def identity(est, world) -> dict[str, str]:
     """alias -> world object it currently sits on (test-only ground truth check)."""
     out = {}
     for a, t in est.tracks.items():
-        out[a] = min(world.objects, key=lambda n: np.linalg.norm(world.objects[n]["pos"] - t.pos))
+        same = [n for n in world.objects if world.objects[n]["cat"] == t.category.key]
+        out[a] = min(same, key=lambda n: np.linalg.norm(world.objects[n]["pos"] - t.pos))
     return out
 
 
@@ -281,7 +282,8 @@ def test_s1_expected_place_contradicted_by_geometry():
     r = end(est, world, rec, 1)
     assert [v.expected for v in r.violations] == ["bowl_A on plate_C"]
     assert "bowl_A on table" in r.violations[0].observed
-    assert r.progress.done == [(("on", "bowl_A", "plate_C"),)]  # the place was seen by the hooks (limitation)
+    assert r.progress.done == [] and r.rolled_back == ["bowl_A on plate_C"]  # hook count withdrawn
+    assert len(r.violations) == 1  # the withdrawal reuses the place violation
 
 
 def test_s5_suppressed_when_goal_predicate_uncertain():
@@ -294,7 +296,10 @@ def test_s5_suppressed_when_goal_predicate_uncertain():
     det.miss = {"akita_black_bowl_1"}  # the last placed bowl is not seen: only the expectation (0.7)
     r = end(est, world, rec, 3)
     assert r.progress.complete
-    assert [u.pred for u in r.uncertain] == ["bowl_A on plate_B"] and r.uncertain[0].p == pytest.approx(0.7)
+    assert r.pending == [2]  # counted from the hooks, the bowl not seen at the end of the turn
+    assert [u.reason for u in r.uncertain] == ["unconfirmed", "p"]
+    assert r.uncertain[1].pred == "bowl_A on plate_B" and r.uncertain[1].p == pytest.approx(0.7)
+    assert "1 counted step(s) not yet confirmed" in est.progress_text()
     assert r.suppress_completion
     assert "S5b" not in [s.id for s in (d.detect(_ctx(est, r)) for d in est_detectors()) if s]
     assert FinishGate().check(r.progress, suppress=True) is None
@@ -406,3 +411,162 @@ def test_estimation_path_reads_no_sim_state():
     assert r.progress.complete
     with pytest.raises(AssertionError):
         env.sim  # noqa: B018 - the guard itself works
+
+
+# --- review fixes (L1 Phase A review) -------------------------------------------------------------
+
+def test_both_bowls_moved_together_and_back_keep_names():
+    """Swap scene: both bowls moved in one turn (hooked), one of them missed by the detector, then
+    both moved back; the global assignment never hands a moved bowl's detection to the other."""
+    world = swap_world()
+    est, det, rec = setup(world, SWAP_GOAL_JSON, SWAP, noise=0.01)
+    first = dict(identity(est, world))
+    world.pick_place("akita_black_bowl_1", "plate_3")
+    world.pick_place("akita_black_bowl_2", "plate_1")
+    det.miss = {"akita_black_bowl_2"}
+    r1 = end(est, world, rec, 1)
+    assert identity(est, world) == first and not r1.new_tracks
+    world.pick_place("akita_black_bowl_2", "plate_2")
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    r2 = end(est, world, rec, 2)
+    assert identity(est, world) == first and not r2.new_tracks
+    r3 = end(est, world, rec, 3)  # no motion, both seen
+    assert identity(est, world) == first and not r3.rematched
+
+
+def test_global_assignment_prefers_overall_nearest():
+    """Two same-shape bowls both shift, one by almost the gate distance: the per-category assignment
+    keeps the names (the pair choice is made over all tracks and detections at once)."""
+    world = FakeWorld({"plate_1": ("plate", (0.5, -0.3, 0.0)), "b1": ("bowl", (0.5, 0.0, 0.02)),
+                       "b2": ("bowl", (0.5, 0.1, 0.02))})
+    est, det, rec = setup(world, SWAP_GOAL_JSON, "move the bowl to the plate")
+    world.objects["b1"]["pos"] = np.array([0.5, 0.08, 0.02])
+    world.objects["b2"]["pos"] = np.array([0.5, 0.16, 0.02])
+    r = end(est, world, rec, 1)
+    assert identity(est, world) == {"bowl_A": "b1", "bowl_B": "b2", "plate_A": "plate_1"}
+    assert not r.new_tracks and not r.rematched
+
+
+def test_step_counter_consecutive_steps():
+    from capx.belief.estimator import StepCounter
+
+    s1, s2 = (("on", "bowl_A", "plate_C"),), (("on", "bowl_B", "plate_A"),)
+    none = {"bowl_A": frozenset({("on", "plate_A")}), "bowl_B": frozenset({("on", "plate_B")})}
+    first = {"bowl_A": frozenset({("on", "plate_C")}), "bowl_B": frozenset({("on", "plate_B")})}
+    both = {"bowl_A": frozenset({("on", "plate_C")}), "bowl_B": frozenset({("on", "plate_A")})}
+    c = StepCounter([[s1, s2]])
+    c.feed(none)
+    assert c.feed(first) == [s1] and c.feed(both) == [s2]  # the next step right after a count
+    c2 = StepCounter([[s1, s2]])
+    c2.feed(none)
+    assert c2.feed(both) == [s1, s2]  # two steps completed between snapshots
+    rep = StepCounter([[s1, s1]])
+    rep.feed(none)
+    assert rep.feed(first) == [s1] and rep.feed(first) == []  # a repeat must go false again
+    assert rep.feed(none) == [] and rep.feed(first) == [s1]
+
+
+def test_repeat_place_that_rolls_off_is_withdrawn():
+    world = repeat_world()
+    est, det, rec = setup(world, REPEAT_GOAL_JSON, REPEAT)
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    r1 = end(est, world, rec, 1)
+    assert len(r1.progress.done) == 1 and r1.pending == []
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    world.objects["akita_black_bowl_1"]["pos"] = np.array([0.35, -0.2, 0.0])  # rolled off onto the table
+    r2 = end(est, world, rec, 2)
+    assert len(r2.progress.done) == 1 and r2.rolled_back == ["bowl_A on plate_A"]
+    assert [v.expected for v in r2.violations] == ["bowl_A on plate_A"]
+    sig = [s for s in (d.detect(_ctx(est, r2)) for d in est_detectors()) if s]
+    assert sig[0].id == "S1"
+    # Put back properly next turn: counts (the bowl was off the plate in between).
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    r3 = end(est, world, rec, 3)
+    assert len(r3.progress.done) == 2 and r3.pending == []
+
+
+def test_two_repeats_in_one_turn_second_rolls_off():
+    world = repeat_world()
+    est, det, rec = setup(world, REPEAT_GOAL_JSON, REPEAT)
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    world.objects["akita_black_bowl_1"]["pos"] = np.array([0.35, -0.2, 0.0])
+    r = end(est, world, rec, 1)
+    # The first place-back still counts but has no end-of-turn evidence: pending, S5 suppressed.
+    assert len(r.progress.done) == 1 and r.rolled_back == ["bowl_A on plate_A"]
+    assert r.pending == [0] and r.suppress_completion
+
+
+def test_s5_blocked_by_any_unconfirmed_counted_step():
+    """Step 1 counted from the hooks but never seen: it blocks S5 until a later confirmed count
+    vouches for it."""
+    world = swap_world()
+    est, det, rec = setup(world, SWAP_GOAL_JSON, SWAP)
+    world.pick_place("akita_black_bowl_1", "plate_3")
+    det.miss = {"akita_black_bowl_1"}
+    r1 = end(est, world, rec, 1)
+    assert r1.pending == [0] and r1.suppress_completion
+    assert FinishGate().check(r1.progress, suppress=r1.suppress_completion) is None
+    world.pick_place("akita_black_bowl_2", "plate_1")
+    r2 = end(est, world, rec, 2)
+    assert r2.pending == [] and len(r2.progress.done) == 2  # the confirmed step 2 confirms step 1
+
+
+def test_grasp_missed_near_object_is_s1():
+    world = repeat_world()
+    est, det, rec = setup(world, REPEAT_GOAL_JSON, REPEAT)
+    p = world.objects["akita_black_bowl_1"]["pos"]
+    world.api["goto_pose"](p + [0.07, 0, 0.0])  # 7 cm off: the fake gripper closes on air
+    world.api["close_gripper"]()
+    r = end(est, world, rec, 1)
+    assert len(r.violations) == 1
+    v = r.violations[0]
+    assert v.call.startswith("close_gripper") and v.expected.startswith("bowl_A in gripper")
+    assert "nothing grasped" in v.observed
+    world.api["goto_pose"](np.array([0.2, 0.4, 0.3]))  # nothing nearby: no signal
+    world.api["close_gripper"]()
+    assert end(est, world, rec, 2).violations == []
+
+
+def test_table_only_from_table_height():
+    world = FakeWorld({"plate_1": ("plate", (0.5, -0.2, 0.0)), "b1": ("bowl", (0.5, 0.1, 0.0))})
+    est, det, rec = setup(world, SWAP_GOAL_JSON, "put the bowl on the plate")
+    assert est.table_z == pytest.approx(-0.025)  # lowest bottom at turn 0
+    assert est.pred_belief(("on", "bowl_A", "table"))[0] == pytest.approx(0.97)
+    assert est.pred_belief(("on", "plate_A", "table"))[0] > 0.7  # bottom 1.5 cm above: still likely
+    world.objects["b1"]["pos"] = np.array([0.5, 0.1, 0.03])  # bottom 3 cm above the table: not sure
+    r = end(est, world, rec, 1)
+    assert 0.3 < est.pred_belief(("on", "bowl_A", "table"))[0] < 0.7
+    world.objects["b1"]["pos"] = np.array([0.5, 0.1, 0.25])  # floating (e.g. on something untracked)
+    end(est, world, rec, 2)
+    assert est.pred_belief(("on", "bowl_A", "table"))[0] == pytest.approx(0.03)
+    assert "bowl_A (black bowl) at (0.50, 0.10, 0.25) location unknown" in est.render()
+    assert r is not None
+    est2 = BeliefEstimator(FakeDetector(FakeWorld({})))  # nothing seen at turn 0: no table height
+    est2.start(FakeWorld({}).get_observation(), "put the bowl on the plate")
+    assert est2.table_z is None and est2.pred_belief(("on", "bowl_A", "table")) == (0.5, "prior", None)
+
+
+def test_hook_recording_failures_never_change_the_call():
+    class BadRepr:
+        def __repr__(self):
+            raise RuntimeError("no repr")
+
+    eef = np.array([0.1, 0.2, 0.3])
+    rec = ApiCallRecorder(lambda: (eef, 0.5), lambda: 1 / 0)
+    assert rec.wrap("goto_pose", lambda x: "ok")(BadRepr()) == "ok"
+    r = rec.drain()[0]
+    assert r.args == "<unprintable>" and r.step_after is None
+    eef[0] = 9.0
+    assert r.eef_after[0] == pytest.approx(0.1)  # recorded copy
+    rec2 = ApiCallRecorder(lambda: ("not an array", "nan?"), None)
+    with pytest.raises(KeyError):
+        rec2.wrap("open_gripper", lambda: {}["x"])()
+
+
+def test_state_reports_perception_source():
+    world = swap_world()
+    est, det, rec = setup(world, SWAP_GOAL_JSON, SWAP)
+    assert est.state()["perception"] == "fake"
+    world.pick_place("akita_black_bowl_1", "plate_3")
+    assert end(est, world, rec, 1).to_log()["perception"] == "fake"

@@ -87,7 +87,8 @@ class ApiCallRecorder:
 
     def _proprio(self) -> Proprio | None:
         try:
-            return self.proprio_fn() if self.proprio_fn is not None else None
+            p = self.proprio_fn() if self.proprio_fn is not None else None
+            return None if p is None else (np.array(p[0], dtype=np.float64, copy=True), float(p[1]))
         except Exception:
             return None
 
@@ -115,19 +116,35 @@ class ApiCallRecorder:
                 raise
             finally:
                 self._depth -= 1
-                after = self._proprio()
-                self.records.append(CallRecord(
-                    index=len(self.records), fn=name, args=_short_args(args, kwargs),
-                    step_before=step_before, step_after=self._clock(),
-                    eef_before=None if before is None else np.asarray(before[0], dtype=np.float64),
-                    eef_after=None if after is None else np.asarray(after[0], dtype=np.float64),
-                    gripper_before=None if before is None else float(before[1]),
-                    gripper_after=None if after is None else float(after[1]),
-                    error=error,
-                ))
+                self._record(name, args, kwargs, before, step_before, error)
 
         hooked.__bg_hooked__ = True  # type: ignore[attr-defined]
         return hooked
+
+    def _record(self, name: str, args: tuple, kwargs: dict, before: Proprio | None, step_before: int | None,
+                error: str | None) -> None:
+        """Append a record; never raises, so the wrapped call's result or exception is unchanged."""
+        try:
+            after = self._proprio()
+            try:
+                arg_text = _short_args(args, kwargs)
+            except Exception:
+                arg_text = "<unprintable>"
+
+            def vec(p: Proprio | None) -> np.ndarray | None:
+                return None if p is None else np.array(p[0], dtype=np.float64, copy=True).reshape(-1)[:3]
+
+            def grip(p: Proprio | None) -> float | None:
+                return None if p is None else float(p[1])
+
+            self.records.append(CallRecord(
+                index=len(self.records), fn=name, args=arg_text,
+                step_before=step_before, step_after=self._clock(),
+                eef_before=vec(before), eef_after=vec(after),
+                gripper_before=grip(before), gripper_after=grip(after), error=error,
+            ))
+        except Exception:
+            pass
 
     def wrap_functions(self, fns: dict[str, Callable[..., Any]]) -> dict[str, Callable[..., Any]]:
         return {name: self.wrap(name, fn) for name, fn in fns.items()}

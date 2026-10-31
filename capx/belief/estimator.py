@@ -54,6 +54,7 @@ from .signals import Signal, Uncertain, Violation
 from .verify import Hypothesis, VdmVerifier, encode_png, pred_text
 
 TABLE = "table"
+UNKNOWN_LOCATION = "location unknown"
 EST_TITLE = (
     "Belief graph (turn {turn}), ESTIMATED from the cameras, the robot state and the API calls: positions and "
     "relations may be wrong. Relations show belief P and source (obs: camera geometry or gripper, vdm: visual "
@@ -75,6 +76,7 @@ class EstConfig:
     support_radius_min: float = 0.03  # m
     on_dz_min: float = -0.01  # m: On(x, y) needs z_x - z_y in (on_dz_min, on_dz_max)
     on_dz_max: float = 0.10
+    table_tol: float = 0.03  # m: an object's bottom this close to the table height can be on the table
     margin_scale: float = 0.02  # m: margin to a threshold that gives full confidence (P 0.97 / 0.03)
     p_vdm: float = 0.9  # P of a VDM true (1 - p_vdm for false)
     stale_turns: int = 2  # a memory not re-observed for this many turns counts as uncertain (S4)
@@ -125,6 +127,9 @@ class EstTurn:
     verify: dict[str, Any] | None = None
     records: list[dict[str, Any]] = field(default_factory=list)
     snapshots: int = 0
+    pending: list[int] = field(default_factory=list)  # counted steps (indices) not yet confirmed
+    rolled_back: list[str] = field(default_factory=list)
+    perception: str = ""
 
     def to_log(self) -> dict[str, Any]:
         p = self.progress
@@ -146,22 +151,32 @@ class EstTurn:
             "verify": self.verify,
             "records": self.records,
             "snapshots": self.snapshots,
+            "pending": self.pending,
+            "rolled_back": self.rolled_back,
+            "perception": self.perception,
         }
 
 
 def _holds_in(snapshot: Snapshot, pred: Pred) -> bool:
     if pred[0] == "inhand":
         return ("inhand", None) in snapshot.get(pred[1], frozenset())
-    if pred[2] == TABLE:  # on the table: tracked, and on / in / held by nothing tracked
-        return pred[1] in snapshot and not snapshot[pred[1]]
     return (pred[0], pred[2]) in snapshot.get(pred[1], frozenset())
 
 
 class StepCounter:
-    """Counts goal steps over location snapshots (see module docstring)."""
+    """Counts goal steps over location snapshots (see module docstring).
+
+    ``was_false`` is kept per step for every goal step from the first snapshot on, so a step that
+    turns true in the same snapshot as (or right after) the previous count is still counted; a
+    counted step must turn false again before it can count again (repeats)."""
 
     def __init__(self, branches: list[list[Step]]) -> None:
         self.branches = branches
+        self.steps: list[Step] = []
+        for b in branches:
+            for s in b:
+                if s not in self.steps:
+                    self.steps.append(s)
         self.done: list[Step] = []
         self.was_false: dict[Step, bool] = {}
         self.overshot = False
@@ -169,22 +184,29 @@ class StepCounter:
     def progress(self) -> Progress:
         return Progress.from_completed(self.branches, self.done, self.overshot)
 
-    def feed(self, snapshot: Snapshot, final: bool = False) -> Step | None:
-        prog = self.progress()
-        if prog.complete:
-            last = self.done[-1]
-            if final and not all(_holds_in(snapshot, p) for p in last):
-                self.overshot = True  # like LIBERO-Mem: the finished goal was undone
-            return None
-        for step in prog.next_steps():
-            if all(_holds_in(snapshot, p) for p in step):
-                if self.was_false.get(step, False):
-                    self.done.append(step)
-                    self.was_false = {}
-                    return step
-            else:
-                self.was_false[step] = True
-        return None
+    def checkpoint(self) -> tuple[list[Step], dict[Step, bool], bool]:
+        return list(self.done), dict(self.was_false), self.overshot
+
+    def restore(self, ckpt: tuple[list[Step], dict[Step, bool], bool]) -> None:
+        self.done, self.was_false, self.overshot = list(ckpt[0]), dict(ckpt[1]), ckpt[2]
+
+    def feed(self, snapshot: Snapshot, final: bool = False) -> list[Step]:
+        """Count the steps this snapshot completes (several in a row if they all hold)."""
+        holds = {s: all(_holds_in(snapshot, p) for p in s) for s in self.steps}
+        counted: list[Step] = []
+        while not self.progress().complete:
+            hit = next((s for s in self.progress().next_steps() if holds[s] and self.was_false.get(s)), None)
+            if hit is None:
+                break
+            self.done.append(hit)
+            self.was_false[hit] = False
+            counted.append(hit)
+        for s in self.steps:
+            if not holds[s]:
+                self.was_false[s] = True
+        if final and self.done and self.progress().complete and not holds[self.done[-1]]:
+            self.overshot = True  # like LIBERO-Mem: the finished goal was undone
+        return counted
 
 
 def _pred_key(p: Pred) -> EdgeKey:
@@ -229,6 +251,8 @@ class BeliefEstimator:
         self.violations: list[Violation] = []
         self.last_image: str | None = None
         self.turn = 0
+        self.table_z: float | None = None  # table height: lowest object bottom at turn 0
+        self.pending: set[int] = set()  # indices into counter.done not yet confirmed by observation
 
     # --- tracks ---------------------------------------------------------------------------------
     def _new_alias(self, cat: Category) -> str:
@@ -270,12 +294,17 @@ class BeliefEstimator:
             tracks = [t for t in self.tracks.values() if t.category.key == cat.key]
             cat_dets = [d for d in dets if d.category == cat.key]
             free_t, free_d = list(range(len(tracks))), list(range(len(cat_dets)))
+            # Pass 1: one global assignment over every track and detection of the category (distances
+            # to the predictions, the held object at the EEF), so a track can only take a detection if
+            # that is best for the category as a whole; only pairs within gate_dist are accepted.
+            # Pass 2: leftovers only, within rematch_dist.
             for gate, label in ((self.cfg.gate_dist, "gate"), (self.cfg.rematch_dist, "rematch")):
                 if not free_t or not free_d:
                     break
                 cost = np.array([[np.linalg.norm(self._predicted(tracks[i], eef) - cat_dets[j].center)
                                   for j in free_d] for i in free_t])
-                rows, cols = linear_sum_assignment(np.where(cost <= gate, cost, 1e6))
+                limit = self.cfg.rematch_dist
+                rows, cols = linear_sum_assignment(np.where(cost <= limit, cost, 1e6))
                 matched_t, matched_d = set(), set()
                 for r, c in zip(rows, cols, strict=True):
                     if cost[r, c] > gate:
@@ -348,7 +377,7 @@ class BeliefEstimator:
 
     def location_text(self, alias: str, snap: Snapshot | None = None) -> str:
         rels = (snap or self.loc).get(alias, frozenset())
-        return format_location(rels) if rels else f"on {TABLE}"
+        return format_location(rels) if rels else UNKNOWN_LOCATION
 
     # --- turn 0 ---------------------------------------------------------------------------------
     def start(
@@ -367,6 +396,8 @@ class BeliefEstimator:
             self.gripper_cmd = "closed"
         dets = self._dedup(self.perception.detect(obs, self.categories))
         self._initial_tracks(dets)
+        if dets:
+            self.table_z = min(float(d.center[2] - 0.5 * d.size[2]) for d in dets)
         for _ in range(self.cfg.init_passes - 1):  # merge further passes (fills in missed objects)
             self._associate(self._dedup(self.perception.detect(obs, self.categories)), eef, 0)
         self._fuse(0, self._observe_relations(0, set(self.tracks), proprio), {}, {})
@@ -381,7 +412,8 @@ class BeliefEstimator:
             self.counter.feed(self.loc)
         self.last_image = self._image(obs)
         self.turn = 0
-        return EstTurn(0, self.counter.progress(), detections=len(dets), new_tracks=sorted(self.tracks))
+        return EstTurn(0, self.counter.progress(), detections=len(dets), new_tracks=sorted(self.tracks),
+                       perception=self.perception_name)
 
     def _image(self, obs: dict[str, Any]) -> str | None:
         if self.verifier is None:
@@ -401,8 +433,8 @@ class BeliefEstimator:
         thr = self.cfg.grasp_threshold
 
         def move(alias: str, new: frozenset) -> None:
-            before = format_location(loc.get(alias, frozenset())) if loc.get(alias) else f"on {TABLE}"
-            after = format_location(new) if new else f"on {TABLE}"
+            before = format_location(loc[alias]) if loc.get(alias) else UNKNOWN_LOCATION
+            after = format_location(new) if new else UNKNOWN_LOCATION
             loc[alias] = new
             if before != after:
                 events.append(EstEvent(turn, alias, before, after, "exp"))
@@ -413,10 +445,15 @@ class BeliefEstimator:
                 continue
             if rec.fn == "close_gripper":
                 self.gripper_cmd = "closed"
-                cand = self._nearest(eef, self.cfg.grasp_radius) if g is not None and g > thr else None
+                near = self._nearest(eef, self.cfg.grasp_radius)
+                cand = near if g is not None and g > thr else None
                 self.held, self.held_lifted, self.grasp_z = (cand.alias if cand else None), False, float(eef[2])
                 if cand is not None:
                     expectations[("inhand", cand.alias, None)] = (True, rec.desc)
+                elif g is not None and near is not None:  # closed fully next to an object: grasp missed
+                    violations.append(Violation(
+                        turn, rec.desc, f"{near.alias} in gripper (nearest object to the gripper)",
+                        f"gripper closed fully ({g:.2f}): nothing grasped"))
             elif rec.fn == "open_gripper":
                 self.gripper_cmd = "open"
                 if self.held is not None:
@@ -428,10 +465,13 @@ class BeliefEstimator:
                         expectations[(pred, t.alias, support.alias)] = (True, rec.desc)
                         t.pos = np.array([eef[0], eef[1], support.pos[2] + 0.02])
                     else:
+                        expectations[("on", t.alias, TABLE)] = (True, rec.desc)
                         t.pos = np.array([eef[0], eef[1], self.grasp_z + self.cfg.held_offset[2]])
                     if self.held_lifted:
-                        move(t.alias, frozenset({("in" if support is not None and support.category.container else "on",
-                                                  support.alias)}) if support is not None else frozenset())
+                        if support is None:
+                            move(t.alias, frozenset({("on", TABLE)}))
+                        else:
+                            move(t.alias, frozenset({("in" if support.category.container else "on", support.alias)}))
                 self.held, self.held_lifted = None, False
             elif self.held is not None:  # a motion while holding
                 t = self.tracks[self.held]
@@ -476,11 +516,19 @@ class BeliefEstimator:
                     obs[("inhand", a, None)] = (0.03, "grip")
         for a in seen:
             x = self.tracks[a]
+            support = 0.0
             for y in self.tracks.values():
                 if y.alias == a or y.category.container and x.category.container:
                     continue
                 key, p = self._relation(x, y, y.alias in seen)
                 obs[key] = (0.03, "geo") if a == holder else (p, "geo")
+                support = max(support, p)
+            if self.table_z is not None:  # On(x, table) only from the table height, never by default
+                bottom = float(x.pos[2] - 0.5 * x.size[2])
+                m = (self.cfg.table_tol - abs(bottom - self.table_z)) / self.cfg.margin_scale
+                p = 0.5 + 0.47 * min(abs(m), 1.0) if m > 0 else 0.5 - 0.47 * min(abs(m), 1.0)
+                p = 0.03 if a == holder else min(p, 1.0 - support)
+                obs[("on", a, TABLE)] = (p, "geo")
         return obs
 
     def _fuse(self, turn: int, obs: dict[EdgeKey, tuple[float, str]], vdm: dict[EdgeKey, bool],
@@ -521,7 +569,7 @@ class BeliefEstimator:
         keys: list[tuple[EdgeKey, str]] = [(k, "expected") for k in expectations if expectations[k][0]]
         for p in self.goal_relevant():
             key = _pred_key(p)
-            if key[2] == TABLE or any(k == key for k, _ in keys):
+            if any(k == key for k, _ in keys):
                 continue
             o = obs.get(key)
             if o is None or self.cfg.uncertain_low <= o[0] <= self.cfg.uncertain_high:
@@ -541,7 +589,8 @@ class BeliefEstimator:
 
     def end_turn(self, turn: int, obs: dict[str, Any], records: Sequence[CallRecord] = (), executed: bool = True) -> EstTurn:
         """Update after a turn from its hook records and the current observation."""
-        result = EstTurn(turn, self.counter.progress(), records=[r.to_dict() for r in records])
+        result = EstTurn(turn, self.counter.progress(), records=[r.to_dict() for r in records],
+                         perception=self.perception_name)
         expectations, snapshots, events, violations = self._apply_records(turn, records)
         result.expectations = [{"edge": _key_text(k, v[0]), "call": v[1]} for k, v in expectations.items()]
 
@@ -609,16 +658,93 @@ class BeliefEstimator:
         result.events = events
 
         if self.goal.branches:
-            for snap in snapshots:
-                self.counter.feed(snap)
-            self.counter.feed(final, final=True)
+            self._count(turn, snapshots, final, result)
         self.loc = final
         self.turn = turn
         result.progress = self.counter.progress()
+        result.pending = sorted(self.pending)
         result.snapshots = len(snapshots) + 1
         result.uncertain = self.uncertain()
         result.suppress_completion = (not result.progress.known) or bool(result.uncertain)
         return result
+
+    # --- counting -------------------------------------------------------------------------------
+    def _observed(self, pred: Pred) -> bool | None:
+        """Truth of ``pred`` as observed this turn (geometry, gripper or VDM), None if not observed."""
+        key = _pred_key(pred)
+        edge = self.graph.edges.get(key)
+        if edge is None or self.origin.get(key) not in ("geo", "grip", "vdm"):
+            return None
+        return edge.holds
+
+    def _verdict(self, step: Step, moved_later: bool) -> str:
+        if moved_later:  # picked up again in the same turn: no end-of-turn evidence for this count
+            return "pending"
+        seen = [self._observed(p) for p in step]
+        if any(v is False for v in seen):
+            return "rejected"
+        return "confirmed" if all(v is True for v in seen) else "pending"
+
+    def _withdraw(self, turn: int, result: EstTurn, step: Step, expected: str, observed: str) -> None:
+        result.rolled_back.append(format_step(step))
+        subjects = {p[1] for p in step}
+        if not any(v.expected.split(" ")[0] in subjects for v in result.violations):
+            self.violations.append(Violation(turn, "progress check", expected, observed))
+            result.violations.append(self.violations[-1])
+
+    def _count(self, turn: int, snapshots: list[Snapshot], final: Snapshot, result: EstTurn) -> None:
+        """Feed this turn's snapshots. A count made on a hook snapshot is pending until an end-of-turn
+        observation confirms it; a contradicted one is withdrawn (with S1); a confirmed count also
+        confirms the pending counts before it."""
+        def subjects(step: Step) -> set[str]:
+            return {p[1] for p in step}
+
+        moved = {a for snap in snapshots for a in snap if snap.get(a) != self.loc.get(a)}
+        # The last count of an earlier turn, if still pending, is judged by this turn's observation
+        # when the hooks did not move its object this turn.
+        last = len(self.counter.done) - 1
+        if last in self.pending and not (subjects(self.counter.done[last]) & moved):
+            v = self._verdict(self.counter.done[last], False)
+            if v == "confirmed":
+                self.pending = set()
+            elif v == "rejected":
+                step = self.counter.done.pop()
+                self.pending.discard(last)
+                self.counter.was_false[step] = True
+                self._withdraw(turn, result, step, f"{format_step(step)} (counted in an earlier turn)",
+                               "not what the camera shows now: count withdrawn")
+
+        ckpt = self.counter.checkpoint()
+        for attempt in range(2):
+            counts: list[tuple[Step, int | None]] = []
+            for i, snap in enumerate(snapshots):
+                counts += [(st, i) for st in self.counter.feed(snap)]
+            counts += [(st, None) for st in self.counter.feed(final, final=True)]
+            verdicts = []
+            for st, i in counts:
+                moved_later = i is not None and any(
+                    snap.get(a) != snapshots[i].get(a) for snap in snapshots[i + 1:] for a in subjects(st))
+                verdicts.append(self._verdict(st, moved_later))
+            bad = [i for (_, i), v in zip(counts, verdicts, strict=True) if v == "rejected" and i is not None]
+            if not bad or attempt:
+                break
+            # Count again from the turn start without the first contradicted hook snapshot and after.
+            for (st, _i), v in zip(counts, verdicts, strict=True):
+                if v == "rejected":
+                    self._withdraw(turn, result, st, f"{format_step(st)} after the hooked place",
+                                   "not confirmed by the camera: count withdrawn")
+            self.counter.restore(ckpt)
+            snapshots = snapshots[:min(bad)]
+        base = len(ckpt[0])
+        for j, v in enumerate(verdicts):
+            idx = base + j
+            if idx >= len(self.counter.done):
+                break
+            if v == "confirmed":
+                self.pending = {q for q in self.pending if q > idx}
+            else:
+                self.pending.add(idx)
+        self.pending = {q for q in self.pending if q < len(self.counter.done)}
 
     # --- progress / uncertainty -----------------------------------------------------------------
     def goal_relevant(self) -> list[Pred]:
@@ -642,12 +768,6 @@ class BeliefEstimator:
                 seen = None
             elif seen is not None and tgt.last_seen_turn is not None:
                 seen = min(seen, tgt.last_seen_turn)
-        if p[0] == "on" and p[2] == TABLE:
-            if p[1] not in self.tracks:
-                return 0.5, "prior", None
-            ps = [self.graph.edges[k].p for k in self._location_edges(p[1])]
-            label = self._label(max(self._location_edges(p[1]), key=lambda k: self.graph.edges[k].p)) if ps else "obs"
-            return 1.0 - max(ps, default=0.0), label, seen
         edge = self.graph.edges.get(_pred_key(p))
         if edge is None:
             return 0.5, "prior", seen
@@ -657,8 +777,28 @@ class BeliefEstimator:
         o = self.origin.get(key, self.graph.edges[key].source if key in self.graph.edges else "prior")
         return {"geo": "obs", "grip": "obs", "expected": "exp"}.get(o, o)
 
+    @property
+    def perception_name(self) -> str:
+        return str(getattr(self.perception, "name", type(self.perception).__name__))
+
+    def state(self) -> dict[str, Any]:
+        """Small summary for logs (includes which perception source fed the graph)."""
+        p = self.counter.progress()
+        return {"perception": self.perception_name, "tracks": len(self.tracks), "goal_source": self.goal.source,
+                "goal_parsed": self.goal.branches is not None, "done": len(p.done), "remaining": p.remaining,
+                "known": p.known, "overshot": p.overshot, "pending": len(self.pending),
+                "violations": len(self.violations)}
+
     def uncertain(self) -> list[Uncertain]:
+        """S4 / S5 suppression: goal predicates of the last counted and the next steps that are unsure,
+        plus every counted step not yet confirmed by observation. Earlier counted steps are not
+        re-checked against the current state: later steps may undo them on purpose (e.g. a swap)."""
         out = []
+        for j in sorted(self.pending):
+            step = self.counter.done[j]
+            prob, src, seen = self.pred_belief(step[0])
+            out.append(Uncertain(f"{format_step(step)} (step {j + 1}, counted from the API calls, not yet seen)",
+                                 prob, src, seen, "unconfirmed"))
         for p in self.goal_relevant():
             prob, src, seen = self.pred_belief(p)
             if self.cfg.uncertain_low <= prob <= self.cfg.uncertain_high:
@@ -684,7 +824,7 @@ class BeliefEstimator:
                     rel = "in gripper" if k[0] == "inhand" else f"{k[0]} {k[2]}"
                     text += f" {rel}" + (f" {e.p:.2f} {self._label(k)}" if with_p else "")
             else:
-                text += f" on {TABLE}"
+                text += f" {UNKNOWN_LOCATION}"
             node = self.graph.nodes.get(a)
             if with_p and node is not None and node.last_seen_turn is not None and node.last_seen_turn < self.turn:
                 text += f", not seen since t{node.last_seen_turn}"
@@ -701,6 +841,8 @@ class BeliefEstimator:
         if not self.goal.branches:
             return "Progress: progress unknown (the goal could not be parsed into steps)"
         text = progress_line(self.counter.progress(), self.current_truths(), complete_text="all steps estimated complete")
+        if self.pending:
+            text += f" | {len(self.pending)} counted step(s) not yet confirmed by observation"
         return text + (" | estimate uncertain (see S4)" if uncertain else "")
 
     def render(self, signals: Sequence[Signal] = (), max_chars: int = 3000, uncertain: bool = False) -> str:

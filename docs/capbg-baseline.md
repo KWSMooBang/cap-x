@@ -242,10 +242,11 @@ y (robot's right first), ties by x: `bowl_A` is the bowl furthest to the robot's
 `init_passes` (2) detection passes of the static scene, which makes a missed object less likely. An object first
 seen later gets the next free letter. Aliases never change once given.
 
-**Data association** (per category, per turn): Hungarian matching on the 3D distance between each track's
-predicted position and the detections, accepted within `gate_dist` (0.10 m). The held object is predicted at the
-EEF. Leftover detections are then re-matched to leftover tracks of the same category within `rematch_dist`
-(0.50 m) before any new node is created. A track left unmatched keeps its last position and edges (source `mem`,
+**Data association** (per category, per turn): one global Hungarian assignment over all tracks and detections of
+the category, on the 3D distance between each track's predicted position and the detections. The held object is
+predicted at the EEF. Only pairs within `gate_dist` (0.10 m) are accepted. In a second step, and only there, the
+leftover detections are re-matched to leftover tracks of the same category within `rematch_dist` (0.50 m). New
+nodes are created only after that. A track left unmatched keeps its last position and edges (source `mem`,
 no decay). Detections of different categories within `dedup_dist` (0.01 m) count as one object.
 
 ### Relations from geometry
@@ -260,18 +261,25 @@ With `d` = xy distance of the centers, `dz` = z(x) - z(y) and `r` = half the lar
   `grasp_threshold` (0.05), the tracked object nearest the EEF (within `grasp_radius`, 0.10 m) is in hand
   (P 0.97 if seen there, else the hook expectation stays). Every other object is not in hand (0.03).
   An object in hand is on / in nothing.
-- An object with no true On / In / inhand is shown as `on table`.
+- `On(x, table)`: only from geometry. The table height is the lowest object bottom (center z - half height) seen at
+  turn 0. It holds when x's bottom is within `table_tol` (0.03 m) of that height, with P scaled by the margin as
+  above and capped at 1 - P of x's best support (a bowl on a thin plate is near table height too). Without a
+  table height (nothing seen at turn 0), or for an object not seen, it is never assumed. An object with no true
+  location relation is shown as `location unknown`.
 
 ### Hooks and expected effects
 
 `close_gripper`, `open_gripper`, `move_to_joints`, `goto_pose` and `goto_home_joint_position` are wrapped in the code
 sandbox (`ApiCallRecorder`). A wrapper records the sim step and the EEF / gripper before and after the call. It passes
-the arguments, return value and exceptions through unchanged. From the records, in order:
+the arguments, return value and exceptions through unchanged. All recording (argument text, array copies, robot
+state reads) is inside try/except, so a recording failure only loses the record. From the records, in order:
 - `close_gripper` with the opening still above `grasp_threshold`: the nearest tracked object is held, expected
-  `inhand` (P 0.7, source `exp`). It counts as picked up (`in gripper` event) once the EEF has risen `lift_min`
+  `inhand` (P 0.7, source `exp`). A `close_gripper` that closes fully while a tracked object is within
+  `grasp_radius` of the EEF is a missed grasp (S1, naming the nearest object as the likely target). With no object
+  nearby there is no signal. It counts as picked up (`in gripper` event) once the EEF has risen `lift_min`
   (0.03 m) while holding.
 - `open_gripper` while holding: expected `On(x, s)` (or `In`) with `s` the highest tracked object under the EEF,
-  else the table. The held object's predicted position moves to the EEF.
+  else `On(x, table)`. The held object's predicted position moves to the EEF.
 - A motion during which the gripper closes fully while holding: the object was dropped (S1).
 
 ### Fusion
@@ -298,11 +306,20 @@ object list, and returns JSON steps over aliases (`goal.py`). It may give altern
 unknown. `goal_source: bddl` (diagnostics only) uses the BDDL goal with sim names mapped to aliases instead.
 
 Progress counts a step when all its predicates hold in a location snapshot after not holding in an earlier snapshot
-since the previous count. LIBERO-Mem's tracker counts the same way: the subgoal has to be false before it can count
+since that step was last counted. This is tracked per goal step from the first snapshot on, so a step that turns
+true right after, or together with, the previous step is still counted. LIBERO-Mem's tracker counts the same way: the subgoal has to be false before it can count
 again. Snapshots are taken after every hooked call and at the end of the turn. So "pick the bowl up and put it back
 on the plate" counts once even though the end-of-turn state did not change. The state alone cannot show a
 repetition: a turn that moved the bowl without hooked calls counts nothing. A completed goal whose last step is
 observed undone at the end of a turn is marked overshot, as in LIBERO-Mem.
+
+A count made on a hook snapshot is **pending** until an observation at the end of a turn (geometry, gripper or VDM)
+confirms the step's predicates. If the observation contradicts it (for example the bowl was put back but rolled off
+the plate), the count is withdrawn: the counter is rerun from the start of the turn without that snapshot and the
+ones after it, and S1 is raised. If the object was not seen at the end of the turn, or was picked up again later in
+the same turn, the count stays pending. A later end-of-turn observation of that object then confirms or withdraws
+it. A confirmed count also confirms all pending counts before it. The progress line says how many counted steps are
+still unconfirmed.
 
 ### Signals (estimated)
 
@@ -313,8 +330,11 @@ observed undone at the end of a turn is marked overshot, as in LIBERO-Mem.
 - S4 uncertain: a goal predicate of the last counted step or of the next steps has 0.3 <= P <= 0.7, or rests only on
   memory / expectation / prior not re-observed for `stale_turns` (2) turns. Suggests re-observing (move the arm away,
   look again).
-- S5a / S5b: as for `bg_oracle`, on the estimated progress, but neither fires while progress is unknown or any of
-  those goal predicates is uncertain (the S4 condition), so a wrong completion signal cannot mislead the model.
+- S5a / S5b: as for `bg_oracle`, on the estimated progress, but neither fires while progress is unknown, any of
+  those goal predicates is uncertain (the S4 condition), or **any counted step is still pending**. A wrong
+  completion signal could otherwise mislead the model. The current truth of earlier counted steps is not
+  re-checked: later steps may undo them on purpose (the swap task moves bowl_A off plate_C again). Their check is
+  the evidence at the time they were counted.
 - S3 is out of scope.
 
 ### Prompt text
@@ -327,7 +347,8 @@ Violations, like Progress and Signals, is never cut.
 ### Fake perception (tests and CPU only)
 
 `SimPerceptionSource` turns simulator poses into category-only detections, with Gaussian noise (1 cm), 10 % misses
-and 50 % misses under the gripper. It prints a `perception=sim_fake` banner when created. It exists for tests and CPU
+and 50 % misses under the gripper. It prints a `perception=sim_fake` banner when created. The estimator records its perception source name in
+`state()` and in every turn log (`perception`). It exists for tests and CPU
 checks without SAM3 and must never be used for an evaluation run.
 
 ## Privileged information
