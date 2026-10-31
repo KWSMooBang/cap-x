@@ -106,6 +106,26 @@ def draw_marks(rgb: np.ndarray, marks: Sequence[tuple[str, tuple[float, float]]]
     return np.asarray(img)
 
 
+def mark_radius(shape: tuple[int, ...]) -> int:
+    s = max(min(shape[0], shape[1]) / 256.0, 0.5)
+    return max(int(round(9 * s)), 5)
+
+
+def spread_marks(marks: Sequence[tuple[str, tuple[float, float]]], shape: tuple[int, ...]) -> list[tuple[str, tuple[float, float]]]:
+    """Move a mark that would cover an earlier one (e.g. a cheese box inside a basket: the same center)
+    down by one mark diameter until it is free, so every mark stays readable. The returned pixels are the
+    drawn ones (prompts report these)."""
+    r = mark_radius(shape)
+    placed: list[tuple[str, tuple[float, float]]] = []
+    for m, (u, v) in marks:
+        for _ in range(6):
+            if all((u - pu) ** 2 + (v - pv) ** 2 >= (2 * r + 2) ** 2 for _, (pu, pv) in placed):
+                break
+            v = v + 2 * r + 2 if v + 2 * r + 2 < shape[0] else v - 2 * r - 2
+        placed.append((m, (u, v)))
+    return placed
+
+
 def pixels_in_image(pixels: dict[str, tuple[float, float] | None], shape: tuple[int, ...]) -> dict[str, tuple[float, float]]:
     h, w = shape[0], shape[1]
     return {a: p for a, p in pixels.items() if p is not None and 0 <= p[0] < w and 0 <= p[1] < h}

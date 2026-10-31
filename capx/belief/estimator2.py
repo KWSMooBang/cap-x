@@ -60,7 +60,7 @@ from .perception import (
 from .progress import Pred, Progress, Step
 from .prompts_v2 import marks_now_text, observe_initial_prompt, observe_turn_prompt
 from .signals import Uncertain, Violation
-from .som import MarkTable, draw_marks, is_support
+from .som import MarkTable, draw_marks, is_support, spread_marks
 from .subtasks import PLACE_OPS, Subtask, SubtaskLog, current_support, expand_step
 from .verify import encode_png
 
@@ -236,7 +236,9 @@ class BeliefEstimatorV2(BeliefEstimator):
             px = self.pixels.get(a)
             if a in aliases and px is not None and 0 <= px[0] < w and 0 <= px[1] < h:
                 shown.append((m, a, px))
-        img = draw_marks(rgb, [(m, px) for m, _, px in shown])
+        spread = spread_marks([(m, px) for m, _, px in shown], rgb.shape)  # readable
+        shown = [(m, a, p) for (m, a, _), (_, p) in zip(shown, spread, strict=True)]
+        img = draw_marks(rgb, spread)
         try:
             return encode_png(img), shown
         except Exception:

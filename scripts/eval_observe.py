@@ -47,7 +47,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from capx.belief.observe import parse_observe, statement_key, statement_text  # noqa: E402
 from capx.belief.perception import VOCABULARY, project_to_pixel  # noqa: E402
 from capx.belief.prompts_v2 import marks_now_text, observe_turn_prompt  # noqa: E402
-from capx.belief.som import MarkTable, draw_marks, is_support  # noqa: E402
+from capx.belief.som import MarkTable, draw_marks, is_support, spread_marks  # noqa: E402
 
 CENTER_REGION = "kitchen_table_the_center"
 CONDITIONS = ("init", "normal", "tilted", "table", "in_basket", "basket_center", "arm")
@@ -210,7 +210,9 @@ def save_scene(maker: SceneMaker, out: Path, sid: str, condition: str, detail: s
             shown.append((m, a, px))
         else:
             missing.append(m)
-    img = draw_marks(rgb, [(m, px) for m, _, px in shown])
+    spread = spread_marks([(m, px) for m, _, px in shown], rgb.shape)  # readable
+    shown = [(m, a, p) for (m, a, _), (_, p) in zip(shown, spread, strict=True)]
+    img = draw_marks(rgb, spread)
     d = out / sid
     d.mkdir(parents=True, exist_ok=True)
     from PIL import Image
@@ -260,7 +262,7 @@ def make_scenes(out: Path, tasks: Sequence[int], per_task: int, seed: int = 0) -
                 detail = f"{alias_of[b]} put on {alias_of[p]}"
             elif cond == "tilted":
                 b, p = rng.choice(bowls), rng.choice(plates)
-                maker.teleport(b, pos[p] + [0.0, 0.06 * rng.choice([-1, 1]), 0.04], tilt_deg=float(rng.uniform(20, 35)))
+                maker.teleport(b, pos[p] + [0.0, 0.045 * rng.choice([-1, 1]), 0.03], tilt_deg=float(rng.uniform(12, 22)))
                 detail = f"{alias_of[b]} dropped tilted on the rim of {alias_of[p]}"
             elif cond == "table":
                 o = rng.choice(bowls or cheese)

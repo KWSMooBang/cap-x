@@ -92,6 +92,15 @@ def test_note_flags():
 
 # --- marks ------------------------------------------------------------------------------------------
 
+def test_overlapping_marks_are_spread():
+    from capx.belief.som import mark_radius, spread_marks
+
+    out = spread_marks([("A", (100.0, 100.0)), ("1", (100.0, 100.0)), ("2", (300.0, 100.0))], (512, 800, 3))
+    r = mark_radius((512, 800, 3))
+    assert out[0] == ("A", (100.0, 100.0)) and out[2] == ("2", (300.0, 100.0))
+    assert out[1][0] == "1" and out[1][1][1] - 100.0 >= 2 * r
+
+
 def test_mark_table_and_draw():
     mt = MarkTable()
     mt.assign_all([("plate_B", "plate"), ("bowl_A", "bowl"), ("plate_A", "plate"), ("bowl_B", "bowl"), ("basket_A", "basket")])
