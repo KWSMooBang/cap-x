@@ -128,6 +128,7 @@ class EstTurn:
     records: list[dict[str, Any]] = field(default_factory=list)
     snapshots: int = 0
     pending: list[int] = field(default_factory=list)  # counted steps (indices) not yet confirmed
+    confirmed_by: list[str | None] = field(default_factory=list)  # per counted step: obs | vdm | later_step
     rolled_back: list[str] = field(default_factory=list)
     perception: str = ""
 
@@ -152,6 +153,7 @@ class EstTurn:
             "records": self.records,
             "snapshots": self.snapshots,
             "pending": self.pending,
+            "confirmed_by": self.confirmed_by,
             "rolled_back": self.rolled_back,
             "perception": self.perception,
         }
@@ -190,11 +192,12 @@ class StepCounter:
     def restore(self, ckpt: tuple[list[Step], dict[Step, bool], bool]) -> None:
         self.done, self.was_false, self.overshot = list(ckpt[0]), dict(ckpt[1]), ckpt[2]
 
-    def feed(self, snapshot: Snapshot, final: bool = False) -> list[Step]:
-        """Count the steps this snapshot completes (several in a row if they all hold)."""
+    def feed(self, snapshot: Snapshot, final: bool = False, count: bool = True) -> list[Step]:
+        """Count the steps this snapshot completes (several in a row if they all hold). ``count=False``
+        only records which steps are false (a snapshot whose counts were withdrawn)."""
         holds = {s: all(_holds_in(snapshot, p) for p in s) for s in self.steps}
         counted: list[Step] = []
-        while not self.progress().complete:
+        while count and not self.progress().complete:
             hit = next((s for s in self.progress().next_steps() if holds[s] and self.was_false.get(s)), None)
             if hit is None:
                 break
@@ -253,6 +256,7 @@ class BeliefEstimator:
         self.turn = 0
         self.table_z: float | None = None  # table height: lowest object bottom at turn 0
         self.pending: set[int] = set()  # indices into counter.done not yet confirmed by observation
+        self.confirmed_by: dict[int, str] = {}  # counted step index -> obs | vdm | later_step
 
     # --- tracks ---------------------------------------------------------------------------------
     def _new_alias(self, cat: Category) -> str:
@@ -295,16 +299,15 @@ class BeliefEstimator:
             cat_dets = [d for d in dets if d.category == cat.key]
             free_t, free_d = list(range(len(tracks))), list(range(len(cat_dets)))
             # Pass 1: one global assignment over every track and detection of the category (distances
-            # to the predictions, the held object at the EEF), so a track can only take a detection if
-            # that is best for the category as a whole; only pairs within gate_dist are accepted.
+            # to the predictions, the held object at the EEF) in which pairs beyond gate_dist cannot be
+            # assigned, so a long crossing pair can never push out a match inside the gate.
             # Pass 2: leftovers only, within rematch_dist.
             for gate, label in ((self.cfg.gate_dist, "gate"), (self.cfg.rematch_dist, "rematch")):
                 if not free_t or not free_d:
                     break
                 cost = np.array([[np.linalg.norm(self._predicted(tracks[i], eef) - cat_dets[j].center)
                                   for j in free_d] for i in free_t])
-                limit = self.cfg.rematch_dist
-                rows, cols = linear_sum_assignment(np.where(cost <= limit, cost, 1e6))
+                rows, cols = linear_sum_assignment(np.where(cost <= gate, cost, 1e6))
                 matched_t, matched_d = set(), set()
                 for r, c in zip(rows, cols, strict=True):
                     if cost[r, c] > gate:
@@ -677,13 +680,15 @@ class BeliefEstimator:
             return None
         return edge.holds
 
-    def _verdict(self, step: Step, moved_later: bool) -> str:
+    def _verdict(self, step: Step, moved_later: bool) -> tuple[str, str]:
+        """(confirmed | rejected | pending, obs | vdm): the end-of-turn evidence for a count."""
         if moved_later:  # picked up again in the same turn: no end-of-turn evidence for this count
-            return "pending"
+            return "pending", ""
         seen = [self._observed(p) for p in step]
+        how = "vdm" if any(self.origin.get(_pred_key(p)) == "vdm" for p in step) else "obs"
         if any(v is False for v in seen):
-            return "rejected"
-        return "confirmed" if all(v is True for v in seen) else "pending"
+            return "rejected", how
+        return ("confirmed", how) if all(v is True for v in seen) else ("pending", "")
 
     def _withdraw(self, turn: int, result: EstTurn, step: Step, expected: str, observed: str) -> None:
         result.rolled_back.append(format_step(step))
@@ -692,10 +697,19 @@ class BeliefEstimator:
             self.violations.append(Violation(turn, "progress check", expected, observed))
             result.violations.append(self.violations[-1])
 
+    def _confirm(self, idx: int, how: str) -> None:
+        """Count ``idx`` confirmed by observation; earlier pending counts are confirmed with it."""
+        for q in self.pending:
+            if q < idx:
+                self.confirmed_by[q] = "later_step"
+        self.pending = {q for q in self.pending if q > idx}
+        self.confirmed_by[idx] = how
+
     def _count(self, turn: int, snapshots: list[Snapshot], final: Snapshot, result: EstTurn) -> None:
-        """Feed this turn's snapshots. A count made on a hook snapshot is pending until an end-of-turn
-        observation confirms it; a contradicted one is withdrawn (with S1); a confirmed count also
-        confirms the pending counts before it."""
+        """Feed this turn's snapshots. A count is pending until an end-of-turn observation confirms
+        it; a contradicted one (on a hook snapshot or the final one) is withdrawn with S1 and the
+        turn is counted again without it; a confirmed count also confirms the pending counts before
+        it (recorded as confirmed_by=later_step)."""
         def subjects(step: Step) -> set[str]:
             return {p[1] for p in step}
 
@@ -704,9 +718,9 @@ class BeliefEstimator:
         # when the hooks did not move its object this turn.
         last = len(self.counter.done) - 1
         if last in self.pending and not (subjects(self.counter.done[last]) & moved):
-            v = self._verdict(self.counter.done[last], False)
+            v, how = self._verdict(self.counter.done[last], False)
             if v == "confirmed":
-                self.pending = set()
+                self._confirm(last, how)
             elif v == "rejected":
                 step = self.counter.done.pop()
                 self.pending.discard(last)
@@ -715,36 +729,47 @@ class BeliefEstimator:
                                "not what the camera shows now: count withdrawn")
 
         ckpt = self.counter.checkpoint()
-        for attempt in range(2):
+        count_final = True
+        for _attempt in range(len(snapshots) + 2):
             counts: list[tuple[Step, int | None]] = []
             for i, snap in enumerate(snapshots):
                 counts += [(st, i) for st in self.counter.feed(snap)]
-            counts += [(st, None) for st in self.counter.feed(final, final=True)]
+            counts += [(st, None) for st in self.counter.feed(final, final=True, count=count_final)]
             verdicts = []
             for st, i in counts:
                 moved_later = i is not None and any(
                     snap.get(a) != snapshots[i].get(a) for snap in snapshots[i + 1:] for a in subjects(st))
                 verdicts.append(self._verdict(st, moved_later))
-            bad = [i for (_, i), v in zip(counts, verdicts, strict=True) if v == "rejected" and i is not None]
-            if not bad or attempt:
+            bad = [i for (_, i), (v, _) in zip(counts, verdicts, strict=True) if v == "rejected"]
+            if not bad:
                 break
-            # Count again from the turn start without the first contradicted hook snapshot and after.
-            for (st, _i), v in zip(counts, verdicts, strict=True):
+            # Withdraw and count the turn again: without the first contradicted hook snapshot and the
+            # ones after it, or (contradicted on the final snapshot) without counting on it.
+            for (st, i), (v, _) in zip(counts, verdicts, strict=True):
                 if v == "rejected":
-                    self._withdraw(turn, result, st, f"{format_step(st)} after the hooked place",
+                    where = "after the hooked place" if i is not None else "at the end of the turn"
+                    self._withdraw(turn, result, st, f"{format_step(st)} {where}",
                                    "not confirmed by the camera: count withdrawn")
             self.counter.restore(ckpt)
-            snapshots = snapshots[:min(bad)]
+            intra = [i for i in bad if i is not None]
+            if intra:
+                snapshots = snapshots[:min(intra)]
+            else:
+                count_final = False
         base = len(ckpt[0])
-        for j, v in enumerate(verdicts):
+        for j, (v, how) in enumerate(verdicts):
             idx = base + j
             if idx >= len(self.counter.done):
                 break
             if v == "confirmed":
-                self.pending = {q for q in self.pending if q > idx}
+                self._confirm(idx, how)
             else:
                 self.pending.add(idx)
-        self.pending = {q for q in self.pending if q < len(self.counter.done)}
+                self.confirmed_by.pop(idx, None)
+        n = len(self.counter.done)
+        self.pending = {q for q in self.pending if q < n}
+        self.confirmed_by = {q: h for q, h in self.confirmed_by.items() if q < n}
+        result.confirmed_by = [self.confirmed_by.get(q) for q in range(n)]
 
     # --- progress / uncertainty -----------------------------------------------------------------
     def goal_relevant(self) -> list[Pred]:
@@ -787,7 +812,12 @@ class BeliefEstimator:
         return {"perception": self.perception_name, "tracks": len(self.tracks), "goal_source": self.goal.source,
                 "goal_parsed": self.goal.branches is not None, "done": len(p.done), "remaining": p.remaining,
                 "known": p.known, "overshot": p.overshot, "pending": len(self.pending),
+                "later_step_confirmations": self.later_step_confirmations(),
                 "violations": len(self.violations)}
+
+    def later_step_confirmations(self) -> int:
+        """Counted steps confirmed only because a later step was observed (not seen themselves)."""
+        return sum(1 for q, h in self.confirmed_by.items() if h == "later_step" and q < len(self.counter.done))
 
     def uncertain(self) -> list[Uncertain]:
         """S4 / S5 suppression: goal predicates of the last counted and the next steps that are unsure,
@@ -843,6 +873,8 @@ class BeliefEstimator:
         text = progress_line(self.counter.progress(), self.current_truths(), complete_text="all steps estimated complete")
         if self.pending:
             text += f" | {len(self.pending)} counted step(s) not yet confirmed by observation"
+        if self.later_step_confirmations():
+            text += f" | {self.later_step_confirmations()} step(s) confirmed only by a later step, not seen"
         return text + (" | estimate uncertain (see S4)" if uncertain else "")
 
     def render(self, signals: Sequence[Signal] = (), max_chars: int = 3000, uncertain: bool = False) -> str:

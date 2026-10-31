@@ -244,7 +244,8 @@ seen later gets the next free letter. Aliases never change once given.
 
 **Data association** (per category, per turn): one global Hungarian assignment over all tracks and detections of
 the category, on the 3D distance between each track's predicted position and the detections. The held object is
-predicted at the EEF. Only pairs within `gate_dist` (0.10 m) are accepted. In a second step, and only there, the
+predicted at the EEF. Pairs beyond `gate_dist` (0.10 m) cannot be assigned in this step, so a long crossing pair
+never pushes out a match inside the gate. In a second step, and only there, the
 leftover detections are re-matched to leftover tracks of the same category within `rematch_dist` (0.50 m). New
 nodes are created only after that. A track left unmatched keeps its last position and edges (source `mem`,
 no decay). Detections of different categories within `dedup_dist` (0.01 m) count as one object.
@@ -316,10 +317,13 @@ observed undone at the end of a turn is marked overshot, as in LIBERO-Mem.
 A count made on a hook snapshot is **pending** until an observation at the end of a turn (geometry, gripper or VDM)
 confirms the step's predicates. If the observation contradicts it (for example the bowl was put back but rolled off
 the plate), the count is withdrawn: the counter is rerun from the start of the turn without that snapshot and the
-ones after it, and S1 is raised. If the object was not seen at the end of the turn, or was picked up again later in
+ones after it, and S1 is raised. A count on the end-of-turn snapshot that the observation contradicts takes the
+same path: it is withdrawn and S1 is raised, it is never left pending. If the object was not seen at the end of the turn, or was picked up again later in
 the same turn, the count stays pending. A later end-of-turn observation of that object then confirms or withdraws
-it. A confirmed count also confirms all pending counts before it. The progress line says how many counted steps are
-still unconfirmed.
+it. A confirmed count also confirms all pending counts before it. Each counted step records `confirmed_by`: `obs` or
+`vdm` when an observation confirmed it, `later_step` when only a later step's observation did (it was never seen
+itself). The progress line says how many counted steps are still unconfirmed and how many were confirmed only by a
+later step. The turn log has `confirmed_by` per step and `state()` has `later_step_confirmations`.
 
 ### Signals (estimated)
 

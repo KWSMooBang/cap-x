@@ -509,7 +509,8 @@ def test_s5_blocked_by_any_unconfirmed_counted_step():
     assert FinishGate().check(r1.progress, suppress=r1.suppress_completion) is None
     world.pick_place("akita_black_bowl_2", "plate_1")
     r2 = end(est, world, rec, 2)
-    assert r2.pending == [] and len(r2.progress.done) == 2  # the confirmed step 2 confirms step 1
+    assert r2.pending == [] and len(r2.progress.done) == 2  # bowl_A seen again: step 1 confirmed
+    assert r2.confirmed_by == ["obs", "obs"]
 
 
 def test_grasp_missed_near_object_is_s1():
@@ -570,3 +571,53 @@ def test_state_reports_perception_source():
     assert est.state()["perception"] == "fake"
     world.pick_place("akita_black_bowl_1", "plate_3")
     assert end(est, world, rec, 1).to_log()["perception"] == "fake"
+
+
+# --- review round 2 ---------------------------------------------------------------------------
+
+def test_gate_match_not_pushed_out_by_long_crossing_pair():
+    """bowl_A (y=0) has a detection 0.08 m away (inside the gate); bowl_B (y=0.5) has none near.
+    Pass 1 must keep bowl_A's gated match instead of a cheaper-overall crossing assignment
+    (bowl_A -> y=-0.3, bowl_B -> y=0.08); the far detection becomes a new node."""
+    world = FakeWorld({"b1": ("bowl", (0.5, 0.0, 0.02)), "b2": ("bowl", (0.5, 0.5, 0.02))})
+    est, det, rec = setup(world, SWAP_GOAL_JSON, "move the bowl")
+    world.objects["b1"]["pos"] = np.array([0.5, 0.08, 0.02])
+    world.objects["b2"]["pos"] = np.array([0.5, -0.3, 0.02])
+    r = end(est, world, rec, 1)
+    assert est.tracks["bowl_A"].pos[1] == pytest.approx(0.08)  # kept its gated match
+    assert r.rematched == [] and r.new_tracks == ["bowl_C"] and r.unmatched_tracks == ["bowl_B"]
+
+
+def test_final_snapshot_count_contradicted_is_withdrawn(monkeypatch):
+    """A count on the end-of-turn snapshot that the observation contradicts takes the same path as a
+    hook-snapshot one: withdrawn, S1, not left pending. (With one fused graph this needs an
+    observation check that disagrees with the snapshot; forced here.)"""
+    world = swap_world()
+    est, det, rec = setup(world, SWAP_GOAL_JSON, SWAP)
+    world.objects["akita_black_bowl_1"]["pos"] = np.array([0.5, 0.2, 0.02])  # moved without hooks
+    real = est._observed
+    monkeypatch.setattr(est, "_observed", lambda p: False if p == ("on", "bowl_A", "plate_C") else real(p))
+    r = end(est, world, rec, 1)
+    assert r.progress.done == [] and r.pending == []
+    assert r.rolled_back == ["bowl_A on plate_C"]
+    assert [v.expected for v in r.violations] == ["bowl_A on plate_C at the end of the turn"]
+    assert "count withdrawn" in r.violations[0].observed
+
+
+def test_confirmed_by_records_later_step_confirmations():
+    world = swap_world()
+    est, det, rec = setup(world, SWAP_GOAL_JSON, SWAP)
+    world.pick_place("akita_black_bowl_1", "plate_3")
+    det.miss = {"akita_black_bowl_1"}
+    r1 = end(est, world, rec, 1)
+    assert r1.confirmed_by == [None]
+    world.pick_place("akita_black_bowl_2", "plate_1")
+    det.miss_always = {"akita_black_bowl_1"}  # bowl_A still unseen: only step 2 is observed
+    r2 = end(est, world, rec, 2)
+    det.miss_always = set()
+    assert r2.confirmed_by == ["later_step", "obs"] and r2.to_log()["confirmed_by"] == ["later_step", "obs"]
+    assert est.state()["later_step_confirmations"] == 1
+    assert "1 step(s) confirmed only by a later step, not seen" in est.progress_text()
+    world.pick_place("akita_black_bowl_1", "plate_2")
+    r3 = end(est, world, rec, 3)
+    assert r3.confirmed_by == ["later_step", "obs", "obs"]
