@@ -442,6 +442,10 @@ class BeliefEstimator:
         violations: list[Violation] = []
         loc = dict(self.loc)
         thr = self.cfg.grasp_threshold
+        # What the hooks saw (read by bg_est2's declaration check; no effect on bg_est).
+        facts: dict[str, list] = {"closed": [], "opened": [], "grasped": [], "missed": [], "lifted": [],
+                                  "released": [], "dropped": []}
+        self.last_record_facts = facts
 
         def move(alias: str, new: frozenset) -> None:
             before = format_location(loc[alias]) if loc.get(alias) else UNKNOWN_LOCATION
@@ -455,23 +459,29 @@ class BeliefEstimator:
             if eef is None:
                 continue
             if rec.fn == "close_gripper":
+                facts["closed"].append(rec.index)
                 self.gripper_cmd = "closed"
                 near = self._nearest(eef, self.cfg.grasp_radius)
                 cand = near if g is not None and g > thr else None
                 self.held, self.held_lifted, self.grasp_z = (cand.alias if cand else None), False, float(eef[2])
                 if cand is not None:
+                    facts["grasped"].append(cand.alias)
                     self.held_off = cand.pos - eef
                     expectations[("inhand", cand.alias, None)] = (True, rec.desc)
                 elif g is not None and near is not None:  # closed fully next to an object: grasp missed
+                    facts["missed"].append(near.alias)
                     violations.append(Violation(
                         turn, rec.desc, f"{near.alias} in gripper (nearest object to the gripper)",
                         f"gripper closed fully ({g:.2f}): nothing grasped", ("inhand", near.alias, None), True))
             elif rec.fn == "open_gripper":
+                facts["opened"].append(rec.index)
                 self.gripper_cmd = "open"
                 if self.held is not None:
                     t = self.tracks[self.held]
                     at = eef + self.held_off  # where the released object is
                     support = self._support_below(t.alias, at)
+                    facts["released"].append((t.alias, support.alias if support is not None else None,
+                                              bool(self.held_lifted)))
                     expectations[("inhand", t.alias, None)] = (False, rec.desc)
                     if support is not None:
                         pred = "in" if support.category.container else "on"
@@ -492,6 +502,7 @@ class BeliefEstimator:
                     violations.append(Violation(turn, rec.desc, f"{t.alias} in gripper",
                                                 f"gripper closed fully ({g:.2f}): object dropped",
                                                 ("inhand", t.alias, None), True))
+                    facts["dropped"].append(t.alias)
                     t.pos = eef + self.held_off
                     if self.held_lifted:
                         move(t.alias, frozenset())
@@ -501,6 +512,7 @@ class BeliefEstimator:
                     t.pos = eef + self.held_off
                     if not self.held_lifted and float(eef[2]) - self.grasp_z >= self.cfg.lift_min:
                         self.held_lifted = True
+                        facts["lifted"].append(t.alias)
                         for p, tgt in loc.get(t.alias, frozenset()):
                             if p != "inhand":
                                 expectations[(p, t.alias, tgt)] = (False, rec.desc)

@@ -218,3 +218,188 @@ def goal_from_bddl(goal_state: Sequence[Any], sim_to_alias: dict[str, str]) -> G
         for b in goal_branches(goal_state)
     ]
     return GoalResult(branches, "bddl", attempts=0)
+
+
+# --- v2 (bg_est2): M3 prompt, regions, per-step "newly true" normalization ---------------------------
+
+V2_PREDICATES = {"on": 3, "in": 3, "at": 3}
+REGION_WORDS = ("center",)  # table regions an instruction may name; at(o, r)
+
+
+def regions_in(instruction: str, regions: Sequence[str] = REGION_WORDS) -> list[str]:
+    text = instruction.lower()
+    return [r for r in regions if re.search(rf"\b{re.escape(r)}\b", text)]
+
+
+def _pred_v2(raw: Any, names: set[str], regions: set[str]) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise GoalParseError(f"predicate {raw!r} is not a list")
+    p = [str(x).strip() for x in raw]
+    p[0] = p[0].lower().replace("_", "")
+    lower = {n.lower(): n for n in names}
+    if p[0] not in V2_PREDICATES or len(p) != V2_PREDICATES[p[0]]:
+        raise GoalParseError(f"predicate {raw!r}: use on/in with 2 objects")
+    subj = lower.get(p[1].lower())
+    if subj is None:
+        raise GoalParseError(f"unknown object {p[1]!r} in {raw!r}")
+    tgt_raw = p[2].lower()
+    tgt = lower.get(tgt_raw)
+    if tgt is None:
+        if tgt_raw == TABLE:
+            if p[0] != "on":
+                raise GoalParseError(f"{raw!r}: only 'on' the table")
+            return ("on", subj, TABLE)
+        region = next((r for r in regions if r in tgt_raw), None)  # "center", "the center of the table"
+        if region is None:
+            raise GoalParseError(f"unknown object {p[2]!r} in {raw!r}")
+        return ("at", subj, region)
+    if p[0] == "at":
+        raise GoalParseError(f"{raw!r}: 'at' takes a region")
+    if subj == tgt:
+        raise GoalParseError(f"predicate {raw!r} relates an object to itself")
+    return (p[0], subj, tgt)
+
+
+def _steps_v2(raw_steps: Any, names: set[str], regions: set[str]) -> list[Step]:
+    if not isinstance(raw_steps, list) or not raw_steps:
+        raise GoalParseError("steps must be a non-empty list")
+    out: list[Step] = []
+    for s in raw_steps:
+        if isinstance(s, dict):
+            preds, repeat = s.get("preds"), s.get("repeat", 1)
+        else:
+            preds, repeat = s, 1
+        if not isinstance(preds, list) or not preds:
+            raise GoalParseError(f"step {s!r} has no predicates")
+        if isinstance(preds[0], str):
+            preds = [preds]
+        try:
+            repeat = int(repeat if repeat is not None else 1)
+        except (TypeError, ValueError) as e:
+            raise GoalParseError(f"repeat {repeat!r} is not a number") from e
+        if not 1 <= repeat <= MAX_REPEAT:
+            raise GoalParseError(f"repeat {repeat} out of range 1..{MAX_REPEAT}")
+        out += [canonical_step([_pred_v2(p, names, regions) for p in preds])] * repeat
+    return out
+
+
+def parse_goal_json_v2(text: str, names: Sequence[str], regions: Sequence[str] = REGION_WORDS) -> list[list[Step]]:
+    """M3 reply -> goal branches (not yet normalized); raises GoalParseError. Accepts on / in over the
+    aliases and "table", and a region word (e.g. center) as target -> ("at", X, region)."""
+    data = _extract_json(text)
+    goal = data.get("goal", data) if isinstance(data, dict) else None
+    if not isinstance(goal, dict):
+        raise GoalParseError("missing 'goal' object")
+    known, regs = set(names), {r.lower() for r in regions}
+    if str(goal.get("type", "sequence")).lower() == "or" or "branches" in goal:
+        branches = goal.get("branches")
+        if not isinstance(branches, list) or not branches:
+            raise GoalParseError("'or' goal needs a non-empty 'branches' list")
+        return [_steps_v2(b.get("steps") if isinstance(b, dict) else b, known, regs) for b in branches]
+    return [_steps_v2(goal.get("steps"), known, regs)]
+
+
+def _apply(state: dict[str, frozenset], pred: tuple[str, ...]) -> None:
+    if pred[0] in ("on", "in", "at"):
+        state[pred[1]] = frozenset({(pred[0], pred[2])})
+
+
+def _holds(state: dict[str, frozenset], pred: tuple[str, ...]) -> bool:
+    return (pred[0], pred[2] if len(pred) > 2 else None) in state.get(pred[1], frozenset())
+
+
+def normalize_steps(branches: Sequence[Sequence[Step]], init: dict[str, frozenset]) -> list[list[Step]]:
+    """Each step keeps only the predicates that BECOME true at it.
+
+    Walking each branch from ``init`` (alias -> {(pred, target)}), a predicate that already holds before
+    its step is dropped when the step has another, new predicate (a cumulative "state so far" step). A
+    step none of whose predicates is new is kept whole: it is a put-back / repeat ("place it back")."""
+    out = []
+    for b in branches:
+        state = dict(init)
+        steps: list[Step] = []
+        for s in b:
+            new = [p for p in s if not _holds(state, p)]
+            step = canonical_step(new if new else list(s))
+            for p in step:
+                _apply(state, p)
+            steps.append(step)
+        out.append(steps)
+    return out
+
+
+def dedupe_branches(branches: Sequence[Sequence[Step]]) -> list[list[Step]]:
+    out: list[list[Step]] = []
+    for b in branches:
+        if list(b) not in out:
+            out.append(list(b))
+    return out
+
+
+def parse_goal_llm_v2(query_fn: QueryFn, instruction: str, scene_lines: Sequence[str], names: Sequence[str],
+                      init: dict[str, frozenset], regions: Sequence[str] = REGION_WORDS,
+                      retries: int = 1) -> GoalResult:
+    """M3; on a bad reply ask once more with the error. Branches are normalized to newly-true predicates."""
+    from .prompts_v2 import goal_prompt_v2
+
+    result = GoalResult(None, "llm")
+    prompt = goal_prompt_v2(instruction, scene_lines)
+    for _ in range(retries + 1):
+        result.attempts += 1
+        try:
+            text, usage = _content(query_fn(prompt))
+        except Exception as exc:
+            result.errors.append(f"query failed: {exc}")
+            continue
+        result.replies.append(text)
+        result.usage.append(usage)
+        try:
+            raw = parse_goal_json_v2(text, names, regions)
+            result.branches = dedupe_branches(normalize_steps(raw, init))
+            return result
+        except GoalParseError as exc:
+            result.errors.append(str(exc))
+            prompt = prompt + [
+                {"role": "assistant", "content": text},
+                {"role": "user", "content": [{"type": "text", "text": (
+                    f"That reply could not be used: {exc}. Answer again with JSON only, in the format above.")}]},
+            ]
+    return result
+
+
+def horizontal_word(y: float, ys: Sequence[float]) -> str:
+    """Image left/right from base y: the robot's right (-y) is the image left. Bins over the scene's spread."""
+    lo, hi = min(ys), max(ys)
+    if hi - lo < 0.05:
+        return "center"
+    f = (y - lo) / (hi - lo)
+    return ("left side", "left of center", "center", "right of center", "right side")[min(int(f * 5), 4)]
+
+
+def depth_word(x: float, xs: Sequence[float]) -> str:
+    """Distance from the camera from base x (larger x = nearer the camera, lower in the image)."""
+    lo, hi = min(xs), max(xs)
+    if hi - lo < 0.05:
+        return "middle"
+    if hi - x < 0.02:
+        return "nearest to the camera"
+    f = (x - lo) / (hi - lo)
+    return ("near the robot", "middle", "near the camera")[min(int(f * 3), 2)]
+
+
+def scene_lines_v2(objects: Sequence[tuple[str, str, Sequence[float], str]], regions: Sequence[str] = ()) -> list[str]:
+    """M3 scene: ``(alias, category prompt, xyz, relation text)`` -> ``- bowl_A (black bowl): on plate_B;
+    center of the image, nearest to the camera``. Relation texts (on X / empty / holds X) come from the
+    initial Observe."""
+    if not objects:
+        return []
+    xs = [float(o[2][0]) for o in objects]
+    ys = [float(o[2][1]) for o in objects]
+    out = []
+    for alias, prompt, pos, rel in objects:
+        h = horizontal_word(float(pos[1]), ys)
+        h = "center of the image" if h == "center" else h
+        out.append(f"- {alias} ({prompt}): {rel}; {h}, {depth_word(float(pos[0]), xs)}")
+    for r in regions:
+        out.append(f'- {r}: a region of the table (a place named in the instruction: use "{r}" as the target)')
+    return out
