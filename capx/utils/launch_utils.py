@@ -84,8 +84,8 @@ DEFAULT_MAX_TOKENS = 2048 * 10
 
 def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, Any]:
     """memory_* keys (see capx.belief.memory): CLI > YAML > defaults (memory_mode none)."""
-    from capx.belief.memory import DEFAULT_MAX_CHARS, MEMORY_MODES
-    from capx.belief.signals import ALL_SIGNALS
+    from capx.belief.memory import DEFAULT_MAX_CHARS, EST_PERCEPTIONS, MEMORY_MODES
+    from capx.belief.signals import ALL_SIGNALS, EST_SIGNALS
 
     def pick(key: str, default: Any) -> Any:
         cli = getattr(args, key, None)
@@ -94,19 +94,39 @@ def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, 
     mode = pick("memory_mode", "none")
     if mode not in MEMORY_MODES:
         raise ValueError(f"memory_mode must be one of {MEMORY_MODES}, got {mode!r}")
-    signals = pick("memory_signals", list(ALL_SIGNALS))
+    implemented = EST_SIGNALS if mode == "bg_est" else ALL_SIGNALS
+    signals = pick("memory_signals", list(implemented))
     if isinstance(signals, str):  # CLI: "S2,S5" or "none"
         signals = [] if signals.strip().lower() in ("", "none") else [x.strip() for x in signals.split(",")]
-    unknown = set(signals) - set(ALL_SIGNALS)
+    unknown = set(signals) - set(implemented)
     if unknown:
-        raise ValueError(f"memory_signals: unknown {sorted(unknown)}; implemented: {ALL_SIGNALS}")
-    return {
+        raise ValueError(f"memory_signals: unknown {sorted(unknown)}; implemented for {mode}: {implemented}")
+    out = {
         "memory_mode": mode,
         "memory_max_chars": int(pick("memory_max_chars", DEFAULT_MAX_CHARS)),
         "memory_signals": list(signals),
         "memory_in_initial_prompt": bool(pick("memory_in_initial_prompt", True)),
         "memory_max_finish_rejections": int(pick("memory_max_finish_rejections", 1)),
     }
+    if mode == "bg_est":
+        perception = pick("memory_est_perception", "sam3")
+        if perception not in EST_PERCEPTIONS:
+            # SimPerceptionSource (simulator poses) must be asked for by its explicit test name.
+            raise ValueError(f"memory_est_perception must be one of {EST_PERCEPTIONS}, got {perception!r}")
+        goal_source = pick("memory_est_goal_source", "llm")
+        if goal_source not in ("llm", "bddl"):
+            raise ValueError(f"memory_est_goal_source must be llm or bddl, got {goal_source!r}")
+        out.update({
+            "memory_est_goal_source": goal_source,
+            "memory_est_perception": perception,
+            "memory_est_max_categories": int(pick("memory_est_max_categories", 5)),
+            "memory_est_gate_dist": float(pick("memory_est_gate_dist", 0.10)),
+            "memory_est_verify": bool(pick("memory_est_verify", True)),
+            "memory_est_shadow": bool(pick("memory_est_shadow", True)),
+            "memory_est_goal_model": pick("memory_est_goal_model", None),
+            "memory_est_goal_server_url": pick("memory_est_goal_server_url", None),
+        })
+    return out
 
 
 def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
@@ -596,6 +616,17 @@ def _save_trial_artifacts(
 
 
 
+def _bg_est_summary_line(config: dict[str, Any]) -> str | None:
+    """bg_est runs name their perception in the summary; the fake one cannot pass unnoticed."""
+    if config.get("memory_mode") != "bg_est":
+        return None
+    perception = config.get("memory_est_perception", "sam3")
+    line = f"Memory mode: bg_est (perception={perception}, goal_source={config.get('memory_est_goal_source', 'llm')})"
+    if perception == "sim_fake_for_tests":
+        line += "  !!! perception=sim_fake: SIMULATOR POSES + noise, NOT A VALID EVALUATION !!!"
+    return line
+
+
 def _print_and_save_summary(
     summaries: list[TrialSummary], args: LaunchArgs, config: dict[str, Any], start_time: float
 ) -> None:
@@ -675,6 +706,9 @@ def _print_and_save_summary(
     print(f"Average regenerations: {average_regenerations:.3f}")
     print(f"Average finishes: {average_finishes:.3f}")
     print(f"Elapsed time: {elapsed_time:.2f} seconds")
+    est_line = _bg_est_summary_line(config)
+    if est_line:
+        print(est_line)
 
     # Write summaries to a txt file
     if config["output_dir"]:
@@ -693,3 +727,5 @@ def _print_and_save_summary(
             f.write(f"Average regenerations: {average_regenerations:.3f}\n")
             f.write(f"Average finishes: {average_finishes:.3f}\n")
             f.write(f"Elapsed time: {elapsed_time:.2f} seconds\n")
+            if est_line:
+                f.write(est_line + "\n")

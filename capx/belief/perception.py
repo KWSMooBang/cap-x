@@ -90,13 +90,32 @@ class PerceptionSource(Protocol):
     def detect(self, obs: dict[str, Any], categories: Sequence[Category]) -> list[Detection]: ...
 
 
-def proprio_from_obs(obs: dict[str, Any]) -> tuple[np.ndarray, float] | None:
-    """(EEF xyz in the robot base frame, gripper 0 closed .. 1 open) from ``get_observation()``."""
+# robot_cartesian_pos (LIBERO Franka) is this far behind the fingertip centre along the gripper's
+# approach axis (local +z): measured on LIBERO-Mem, a goto_pose fingertip target 0.030 m above the
+# table reads z 0.138 top-down.
+TCP_OFFSET = 0.108
+
+
+def _quat_wxyz_to_mat(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = q / (np.linalg.norm(q) or 1.0)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def proprio_from_obs(obs: dict[str, Any], tcp_offset: float = TCP_OFFSET) -> tuple[np.ndarray, float] | None:
+    """(fingertip centre xyz in the robot base frame, gripper 0 closed .. 1 open) from
+    ``get_observation()``: ``robot_cartesian_pos`` moved ``tcp_offset`` along the approach axis."""
     cart = obs.get("robot_cartesian_pos") if isinstance(obs, dict) else None
     if cart is None:
         return None
     cart = np.asarray(cart, dtype=np.float64)
-    return cart[:3].copy(), float(cart[-1])
+    pos = cart[:3].copy()
+    if len(cart) >= 8:
+        pos = pos + _quat_wxyz_to_mat(cart[3:7]) @ np.array([0.0, 0.0, tcp_offset])
+    return pos, float(cart[-1])
 
 
 def mask_points(mask: np.ndarray, depth: np.ndarray, K: np.ndarray, T: np.ndarray, max_depth: float = 3.0) -> np.ndarray:
@@ -240,8 +259,9 @@ class SimPerceptionSource:
                 if (eef is not None and np.linalg.norm(pos[:2] - eef[:2]) < self.occlusion_radius
                         and eef[2] > pos[2] and self.rng.random() < self.occlusion):
                     continue
-            center = pos + self.rng.normal(0.0, self.noise_std, 3)
             size = np.asarray(cat.size) * (1.0 + self.rng.normal(0.0, 0.05, 3))
+            # Body origins of LIBERO objects are at their bottom; a camera sees the middle.
+            center = pos + np.array([0.0, 0.0, 0.5 * cat.size[2]]) + self.rng.normal(0.0, self.noise_std, 3)
             out.append(Detection(cat.key, center, np.abs(size), 0.9))
         order = self.rng.permutation(len(out))  # detection order says nothing about identity
         return [out[i] for i in order]

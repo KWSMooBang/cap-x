@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 
-from capx.belief.perception import Detection
+from capx.belief.perception import TCP_OFFSET, Detection
 
 BOWL_SIZE = (0.13, 0.13, 0.05)
 PLATE_SIZE = (0.20, 0.20, 0.02)
@@ -70,8 +70,10 @@ class FakeWorld:
 
     # --- robot observation (what get_observation() gives) ---
     def get_observation(self) -> dict[str, Any]:
+        # Like LIBERO: the reported pose is TCP_OFFSET behind the fingertips (top-down: above them).
         return {
-            "robot_cartesian_pos": np.concatenate([self.eef, [0.0, 1.0, 0.0, 0.0], [self.gripper]]),
+            "robot_cartesian_pos": np.concatenate([self.eef + [0.0, 0.0, TCP_OFFSET], [0.0, 1.0, 0.0, 0.0],
+                                                   [self.gripper]]),
             "agentview": {
                 "images": {"rgb": np.zeros((8, 8, 3), np.uint8), "depth": np.ones((8, 8), np.float32)},
                 "intrinsics": np.array([[4.0, 0, 4.0], [0, 4.0, 4.0], [0, 0, 1]]),
@@ -148,6 +150,139 @@ SWAP_GOAL_JSON = json.dumps({"goal": {"type": "or", "branches": [
                {"preds": [["on", "bowl_B", "plate_A"]]}]},
 ]}})
 REPEAT_GOAL_JSON = json.dumps({"goal": {"type": "sequence", "steps": [{"preds": [["on", "bowl_A", "plate_A"]], "repeat": 3}]}})
+
+
+# --- trial-loop fakes (bg_est through capx.envs.trial) ------------------------------------------
+
+from capx.belief.estimator import StepCounter  # noqa: E402
+from capx.belief.progress import goal_branches  # noqa: E402
+from capx.envs.base import BaseEnv  # noqa: E402
+from capx.integrations.base_api import ApiBase, register_api  # noqa: E402
+
+SWAP_BDDL_GOAL = [[
+    "or",
+    ["sequence", ["and", ["on", "akita_black_bowl_1", "plate_3"]], ["and", ["on", "akita_black_bowl_2", "plate_1"]],
+     ["and", ["on", "akita_black_bowl_1", "plate_2"]]],
+    ["sequence", ["and", ["on", "akita_black_bowl_2", "plate_3"]], ["and", ["on", "akita_black_bowl_1", "plate_2"]],
+     ["and", ["on", "akita_black_bowl_2", "plate_1"]]],
+]]
+SHORT_IDS = {"b1": "akita_black_bowl_1", "b2": "akita_black_bowl_2", "p1": "plate_1", "p2": "plate_2", "p3": "plate_3"}
+
+
+class WorldEnv(BaseEnv):
+    """Low-level env around a FakeWorld (swap layout): robot observation and a step counter, plus a
+    ``world`` that only the fake ground-truth source reads."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.world = swap_world()
+        self.history: list[dict[str, str | None]] = []
+
+    @property
+    def _sim_step_count(self) -> int:
+        return self.world.steps
+
+    def supports(self) -> dict[str, str | None]:
+        out = {}
+        for n, o in self.world.objects.items():
+            under = [m for m, q in self.world.objects.items() if m != n and q["cat"] == "plate" and o["cat"] == "bowl"
+                     and np.linalg.norm(q["pos"][:2] - o["pos"][:2]) < 0.08 and 0 < o["pos"][2] - q["pos"][2] < 0.05]
+            out[n] = under[0] if under else None
+        return out
+
+    def after_call(self) -> None:
+        self.history.append(self.supports())
+
+    def reset(self, *, seed=None, options=None):
+        self.world = swap_world()
+        self.history = [self.supports()]
+        return self.get_observation(), {}
+
+    def step(self, action):
+        return self.get_observation(), 0.0, False, False, {}
+
+    def get_observation(self):
+        return self.world.get_observation()
+
+    def compute_reward(self) -> float:
+        return 0.0
+
+    def task_completed(self) -> bool:
+        return False
+
+
+class FakeGripperApi(ApiBase):
+    """Gripper API over WorldEnv; every call is a hookable sandbox function."""
+
+    def functions(self):
+        def wrap(fn):
+            def call(*a, **k):
+                out = fn(*a, **k)
+                self._env.after_call()
+                return out
+            return call
+
+        w = self._env
+        return {
+            "close_gripper": wrap(lambda: w.world.close_gripper()),
+            "open_gripper": wrap(lambda: w.world.open_gripper()),
+            "goto_pose": wrap(lambda position, quaternion_wxyz=None: w.world.goto_pose(position)),
+            "obj_pos": lambda short: w.world.objects[SHORT_IDS[short]]["pos"].copy(),
+        }
+
+
+register_api("FakeGripperApi", FakeGripperApi)
+
+
+def pick_place_code(obj: str, target: str) -> str:
+    return (
+        "import numpy as np\n"
+        f"p = obj_pos({obj!r})\n"
+        "goto_pose(p + np.array([0, 0, 0.02]))\nclose_gripper()\ngoto_pose(p + np.array([0, 0, 0.15]))\n"
+        f"t = obj_pos({target!r})\n"
+        "goto_pose(t + np.array([0, 0, 0.15]))\ngoto_pose(t + np.array([0, 0, 0.04]))\nopen_gripper()\n"
+        "goto_pose(t + np.array([0, 0, 0.15]))\n"
+    )
+
+
+class WorldTruth:
+    """GroundTruthSource over WorldEnv (stands in for LiberoMemSource in the oracle shadow)."""
+
+    def __init__(self, low: WorldEnv) -> None:
+        self.low = low
+
+    def movable_objects(self):
+        return list(self.low.world.objects)
+
+    def on_targets(self):
+        return [n for n in self.low.world.objects if n.startswith("plate")]
+
+    def contain_regions(self):
+        return []
+
+    def goal_state(self):
+        return SWAP_BDDL_GOAL
+
+    def positions(self):
+        return {n: tuple(o["pos"]) for n, o in self.low.world.objects.items()}
+
+    def eval_predicate(self, pred):
+        return self.low.supports().get(pred[1]) == pred[2]
+
+    def grasped(self, name):
+        return self.low.world.held == name
+
+    def _counter(self) -> StepCounter:
+        c = StepCounter(goal_branches(SWAP_BDDL_GOAL))
+        for h in self.low.history:
+            c.feed({n: frozenset({("on", s)}) if s else frozenset() for n, s in h.items()})
+        return c
+
+    def completed_steps(self):
+        return self._counter().done
+
+    def overshot(self):
+        return False
 
 
 class ScriptedModel:

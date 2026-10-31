@@ -125,19 +125,45 @@ class LaunchArgs:
     # Memory condition (capx.belief); each overrides the YAML key of the same name
     memory_mode: str | None = None
     """Memory in the multi-turn decision prompt: none (cap-x baseline, default), vdm_history (every
-    turn's VDM description) or bg_oracle (Belief Graph from simulator ground truth + S2/S5 signals)."""
+    turn's VDM description), bg_oracle (Belief Graph from simulator ground truth + S2/S5 signals) or
+    bg_est (Belief Graph estimated from cameras, robot state and API calls + S1/S2/S4/S5 signals)."""
 
     memory_max_chars: int | None = None
     """Character budget of the memory block (default 3000)."""
 
     memory_signals: str | None = None
-    """bg_oracle signals, comma-separated: "S2,S5" (default) or "none"."""
+    """Signals, comma-separated or "none". bg_oracle: S2,S5 (default). bg_est: S1,S2,S4,S5 (default)."""
 
     memory_in_initial_prompt: bool | None = None
     """bg_oracle: also put the initial Belief Graph into the first code-generation prompt (default True)."""
 
     memory_max_finish_rejections: int | None = None
-    """bg_oracle S5(a): how many FINISH replies to reject per trial while steps remain (default 1)."""
+    """bg_oracle / bg_est S5(a): how many FINISH replies to reject per trial while steps remain (default 1)."""
+
+    memory_est_goal_source: str | None = None
+    """bg_est goal steps: llm (default; parsed from the task language) or bddl (diagnostics only)."""
+
+    memory_est_perception: str | None = None
+    """bg_est detector: sam3 (default) or sim_fake_for_tests (simulator poses + noise; tests and CPU
+    checks only, flagged in every log and the summary)."""
+
+    memory_est_max_categories: int | None = None
+    """bg_est: at most this many object categories from the task language (default 5)."""
+
+    memory_est_gate_dist: float | None = None
+    """bg_est data association gate in m (default 0.10)."""
+
+    memory_est_verify: bool | None = None
+    """bg_est: one verification VDM call per turn (default True)."""
+
+    memory_est_shadow: bool | None = None
+    """bg_est: log the oracle shadow (simulator truth, logs only; default True)."""
+
+    memory_est_goal_model: str | None = None
+    """bg_est goal parsing model (default: the coding model, text only)."""
+
+    memory_est_goal_server_url: str | None = None
+    """bg_est goal parsing server (default: the coding model's server)."""
 
     # Web UI configuration
     web_ui: bool | None = None

@@ -69,10 +69,12 @@ class EstConfig:
     gate_dist: float = 0.10  # m: a detection farther than this from a track's prediction is not matched in pass 1
     rematch_dist: float = 0.50  # m: pass 2 re-matches leftovers of the same category within this
     dedup_dist: float = 0.01  # m: detections of different categories this close are one object
-    grasp_threshold: float = 0.05  # gripper (0 closed .. 1 open) above this after close_gripper -> holding
-    grasp_radius: float = 0.10  # m: EEF to the grasped object's center
+    # gripper (0 closed .. 1 open) above this after close_gripper -> holding. LIBERO-Mem: closing on
+    # nothing reads ~0.015; holding a bowl by the rim 0.11 after the close and ~0.044 once lifted.
+    grasp_threshold: float = 0.025
+    grasp_radius: float = 0.10  # m: fingertip centre to the grasped object's center
     lift_min: float = 0.03  # m: EEF rise while holding that counts as picked up
-    held_offset: tuple[float, float, float] = (0.0, 0.0, -0.02)  # held object center relative to the EEF
+    held_offset: tuple[float, float, float] = (0.0, 0.0, -0.02)  # held object center - fingertip, if unknown
     support_radius_min: float = 0.03  # m
     on_dz_min: float = -0.01  # m: On(x, y) needs z_x - z_y in (on_dz_min, on_dz_max)
     on_dz_max: float = 0.10
@@ -251,6 +253,7 @@ class BeliefEstimator:
         self.held: str | None = None
         self.held_lifted = False
         self.grasp_z = 0.0
+        self.held_off = np.asarray(self.cfg.held_offset, dtype=np.float64)  # measured at the grasp
         self.violations: list[Violation] = []
         self.last_image: str | None = None
         self.turn = 0
@@ -284,7 +287,7 @@ class BeliefEstimator:
 
     def _predicted(self, t: Track, eef: np.ndarray | None) -> np.ndarray:
         if t.alias == self.held and eef is not None and self.gripper_cmd == "closed":
-            return eef + np.asarray(self.cfg.held_offset)
+            return eef + self.held_off
         return t.pos
 
     def _associate(self, dets: list[Detection], eef: np.ndarray | None, turn: int) -> tuple[set[str], list[str], list[str], list[str]]:
@@ -366,10 +369,11 @@ class BeliefEstimator:
         return best
 
     def _nearest(self, eef: np.ndarray, radius: float, only: set[str] | None = None) -> Track | None:
-        cands = [(float(np.linalg.norm(t.pos - eef)), t) for t in self.tracks.values()
-                 if only is None or t.alias in only]
-        cands = [c for c in cands if c[0] <= radius]
-        return min(cands, key=lambda c: c[0])[1] if cands else None
+        """The tracked object the fingers are on: within ``radius`` of the fingertip centre, the highest
+        one (a rim grasp is about as close to the plate under the bowl as to the bowl)."""
+        cands = [t for t in self.tracks.values()
+                 if (only is None or t.alias in only) and float(np.linalg.norm(t.pos - eef)) <= radius]
+        return max(cands, key=lambda t: float(t.pos[2])) if cands else None
 
     # --- graph helpers --------------------------------------------------------------------------
     def _location_edges(self, alias: str) -> list[EdgeKey]:
@@ -452,24 +456,26 @@ class BeliefEstimator:
                 cand = near if g is not None and g > thr else None
                 self.held, self.held_lifted, self.grasp_z = (cand.alias if cand else None), False, float(eef[2])
                 if cand is not None:
+                    self.held_off = cand.pos - eef
                     expectations[("inhand", cand.alias, None)] = (True, rec.desc)
                 elif g is not None and near is not None:  # closed fully next to an object: grasp missed
                     violations.append(Violation(
                         turn, rec.desc, f"{near.alias} in gripper (nearest object to the gripper)",
-                        f"gripper closed fully ({g:.2f}): nothing grasped"))
+                        f"gripper closed fully ({g:.2f}): nothing grasped", ("inhand", near.alias, None), True))
             elif rec.fn == "open_gripper":
                 self.gripper_cmd = "open"
                 if self.held is not None:
                     t = self.tracks[self.held]
-                    support = self._support_below(t.alias, eef)
+                    at = eef + self.held_off  # where the released object is
+                    support = self._support_below(t.alias, at)
                     expectations[("inhand", t.alias, None)] = (False, rec.desc)
                     if support is not None:
                         pred = "in" if support.category.container else "on"
                         expectations[(pred, t.alias, support.alias)] = (True, rec.desc)
-                        t.pos = np.array([eef[0], eef[1], support.pos[2] + 0.02])
+                        t.pos = np.array([at[0], at[1], support.pos[2] + 0.02])
                     else:
                         expectations[("on", t.alias, TABLE)] = (True, rec.desc)
-                        t.pos = np.array([eef[0], eef[1], self.grasp_z + self.cfg.held_offset[2]])
+                        t.pos = np.array([at[0], at[1], self.grasp_z + self.held_off[2]])
                     if self.held_lifted:
                         if support is None:
                             move(t.alias, frozenset({("on", TABLE)}))
@@ -480,14 +486,15 @@ class BeliefEstimator:
                 t = self.tracks[self.held]
                 if g is not None and g <= thr:
                     violations.append(Violation(turn, rec.desc, f"{t.alias} in gripper",
-                                                f"gripper closed fully ({g:.2f}): object dropped"))
-                    t.pos = eef + np.asarray(self.cfg.held_offset)
+                                                f"gripper closed fully ({g:.2f}): object dropped",
+                                                ("inhand", t.alias, None), True))
+                    t.pos = eef + self.held_off
                     if self.held_lifted:
                         move(t.alias, frozenset())
                     expectations.pop(("inhand", t.alias, None), None)
                     self.held, self.held_lifted = None, False
                 else:
-                    t.pos = eef + np.asarray(self.cfg.held_offset)
+                    t.pos = eef + self.held_off
                     if not self.held_lifted and float(eef[2]) - self.grasp_z >= self.cfg.lift_min:
                         self.held_lifted = True
                         for p, tgt in loc.get(t.alias, frozenset()):
@@ -636,7 +643,7 @@ class BeliefEstimator:
                             else f"{key[1]} not at the gripper ({self.location_text(key[1], final)})")
             else:
                 observed = f"{key[1]} {self.location_text(key[1], final)} (P {edge.p:.2f} {self.origin[key]})"
-            violations.append(Violation(turn, desc, expected, observed))
+            violations.append(Violation(turn, desc, expected, observed, key, holds))
         self.violations += violations
         result.violations = violations
 
@@ -694,7 +701,7 @@ class BeliefEstimator:
         result.rolled_back.append(format_step(step))
         subjects = {p[1] for p in step}
         if not any(v.expected.split(" ")[0] in subjects for v in result.violations):
-            self.violations.append(Violation(turn, "progress check", expected, observed))
+            self.violations.append(Violation(turn, "progress check", expected, observed, _pred_key(step[0]), True))
             result.violations.append(self.violations[-1])
 
     def _confirm(self, idx: int, how: str) -> None:
@@ -828,13 +835,13 @@ class BeliefEstimator:
             step = self.counter.done[j]
             prob, src, seen = self.pred_belief(step[0])
             out.append(Uncertain(f"{format_step(step)} (step {j + 1}, counted from the API calls, not yet seen)",
-                                 prob, src, seen, "unconfirmed"))
+                                 prob, src, seen, "unconfirmed", _pred_key(step[0])))
         for p in self.goal_relevant():
             prob, src, seen = self.pred_belief(p)
             if self.cfg.uncertain_low <= prob <= self.cfg.uncertain_high:
-                out.append(Uncertain(format_pred(p), prob, src, seen, "p"))
+                out.append(Uncertain(format_pred(p), prob, src, seen, "p", _pred_key(p)))
             elif src in ("mem", "exp", "prior") and (seen is None or self.turn - seen >= self.cfg.stale_turns):
-                out.append(Uncertain(format_pred(p), prob, src, seen, "stale"))
+                out.append(Uncertain(format_pred(p), prob, src, seen, "stale", _pred_key(p)))
         return out
 
     def current_truths(self) -> dict[Pred, bool]:

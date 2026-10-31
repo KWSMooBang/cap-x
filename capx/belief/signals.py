@@ -45,13 +45,16 @@ class Violation:
     call: str  # e.g. "close_gripper (sim step 1234)"
     expected: str  # e.g. "bowl_A in gripper"
     observed: str  # e.g. "gripper empty (gripper 0.00)"
+    key: tuple | None = None  # edge (predicate, subject, target) of the expectation, for the eval logs
+    holds: bool = True  # the expected truth of ``key``
 
     @property
     def text(self) -> str:
         return f"{self.call}: expected {self.expected}, observed {self.observed}"
 
     def to_dict(self) -> dict[str, object]:
-        return {"turn": self.turn, "call": self.call, "expected": self.expected, "observed": self.observed}
+        return {"turn": self.turn, "call": self.call, "expected": self.expected, "observed": self.observed,
+                "key": list(self.key) if self.key else None, "holds": self.holds}
 
 
 @dataclass
@@ -62,7 +65,8 @@ class Uncertain:
     p: float
     source: str
     last_seen_turn: int | None
-    reason: str  # "p" (0.3-0.7) or "stale" (old memory only)
+    reason: str  # "p" (0.3-0.7), "stale" (old memory only) or "unconfirmed" (a counted step not seen)
+    key: tuple | None = None  # edge (predicate, subject, target), for the eval logs
 
     @property
     def text(self) -> str:
@@ -71,7 +75,8 @@ class Uncertain:
 
     def to_dict(self) -> dict[str, object]:
         return {"pred": self.pred, "p": round(self.p, 3), "source": self.source,
-                "last_seen_turn": self.last_seen_turn, "reason": self.reason}
+                "last_seen_turn": self.last_seen_turn, "reason": self.reason,
+                "key": list(self.key) if self.key else None}
 
 
 @dataclass
