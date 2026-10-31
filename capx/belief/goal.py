@@ -159,6 +159,20 @@ class GoalResult:
 
 QueryFn = Callable[[list[dict[str, Any]]], Any]  # prompt -> str or {"content", "usage", ...}
 
+_UNKNOWN = re.compile(r"unknown object '([^']*)'")
+
+
+def unknown_objects(result: GoalResult) -> list[str]:
+    """Names a failed goal parse rejected as not in the detected objects (empty: it failed otherwise)."""
+    if result.branches is not None:
+        return []
+    out: list[str] = []
+    for e in result.errors:
+        for m in _UNKNOWN.finditer(e):
+            if m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
 
 def _content(out: Any) -> tuple[str, Any]:
     if isinstance(out, dict):

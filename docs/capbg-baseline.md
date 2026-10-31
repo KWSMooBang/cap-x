@@ -470,6 +470,21 @@ verbatim, `capx/belief/prompts_v2.py`). `bg_est` is unchanged and can still be r
   "empty" / "holds X" from M2 — and a region line when the instruction names one (`center`). Steps list only
   newly true predicates; a reply with cumulative steps is normalized (a predicate already true before its step
   is dropped when the step has a new one; a step with none new, a put-back or repeat, is kept).
+- **SAM3 prompts** (`perception.VOCABULARY_V2`, bg_est2 only; `bg_est` keeps `VOCABULARY` and its one prompt per
+  category). Each category has an ordered list of SAM3 prompts, measured on LIBERO-Mem agentview renders
+  (800×512, tasks 0–9 × 2 scenes, score ≥ 0.4, mask NMS 0.5): cream cheese `small blue box` → `blue box` →
+  `blue package` (it renders as a small blue box; `cream cheese box` found it 0/4), plate `saucer` → `plate`,
+  bowl `bowl` → `black bowl`, bottle `bottle` → `wine bottle`, basket `basket` → `wicker basket`; other
+  categories their one prompt. The name shown to the code agent, the VDM and the goal model stays semantic
+  (`cream_cheese_A (cream cheese)`, `plate_A (plate)`, `bowl_A (black bowl)`); the SAM3 strings never reach a
+  model prompt. Re-detection: at turn 0, a category with no detection under its prompt tries the next candidates
+  (instruction / goal categories first) until one finds something, and that prompt is kept for the trial
+  (nothing found: the first stays). Later, a category with no detection for 2 turns in a row
+  (`Est2Config.redetect_turns`) tries its next untried candidate once; a hit makes it the category's prompt.
+  If the goal model's reply is rejected for an unknown object, the undetected categories (of the rejected names,
+  then all of the instruction's, beyond `memory_est_max_categories`) are re-detected with the candidates not yet
+  run on the turn-0 image; if that finds an object, the initial belief (M2) is rebuilt and the goal is parsed
+  once more (`goal_retry` in the log).
 - **M4** is appended to the first prompt and to every decision prompt (bg_est2 only).
 - **Turn end.** The harness passes the block that ran. A valid declaration (op ∈ pick, place, put_in,
   place_region, look; known names) whose operator API ran (pick: `close_gripper`; place*: `open_gripper`)
@@ -527,12 +542,17 @@ shortened; title, Subtask, Effect, Delta, Subtasks and Signals are never cut.
 ### Logs
 
 - `all_responses.json`: as `bg_est` (`memory_*`, `memory_est` with `est`, `shadow`) plus
-  `memory_est.cot_record` = `{turn, Subtask, Effect, declared, Observe, Notes, Belief, Delta, Subtasks, Signals}`.
+  `memory_est.cot_record` = `{turn, Subtask, Effect, declared, Observe, Notes, Belief, Delta, Subtasks, Signals}`;
+  `memory_est.est.prompts` (category → SAM3 prompt in use), `memory_est.est.redetects` (this turn's
+  re-detections: turn, category, prompt, previous, detections, reason `turn0_none` / `none_2_turns` /
+  `goal_unknown_object`) and, at turn 0, `memory_est.est.goal_retry` (unknown names, categories, new tracks,
+  retried, parsed).
 - `<trial_dir>/belief_trace.jsonl`: one line at the start, per turn end and per event-frame Observe: `nodes`
   (category, mark, pos, size, last_seen, pixel, flag), `robot` (eef, gripper, handempty, above, holding,
   lifted), `keys` (per relation: P, source, obs, observe answer, last_seen_turn, geom {dz, d_xy, r}, `shadow` =
   simulator truth), `goal` (+ region centers), `steps` (status, by, turn), `subtasks`, `plan`, `declaration`,
-  `observe` (statements, reply, parsed, prompt text), `cot`, `signals`, `est`, `shadow`. Written to
+  `observe` (statements, reply, parsed, prompt text), `cot`, `prompts` (SAM3 prompt in use per category),
+  `redetects` (every re-detection of the trial so far), `signals`, `est`, `shadow`. Written to
   `<output_dir>/belief_trace_trial_NN.jsonl` while the trial runs and copied into the trial directory.
 - Shadow totals (`memory_state.shadow_totals`): `bg_est`'s plus `observe` (per predicate: answers 1 / 0 with
   [n, right], `?`, missing), `observe_fail`, `declared` / `declared_valid` / `declared_dropped` /
@@ -552,7 +572,9 @@ Same as `bg_est` with `--memory-mode bg_est2`. Extra keys:
 
 `memory_est_perception`, `memory_est_goal_source`, `memory_est_goal_model`, `memory_est_shadow`,
 `memory_est_gate_dist`, `memory_est_max_categories` work as for `bg_est`. Extra model calls per trial: one M2 and
-one M3, then one M5 per turn (event frames: up to 4 more).
+one M3, then one M5 per turn (event frames: up to 4 more). Re-detection adds SAM3 calls only for categories
+with no detection (at most the remaining candidates at turn 0, one per 2 missed turns later, each candidate once)
+and, after an unknown-object goal rejection, at most one more M2 and one more M3.
 
 Offline Observe accuracy (`scripts/eval_observe.py`): `scenes` makes labelled LIBERO-Mem scenes on CPU (needs the
 simulator, no keys); `query` sends them to the VDM as M5 prompts (`OBSERVE_VDM_URL`, `OBSERVE_VDM_MODEL`,
