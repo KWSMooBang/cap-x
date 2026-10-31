@@ -254,9 +254,10 @@ no decay). Detections of different categories within `dedup_dist` (0.01 m) count
 ### Relations from geometry
 
 With `d` = xy distance of the centers, `dz` = z(x) - z(y) and `r` = half the larger xy extent of y (at least 3 cm):
-- `On(x, y)`: `d < r` and `-0.01 < dz < 0.10` m.
+- `On(x, y)`: `d < r` and `0 < dz < 0.10` m. A bowl resting on a LIBERO plate is about 0.018 m above it (centres).
+  A bowl tilted onto the plate rim, which is not On for LIBERO, sits level with it and comes out near P 0.5.
 - `In(x, y)` (y a container category: basket, tray): `d < r` and `dz` within y's height (-h/2 - 0.02, h/2 + 0.03).
-- The margin `m` is the smallest of `(r - d) / max(r/2, 2 cm)` and the z margins / 2 cm. P = 0.5 + 0.47 min(|m|, 1)
+- The margin `m` is the smallest of `(r - d) / max(r/2, 2 cm)` and the z margins / 1 cm. P = 0.5 + 0.47 min(|m|, 1)
   when it holds, 0.5 - 0.47 min(|m|, 1) when not. Clear cases are 0.97 / 0.03 and borderline cases come out near 0.5.
   If y was not seen this turn (position from memory), the confidence is halved.
 - `inhand`: from the gripper. After the last gripper call was `close_gripper` and the opening is above
@@ -316,14 +317,17 @@ repetition: a turn that moved the bowl without hooked calls counts nothing. A co
 observed undone at the end of a turn is marked overshot, as in LIBERO-Mem.
 
 A count made on a hook snapshot is **pending** until an observation at the end of a turn (geometry, gripper or VDM)
-confirms the step's predicates. If the observation contradicts it (for example the bowl was put back but rolled off
+confirms the step's predicates with P >= 0.7. A count is withdrawn only for P <= 0.3; anything in between keeps it
+pending. If the observation contradicts it (for example the bowl was put back but rolled off
 the plate), the count is withdrawn: the counter is rerun from the start of the turn without that snapshot and the
 ones after it, and S1 is raised. A count on the end-of-turn snapshot that the observation contradicts takes the
 same path: it is withdrawn and S1 is raised, it is never left pending. If the object was not seen at the end of the turn, or was picked up again later in
 the same turn, the count stays pending. A later end-of-turn observation of that object then confirms or withdraws
-it. A confirmed count also confirms all pending counts before it. Each counted step records `confirmed_by`: `obs` or
-`vdm` when an observation confirmed it, `later_step` when only a later step's observation did (it was never seen
-itself). The progress line says how many counted steps are still unconfirmed and how many were confirmed only by a
+it. A confirmed count also confirms the pending counts of *different* steps before it: the sequence reached a later
+step. Pending repeats of the same step stay pending, because seeing the third place-back says nothing about the
+first two. In a CPU check of task 2 that rule would have confirmed two unseen repeats and fired a wrong S5b. Each
+counted step records `confirmed_by`: `obs` or `vdm` when an observation confirmed it, `later_step` when only a
+later step's observation did (it was never seen itself). The progress line says how many counted steps are still unconfirmed and how many were confirmed only by a
 later step. The turn log has `confirmed_by` per step and `state()` has `later_step_confirmations`.
 
 ### Signals (estimated)
@@ -346,7 +350,9 @@ later step. The turn log has `confirmed_by` per step and `state()` has `later_st
 
 Same layout as `bg_oracle` (Progress / Objects / Events / Signals) with a title saying everything is an estimate, P
 and source after every relation (`on plate_B 0.97 obs`, `in gripper 0.70 exp`), `not seen since tK` for objects not
-seen this turn, and a `Violations:` line (last 3) before `Signals:`. The budget rule is the same as `bg_oracle`;
+seen this turn, and a `Violations:` line (last 3) before `Signals:`. When every step is counted but the estimate is
+uncertain (S5 suppressed), the Progress line says `all steps counted, but NOT all confirmed` instead of `all steps
+estimated complete`, so the wording does not invite a FINISH that S5b would not back. The budget rule is the same as `bg_oracle`;
 Violations, like Progress and Signals, is never cut.
 
 ### Running `bg_est`

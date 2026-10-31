@@ -76,10 +76,13 @@ class EstConfig:
     lift_min: float = 0.03  # m: EEF rise while holding that counts as picked up
     held_offset: tuple[float, float, float] = (0.0, 0.0, -0.02)  # held object center - fingertip, if unknown
     support_radius_min: float = 0.03  # m
-    on_dz_min: float = -0.01  # m: On(x, y) needs z_x - z_y in (on_dz_min, on_dz_max)
+    # m: On(x, y) needs z_x - z_y (centres) in (on_dz_min, on_dz_max). A bowl resting on a LIBERO plate
+    # is ~0.018 above it; a bowl tilted onto the plate rim (not On for LIBERO) sits level with it.
+    on_dz_min: float = 0.0
     on_dz_max: float = 0.10
     table_tol: float = 0.03  # m: an object's bottom this close to the table height can be on the table
     margin_scale: float = 0.02  # m: margin to a threshold that gives full confidence (P 0.97 / 0.03)
+    z_margin_scale: float = 0.01  # m: the same for the vertical On / In thresholds
     p_vdm: float = 0.9  # P of a VDM true (1 - p_vdm for false)
     stale_turns: int = 2  # a memory not re-observed for this many turns counts as uncertain (S4)
     uncertain_low: float = 0.3
@@ -354,7 +357,8 @@ class BeliefEstimator:
         else:
             key = ("on", x.alias, y.alias)
             lo, hi = cfg.on_dz_min, cfg.on_dz_max
-        m = min((r - d_xy) / max(0.5 * r, cfg.margin_scale), (dz - lo) / cfg.margin_scale, (hi - dz) / cfg.margin_scale)
+        zs = cfg.z_margin_scale
+        m = min((r - d_xy) / max(0.5 * r, cfg.margin_scale), (dz - lo) / zs, (hi - dz) / zs)
         c = min(abs(m), 1.0) * (1.0 if y_seen else 0.5)  # support position from memory: less sure
         return key, 0.5 + 0.47 * c if m > 0 else 0.5 - 0.47 * c
 
@@ -680,12 +684,17 @@ class BeliefEstimator:
 
     # --- counting -------------------------------------------------------------------------------
     def _observed(self, pred: Pred) -> bool | None:
-        """Truth of ``pred`` as observed this turn (geometry, gripper or VDM), None if not observed."""
+        """``pred`` as observed this turn (geometry, gripper or VDM) with confidence: True for
+        P >= uncertain_high, False for P <= uncertain_low, None if unsure or not observed."""
         key = _pred_key(pred)
         edge = self.graph.edges.get(key)
         if edge is None or self.origin.get(key) not in ("geo", "grip", "vdm"):
             return None
-        return edge.holds
+        if edge.p >= self.cfg.uncertain_high:
+            return True
+        if edge.p <= self.cfg.uncertain_low:
+            return False
+        return None
 
     def _verdict(self, step: Step, moved_later: bool) -> tuple[str, str]:
         """(confirmed | rejected | pending, obs | vdm): the end-of-turn evidence for a count."""
@@ -705,11 +714,17 @@ class BeliefEstimator:
             result.violations.append(self.violations[-1])
 
     def _confirm(self, idx: int, how: str) -> None:
-        """Count ``idx`` confirmed by observation; earlier pending counts are confirmed with it."""
+        """Count ``idx`` confirmed by observation. Earlier pending counts of a *different* step are
+        confirmed with it (a later step of the sequence was reached). Earlier pending repeats of the
+        same step stay pending: seeing the third place-back says nothing about the first two."""
+        step = self.counter.done[idx]
+        keep = set()
         for q in self.pending:
-            if q < idx:
+            if q < idx and self.counter.done[q] != step:
                 self.confirmed_by[q] = "later_step"
-        self.pending = {q for q in self.pending if q > idx}
+            elif q != idx:
+                keep.add(q)
+        self.pending = keep
         self.confirmed_by[idx] = how
 
     def _count(self, turn: int, snapshots: list[Snapshot], final: Snapshot, result: EstTurn) -> None:
@@ -836,7 +851,10 @@ class BeliefEstimator:
             prob, src, seen = self.pred_belief(step[0])
             out.append(Uncertain(f"{format_step(step)} (step {j + 1}, counted from the API calls, not yet seen)",
                                  prob, src, seen, "unconfirmed", _pred_key(step[0])))
+        flagged = {u.key for u in out}
         for p in self.goal_relevant():
+            if _pred_key(p) in flagged:  # already listed as an unconfirmed count
+                continue
             prob, src, seen = self.pred_belief(p)
             if self.cfg.uncertain_low <= prob <= self.cfg.uncertain_high:
                 out.append(Uncertain(format_pred(p), prob, src, seen, "p", _pred_key(p)))
@@ -877,7 +895,8 @@ class BeliefEstimator:
     def progress_text(self, uncertain: bool = False) -> str:
         if not self.goal.branches:
             return "Progress: progress unknown (the goal could not be parsed into steps)"
-        text = progress_line(self.counter.progress(), self.current_truths(), complete_text="all steps estimated complete")
+        done_text = "all steps counted, but NOT all confirmed" if uncertain else "all steps estimated complete"
+        text = progress_line(self.counter.progress(), self.current_truths(), complete_text=done_text)
         if self.pending:
             text += f" | {len(self.pending)} counted step(s) not yet confirmed by observation"
         if self.later_step_confirmations():

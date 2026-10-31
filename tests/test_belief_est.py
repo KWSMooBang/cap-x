@@ -297,8 +297,8 @@ def test_s5_suppressed_when_goal_predicate_uncertain():
     r = end(est, world, rec, 3)
     assert r.progress.complete
     assert r.pending == [2]  # counted from the hooks, the bowl not seen at the end of the turn
-    assert [u.reason for u in r.uncertain] == ["unconfirmed", "p"]
-    assert r.uncertain[1].pred == "bowl_A on plate_B" and r.uncertain[1].p == pytest.approx(0.7)
+    assert [u.reason for u in r.uncertain] == ["unconfirmed"]  # the same predicate is not listed twice
+    assert r.uncertain[0].pred.startswith("bowl_A on plate_B (step 3") and r.uncertain[0].p == pytest.approx(0.7)
     assert "1 counted step(s) not yet confirmed" in est.progress_text()
     assert r.suppress_completion
     assert "S5b" not in [s.id for s in (d.detect(_ctx(est, r)) for d in est_detectors()) if s]
@@ -621,3 +621,23 @@ def test_confirmed_by_records_later_step_confirmations():
     world.pick_place("akita_black_bowl_1", "plate_2")
     r3 = end(est, world, rec, 3)
     assert r3.confirmed_by == ["later_step", "obs", "obs"]
+
+
+def test_later_repeat_does_not_confirm_earlier_unseen_repeat():
+    """Seen in LIBERO-Mem task_02 on CPU: a tilted bowl's borderline observation confirmed the 3rd
+    repeat and, through it, two unseen earlier ones -> wrong S5b. Repeats confirm only themselves."""
+    world = repeat_world()
+    est, det, rec = setup(world, REPEAT_GOAL_JSON, REPEAT)
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    det.miss = {"akita_black_bowl_1"}
+    r1 = end(est, world, rec, 1)
+    assert r1.pending == [0]
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    r2 = end(est, world, rec, 2)
+    assert r2.confirmed_by == [None, "obs"] and r2.pending == [0] and r2.suppress_completion
+    assert est.state()["later_step_confirmations"] == 0
+    world.pick_place("akita_black_bowl_1", "plate_1")
+    r3 = end(est, world, rec, 3)
+    assert r3.progress.complete and r3.suppress_completion
+    text = est.progress_text(uncertain=True)
+    assert "all steps counted, but NOT all confirmed" in text and "estimated complete" not in text
