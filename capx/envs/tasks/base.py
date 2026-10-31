@@ -134,6 +134,9 @@ class CodeExecutionEnvBase(Env):
         # Unfilled prompt; reset() restores it and fill_prompt_goal() formats a copy of it.
         self._full_prompt_template = copy.deepcopy(self._full_prompt)
 
+        # Optional (name, fn) -> fn wrapper for API functions bound into the code sandbox. bg_est
+        # memory sets it to a record-only hook (capx.belief.hooks); None binds the functions as is.
+        self.api_call_wrapper: Any = None
         # Persistent execution namespace to retain variables across steps
         self._exec_globals: dict[str, Any] = {}
         self._init_exec_globals()
@@ -177,7 +180,7 @@ class CodeExecutionEnvBase(Env):
         # Ensure API helper functions remain bound/current
         for api in self._apis.values():
             for fn_name, fn in api.functions().items():
-                self._exec_globals[fn_name] = fn
+                self._exec_globals[fn_name] = self._bind_api_fn(fn_name, fn)
 
         stdout_buffer = io.StringIO()
         tee_out = Tee(sys.stdout, stdout_buffer)
@@ -225,8 +228,12 @@ class CodeExecutionEnvBase(Env):
         # Bind helper functions from APIs into the global namespace for convenience
         for api in self._apis.values():
             for fn_name, fn in api.functions().items():
-                g[fn_name] = fn
+                g[fn_name] = self._bind_api_fn(fn_name, fn)
         self._exec_globals = g
+
+    def _bind_api_fn(self, name: str, fn: Any) -> Any:
+        wrapper = getattr(self, "api_call_wrapper", None)
+        return fn if wrapper is None else wrapper(name, fn)
 
     def _build_low_level(
         self, src: Env | str, privileged: bool = False, enable_render: bool = True, viser_debug: bool = False

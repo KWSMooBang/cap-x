@@ -179,6 +179,7 @@ YAMLs as they are (`memory_mode` is not in them, so it defaults to `none`):
 | `none` (default) | The cap-x baseline. Every prompt is byte-identical to the harness before memory existed (`tests/test_memory_mode.py` checks this against a recorded fixture). |
 | `vdm_history` | The VDM descriptions of all previous turns, as `turn k: ...` (unstructured text memory). The current turn's description is already in the VDM block, so the history leaves it out. |
 | `bg_oracle` | A Belief Graph built from LIBERO-Mem **simulator ground truth** (`capx/belief/`): progress over the BDDL goal steps, object positions and supports, location-change events, plus the S2 / S5 signals below. This is an upper bound, not a deployable method. |
+| `bg_est` | A Belief Graph **estimated** from what the robot can use (cameras, robot state, API calls, VDM, task language), with S1 / S2 / S4 / S5. See [Estimated Belief Graph](#estimated-belief-graph-bg_est). |
 
 The memory block goes after the VDM description and before the REGENERATE / FINISH instructions. Options (CLI
 flag or YAML key of the same name; CLI wins):
@@ -188,7 +189,7 @@ flag or YAML key of the same name; CLI wins):
 | `memory_max_chars` | 3000 | Budget of the memory block. `vdm_history` drops the oldest turns. `bg_oracle` drops the oldest events, then shortens and finally leaves out the objects line, but never cuts the Progress and Signals lines (`memory_state.over_budget` marks when those alone exceed the budget). |
 | `memory_signals` | `S2,S5` | `bg_oracle` signals (`none` turns them off). S2: an executed turn left the number of remaining steps unchanged. The prompt says "no progress this turn" and asks the model to rethink. S5b: every step is verified complete. The prompt says so, and the model still decides FINISH (the harness never ends a trial by itself). S5a: a FINISH while steps remain is rejected and the same prompt is asked again with the reply and the remaining steps appended. That answer stands. |
 | `memory_max_finish_rejections` | 1 | S5a rejections per trial. |
-| `memory_in_initial_prompt` | true | `bg_oracle`: also append the turn-0 graph to the first code-generation prompt. |
+| `memory_in_initial_prompt` | true | `bg_oracle` / `bg_est`: also append the turn-0 graph to the first code-generation prompt. |
 
 Example (LIBERO-Mem task 6, oracle condition):
 
@@ -212,6 +213,235 @@ messages). The entry's decision fields describe the second answer.
 
 `bg_oracle` reads ground truth through the harness's own `env.low_level_env` reference. Generated code still
 gets no memory or env object (exposing a belief API to code is out of scope).
+
+## Estimated Belief Graph (`bg_est`)
+
+`bg_est` builds the same kind of graph as `bg_oracle` (`capx/belief/`) from information the robot can actually
+use, so the gap between the two separates the memory effect from the effect of being given the true state.
+
+**Uses:** the agentview RGB-D image with intrinsics and extrinsics (what `get_observation()` returns), the
+end-effector pose and gripper opening (`robot_cartesian_pos`, `robot_joint_pos`), the API calls the generated code
+made (arguments, return, timing), VDM replies and the task language.
+**Never uses:** simulator object poses or sim state, BDDL objects or predicates, LIBERO-Mem's progress tracker
+(`memory_state`), `task_completed`. Those only feed the oracle shadow in the evaluation logs.
+`tests/test_belief_est.py::test_estimation_path_reads_no_sim_state` runs the estimator against an env stand-in
+that fails on any attribute other than `get_observation` and `_sim_step_count`.
+
+Modules: `goal.py` (task language -> steps), `perception.py` (detections -> 3D), `hooks.py` (API call records),
+`verify.py` (verification VDM), `estimator.py` (association, geometry, fusion, events, progress, S1/S4 inputs).
+
+### Objects and aliases
+
+Object categories come from the task language through a fixed vocabulary (`perception.VOCABULARY`; "bowl" ->
+SAM3 prompt "black bowl", "cream cheese" -> "cream cheese box", ...), at most `max_categories` (default 5), in
+order of mention. Each category is one SAM3 text-prompt call on the agentview RGB. Each instance mask (score >= 0.4,
+duplicates with mask IoU > 0.5 removed) is lifted to 3D with depth, intrinsics and extrinsics in the robot base frame,
+the same frame as the generated code. Center = median point, size = 5-95 percentile extent per axis.
+
+Aliases are `<category>_<letter>`. At turn 0, instances of a category are lettered in order of their base-frame
+y (robot's right first), ties by x: `bowl_A` is the bowl furthest to the robot's right. Turn 0 merges
+`init_passes` (2) detection passes of the static scene, which makes a missed object less likely. An object first
+seen later gets the next free letter. Aliases never change once given.
+
+**Data association** (per category, per turn): one global Hungarian assignment over all tracks and detections of
+the category, on the 3D distance between each track's predicted position and the detections. The held object is
+predicted at the EEF. Pairs beyond `gate_dist` (0.10 m) cannot be assigned in this step, so a long crossing pair
+never pushes out a match inside the gate. In a second step, and only there, the
+leftover detections are re-matched to leftover tracks of the same category within `rematch_dist` (0.50 m). New
+nodes are created only after that. A track left unmatched keeps its last position and edges (source `mem`,
+no decay). Detections of different categories within `dedup_dist` (0.01 m) count as one object.
+
+### Relations from geometry
+
+With `d` = xy distance of the centers, `dz` = z(x) - z(y) and `r` = half the larger xy extent of y (at least 3 cm):
+- `On(x, y)`: `d < r` and `0 < dz < 0.10` m. A bowl resting on a LIBERO plate is about 0.018 m above it (centres).
+  A bowl tilted onto the plate rim, which is not On for LIBERO, sits level with it and comes out near P 0.5.
+- `In(x, y)` (y a container category: basket, tray): `d < r` and `dz` within y's height (-h/2 - 0.02, h/2 + 0.03).
+- The margin `m` is the smallest of `(r - d) / max(r/2, 2 cm)` and the z margins / 1 cm. P = 0.5 + 0.47 min(|m|, 1)
+  when it holds, 0.5 - 0.47 min(|m|, 1) when not. Clear cases are 0.97 / 0.03 and borderline cases come out near 0.5.
+  If y was not seen this turn (position from memory), the confidence is halved.
+- `inhand`: from the gripper. After the last gripper call was `close_gripper` and the opening is above
+  `grasp_threshold` (0.05), the tracked object nearest the EEF (within `grasp_radius`, 0.10 m) is in hand
+  (P 0.97 if seen there, else the hook expectation stays). Every other object is not in hand (0.03).
+  An object in hand is on / in nothing.
+- `On(x, table)`: only from geometry. The table height is the lowest object bottom (center z - half height) seen at
+  turn 0. It holds when x's bottom is within `table_tol` (0.03 m) of that height, with P scaled by the margin as
+  above and capped at 1 - P of x's best support (a bowl on a thin plate is near table height too). Without a
+  table height (nothing seen at turn 0), or for an object not seen, it is never assumed. An object with no true
+  location relation is shown as `location unknown`.
+
+### Hooks and expected effects
+
+`close_gripper`, `open_gripper`, `move_to_joints`, `goto_pose` and `goto_home_joint_position` are wrapped in the code
+sandbox (`ApiCallRecorder`). A wrapper records the sim step and the EEF / gripper before and after the call. It passes
+the arguments, return value and exceptions through unchanged. All recording (argument text, array copies, robot
+state reads) is inside try/except, so a recording failure only loses the record. From the records, in order:
+- `close_gripper` with the opening still above `grasp_threshold`: the nearest tracked object is held, expected
+  `inhand` (P 0.7, source `exp`). A `close_gripper` that closes fully while a tracked object is within
+  `grasp_radius` of the EEF is a missed grasp (S1, naming the nearest object as the likely target). With no object
+  nearby there is no signal. It counts as picked up (`in gripper` event) once the EEF has risen `lift_min`
+  (0.03 m) while holding.
+- `open_gripper` while holding: expected `On(x, s)` (or `In`) with `s` the highest tracked object under the EEF,
+  else `On(x, table)`. The held object's predicted position moves to the EEF.
+- A motion during which the gripper closes fully while holding: the object was dropped (S1).
+
+### Fusion
+
+Per edge, highest first: geometry / gripper (`obs`) > verification VDM (`obs`, P 0.9 / 0.1) > this turn's expectation
+(`exp`, 0.7 / 0.3) > memory (`mem`, P kept) > prior (0.5). When geometry and the VDM disagree on whether an edge
+holds, both go into the log (`conflicts`). The one further from P=0.5 wins, geometry on a tie, so a clear
+geometric observation (0.97) beats the VDM (0.9) and the VDM beats a borderline one.
+
+The verification VDM is called once per turn with the agentview images before and after the turn and a numbered list:
+this turn's expected effects that should hold, plus goal predicates whose geometry is missing or between 0.3 and 0.7
+(at most `max_hypotheses`, 8). Objects are named by alias and the pixel their estimated position projects to.
+Answers are true / false / not_visible as JSON. A reply that does not parse is ignored.
+
+### Events and progress
+
+An event is a change of an object's location label. Events from hooks come first, in call order (`exp`). Then come
+changes between the last hook state and the observed end-of-turn state (`obs`, or `vdm` if the VDM decided).
+A hook event that the end-of-turn observation confirms is labelled `exp+obs`.
+
+The goal is parsed once, after the turn-0 perception: the coding model, text only, gets the task language and the
+object list, and returns JSON steps over aliases (`goal.py`). It may give alternative orders (`or`) and repeats
+(`"repeat": N` for "N times"). A bad reply is asked once more with the error; if it fails again, progress is
+unknown. `goal_source: bddl` (diagnostics only) uses the BDDL goal with sim names mapped to aliases instead.
+
+Progress counts a step when all its predicates hold in a location snapshot after not holding in an earlier snapshot
+since that step was last counted. This is tracked per goal step from the first snapshot on, so a step that turns
+true right after, or together with, the previous step is still counted. LIBERO-Mem's tracker counts the same way: the subgoal has to be false before it can count
+again. Snapshots are taken after every hooked call and at the end of the turn. So "pick the bowl up and put it back
+on the plate" counts once even though the end-of-turn state did not change. The state alone cannot show a
+repetition: a turn that moved the bowl without hooked calls counts nothing. A completed goal whose last step is
+observed undone at the end of a turn is marked overshot, as in LIBERO-Mem.
+
+A count made on a hook snapshot is **pending** until an observation at the end of a turn (geometry, gripper or VDM)
+confirms the step's predicates with P >= 0.7. A count is withdrawn only for P <= 0.3; anything in between keeps it
+pending. If the observation contradicts it (for example the bowl was put back but rolled off
+the plate), the count is withdrawn: the counter is rerun from the start of the turn without that snapshot and the
+ones after it, and S1 is raised. A count on the end-of-turn snapshot that the observation contradicts takes the
+same path: it is withdrawn and S1 is raised, it is never left pending. If the object was not seen at the end of the turn, or was picked up again later in
+the same turn, the count stays pending. A later end-of-turn observation of that object then confirms or withdraws
+it. A confirmed count also confirms the pending counts of *different* steps before it: the sequence reached a later
+step. Pending repeats of the same step stay pending, because seeing the third place-back says nothing about the
+first two. In a CPU check of task 2 that rule would have confirmed two unseen repeats and fired a wrong S5b. Each
+counted step records `confirmed_by`: `obs` or `vdm` when an observation confirmed it, `later_step` when only a
+later step's observation did (it was never seen itself). The progress line says how many counted steps are still unconfirmed and how many were confirmed only by a
+later step. The turn log has `confirmed_by` per step and `state()` has `later_step_confirmations`.
+
+### Signals (estimated)
+
+- S1 expectation violation: an expected effect of this turn contradicted by geometry, the gripper or the VDM
+  (e.g. `inhand` expected but the gripper is empty, or the object is not where it was put down), or a drop while
+  holding. The failed call is named.
+- S2 progress stall: as for `bg_oracle`, on the estimated progress.
+- S4 uncertain: a goal predicate of the last counted step or of the next steps has 0.3 <= P <= 0.7, or rests only on
+  memory / expectation / prior not re-observed for `stale_turns` (2) turns. Suggests re-observing (move the arm away,
+  look again).
+- S5a / S5b: as for `bg_oracle`, on the estimated progress, but neither fires while progress is unknown, any of
+  those goal predicates is uncertain (the S4 condition), or **any counted step is still pending**. A wrong
+  completion signal could otherwise mislead the model. The current truth of earlier counted steps is not
+  re-checked: later steps may undo them on purpose (the swap task moves bowl_A off plate_C again). Their check is
+  the evidence at the time they were counted.
+- S3 is out of scope.
+
+### Prompt text
+
+Same layout as `bg_oracle` (Progress / Objects / Events / Signals) with a title saying everything is an estimate, P
+and source after every relation (`on plate_B 0.97 obs`, `in gripper 0.70 exp`), `not seen since tK` for objects not
+seen this turn, and a `Violations:` line (last 3) before `Signals:`. When every step is counted but the estimate is
+uncertain (S5 suppressed), the Progress line says `all steps counted, but NOT all confirmed` instead of `all steps
+estimated complete`, so the wording does not invite a FINISH that S5b would not back. The budget rule is the same as `bg_oracle`;
+Violations, like Progress and Signals, is never cut.
+
+### Running `bg_est`
+
+```bash
+uv run --no-sync --active capx/envs/launch.py \
+    --config-path env_configs/capbg_baseline/libero_mem/task_06_swap_bowls.yaml \
+    --memory-mode bg_est --output-dir outputs/capbg_bg_est/task_06_swap_bowls ...  # model flags as above
+```
+
+The SAM3 server of the config (`127.0.0.1:8114`) must be up: `bg_est` calls it itself, once per category per
+perception. The goal is parsed by the coding model (`--model`, `--server-url`) and the verification VDM uses
+`--visual-differencing-model`. Options (CLI flag or YAML key; CLI wins). They only exist when `memory_mode` is
+`bg_est`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `memory_signals` | `S1,S2,S4,S5` | Signals (`none` turns them off). S1 and S4 exist only for `bg_est`. |
+| `memory_est_perception` | `sam3` | `sam3`, or `sim_fake_for_tests` (simulator poses + noise; tests and CPU checks only). Any other value is an error, so the fake detector is never selected by accident. When it is used, every `memory_state.perception` / `memory_est.perception` in `all_responses.json` says `sim_fake_for_tests (FAKE ...)`, and `summaries.txt` gets a `NOT A VALID EVALUATION` line. |
+| `memory_est_goal_source` | `llm` | `llm`, or `bddl` (diagnostics: BDDL goal with sim names mapped to turn-0 aliases; logged as `goal.source: bddl`). |
+| `memory_est_max_categories` | 5 | Object categories taken from the task language. |
+| `memory_est_gate_dist` | 0.10 | Data-association gate (m). |
+| `memory_est_verify` | true | One verification VDM call per turn. |
+| `memory_est_shadow` | true | Log the oracle shadow (needs the LIBERO-Mem env; logs only). |
+| `memory_est_goal_model` / `memory_est_goal_server_url` | coding model / server | Model for goal parsing (text only). |
+
+`memory_max_chars`, `memory_max_finish_rejections` and `memory_in_initial_prompt` work as for `bg_oracle`. A turn
+that ran no code (`truncated_skip`) is still observed, so the text keeps the turn number current. It never
+fires S1 or S2, and S2 then compares the next executed turn with the last executed one (same rule as `bg_oracle`).
+
+**Harness integration.** `CodeExecutionEnvBase.api_call_wrapper` (default None: functions are bound as before)
+wraps the API functions bound into the code sandbox. `bg_est` sets it to the record-only hook and every trial
+resets it, because envs are reused across trials. `bg_est` reads the robot observation through
+`env.low_level_env.get_observation()` and the step counter `_sim_step_count`. The task language comes from
+`handle.task_language`. Memory is created after the VDM query settings, which changes nothing for the other modes.
+
+**Logs** (`all_responses.json`): every entry has `memory_state`. For `bg_est` that is `estimator.state()` plus
+`perception`, `over_budget`, `uncertain`, `suppress_completion`, `calls` and `shadow_totals`. `calls` holds
+`goal_parse` with its prompt / completion tokens, `verify_vdm` with its tokens, and `perception` (detector calls:
+SAM3 requests). Every entry also has `memory_est`:
+- `est`: this turn's estimator record: hook `records`, `expectations`, `detections`, `new_tracks`,
+  `unmatched_tracks`, `rematched`, `hypotheses`, `verify` (reply, answers), `conflicts`, `events`, `violations`,
+  `uncertain`, `progress`, `pending`, `confirmed_by`, `rolled_back`, `perception`.
+- `goal` (initial entry): the parsed goal, attempts, errors, raw replies.
+- `shadow` (**evaluation only, never in a prompt**; `capx/belief/shadow.py`):
+  - `mapping`: alias -> sim object, per category, by Hungarian on position.
+  - `aliases_swapped_vs_t0` and `identity_swap_events`: aliases now mapped to a different object than at turn 0,
+    and those that changed since the previous turn.
+  - `goal_pred_correct` / `goal_pred_total` / `goal_pred_wrong`: goal predicates, estimate P > 0.5 vs the oracle
+    graph, aliases read with the turn-0 mapping.
+  - `est_done` / `oracle_done` / `step_error`; `oracle_complete`.
+  - `signals`: each fired signal judged against the truth. S1 is right if the oracle also contradicts the
+    expectation. S4 is right if a flagged predicate really was wrong, or a count was unconfirmed. S5b is right if
+    the oracle says complete. S2 is right if the oracle made no progress either.
+  - `finish_check`: an S5a rejection, right if the oracle was not complete.
+  - The initial entry adds `goal_match` (parsed goal == BDDL goal under the turn-0 mapping) and `oracle_goal`.
+  - `memory_state.shadow_totals` accumulates all of the above per trial, including
+    `s5_suppressed_while_complete`.
+
+**Calibration (measured on LIBERO-Mem task 6, CPU):** `robot_cartesian_pos` is 0.108 m behind the fingertip centre
+along the approach axis. The estimator uses the fingertip point (`perception.TCP_OFFSET`). Closing on nothing reads
+about 0.015. A rim grasp on the bowl reads 0.11 after the close and about 0.044 once lifted, so `grasp_threshold` is
+0.025. Among objects within `grasp_radius` of the fingertips, the highest is taken as grasped: a rim grasp is about
+as close to the plate under the bowl as to the bowl. The held object's offset from the fingertips is measured at
+the grasp.
+
+### Known limitations
+
+- **Perception errors.** A missed detection keeps the old position (`mem`). After `stale_turns` it becomes S4 and
+  blocks S5. A false detection of a tracked category is re-matched to a leftover track within `rematch_dist`
+  first, so it can pull a track away from an occluded object. Only the agentview camera is used, so objects
+  under or behind the arm are often missed while it is over them.
+- **Identity swaps.** Identity rests on hook predictions and distance. Two same-shape objects moved without hooked
+  calls (or a grasp attributed to the wrong object) can swap names, and nothing corrects it later. The shadow
+  counts these (`identity_swap_events`). The grasped object is assumed to be the highest tracked object near the
+  fingertips.
+- **Categories** come from a fixed vocabulary. Region targets such as "the center of the table" never hold, so S5
+  stays suppressed for task 8 / 9 style goals.
+- **Repeats need hooks.** A pick-and-place-back that does not go through the hooked API calls is invisible: the end
+  state does not change. A hook count without end-of-turn evidence stays pending, which blocks S5.
+- **CPU check only:** the SAM3 path (`Sam3PerceptionSource`) is wired to cap-x's SAM3 client but has not run
+  against a real SAM3 server here (no GPU). Its depth lifting is unit-tested on synthetic data.
+
+### Fake perception (tests and CPU only)
+
+`SimPerceptionSource` turns simulator poses into category-only detections, with Gaussian noise (1 cm), 10 % misses
+and 50 % misses under the gripper. It prints a `perception=sim_fake` banner when created. The estimator records its perception source name in
+`state()` and in every turn log (`perception`). It exists for tests and CPU
+checks without SAM3 and must never be used for an evaluation run.
 
 ## Privileged information
 

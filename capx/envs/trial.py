@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image
 
 from capx.belief.memory import DEFAULT_MAX_CHARS, make_memory
-from capx.belief.signals import ALL_SIGNALS
+from capx.belief.signals import ALL_SIGNALS, EST_SIGNALS
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 
@@ -758,8 +758,6 @@ def _run_single_trial(
             partial_artifacts["deadline"] = time.monotonic() + budget
     obs["full_prompt"] = copy.deepcopy(obs["full_prompt"])
     _patch_libero_goal(env, obs)
-    # Memory condition (memory_mode); none adds nothing to any prompt.
-    memory = _make_trial_memory(config, env)
 
     if config["record_video"] and hasattr(env, "enable_video_capture"):
         env.enable_video_capture(True, clear=True, wrist_camera=use_wrist)
@@ -801,6 +799,9 @@ def _run_single_trial(
         assert visual_differencing_args.model in VLM_MODELS, (
             "Image/video differencing model must be in the list of VLM models"
         )
+
+    # Memory condition (memory_mode); none adds nothing to any prompt.
+    memory = _make_trial_memory(config, env, args, visual_differencing_args)
 
     # --- 2. Capture initial visual feedback ---
     visual_feedback_imgs, visual_feedback_base64_history, task_description = (
@@ -883,6 +884,7 @@ def _run_single_trial(
         "memory_mode": memory.mode,
         "memory_initial_text": initial_memory_text,
         "memory_state": memory.state(),
+        **_memory_est_log(memory),
     })
 
     with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
@@ -1146,20 +1148,68 @@ def _run_single_trial(
     )
 
 
-def _make_trial_memory(config: dict[str, Any], env: CodeExecutionEnvBase) -> Any:
+def _make_trial_memory(
+    config: dict[str, Any],
+    env: CodeExecutionEnvBase,
+    args: Any = None,
+    visual_differencing_args: ModelQueryArgs | None = None,
+) -> Any:
     """Memory for this trial (capx.belief.memory), reset on the freshly reset low-level env.
 
     bg_oracle reads simulator ground truth through ``env.low_level_env``; that reference stays in
     the harness and is never put into the generated-code sandbox.
+
+    bg_est gets the robot observation from the low-level env, record-only hooks on the sandbox API
+    functions (``env.api_call_wrapper``), the task language, the coding model for goal parsing and the
+    VDM for verification. Its oracle shadow (simulator truth) only goes to the logs.
     """
+    mode = config.get("memory_mode", "none")
+    if hasattr(env, "api_call_wrapper"):
+        env.api_call_wrapper = None  # envs are reused across trials: only bg_est installs a hook
+    if mode == "bg_est":
+        signals = config.get("memory_signals", EST_SIGNALS)
+    else:
+        signals = config.get("memory_signals", ALL_SIGNALS)
     memory = make_memory(
-        config.get("memory_mode", "none"),
+        mode,
         max_chars=config.get("memory_max_chars", DEFAULT_MAX_CHARS),
-        signals=config.get("memory_signals", ALL_SIGNALS),
+        signals=signals,
         max_finish_rejections=config.get("memory_max_finish_rejections", 1),
+        goal_source=config.get("memory_est_goal_source", "llm"),
+        max_categories=config.get("memory_est_max_categories", 5),
+        gate_dist=config.get("memory_est_gate_dist", 0.10),
+        verify=config.get("memory_est_verify", True),
+        perception=config.get("memory_est_perception", "sam3"),
+        shadow=config.get("memory_est_shadow", True),
     )
-    memory.reset(env.low_level_env)
+    if mode != "bg_est":
+        memory.reset(env.low_level_env)
+        return memory
+
+    goal_args: Any = args
+    if config.get("memory_est_goal_model"):
+        goal_args = ModelQueryArgs(
+            model=config["memory_est_goal_model"],
+            server_url=config.get("memory_est_goal_server_url") or args.server_url,
+            api_key=args.api_key, max_tokens=args.max_tokens, temperature=args.temperature,
+            reasoning_effort=args.reasoning_effort, debug=args.debug,
+        )
+    handle = getattr(env.low_level_env, "handle", None)
+    memory.reset(
+        env.low_level_env,
+        code_env=env,
+        instruction=getattr(handle, "task_language", None) or "",
+        goal_query_fn=(lambda prompt: _query_model(goal_args, prompt)) if goal_args is not None else None,
+        vdm_query_fn=(lambda prompt: _query_model(visual_differencing_args, prompt))
+        if visual_differencing_args is not None and visual_differencing_args.model else None,
+    )
     return memory
+
+
+def _memory_est_log(memory: Any) -> dict[str, Any]:
+    """bg_est: estimator details and the oracle shadow (logs only; never in a prompt)."""
+    turn_log = getattr(memory, "turn_log", None)
+    return {"memory_est": turn_log()} if turn_log is not None else {}
 
 
 def _memory_log(memory: Any, mem_turn: Any) -> dict[str, Any]:
@@ -1170,6 +1220,7 @@ def _memory_log(memory: Any, mem_turn: Any) -> dict[str, Any]:
         "memory_signals": mem_turn.signal_dicts() if mem_turn is not None else [],
         "memory_state": memory.state(),
         "s5_rejected": False,
+        **_memory_est_log(memory),
     }
 
 

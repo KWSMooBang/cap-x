@@ -114,6 +114,10 @@ class BeliefGraph:
         """Edge predicted from an executed action but not yet observed, P=0.7 (or 0.3)."""
         return self._set(key, P_EXPECTED if holds else 1.0 - P_EXPECTED, "expected", turn)
 
+    def set_edge(self, key: EdgeKey, p: float, source: str, turn: int | None) -> Edge:
+        """Edge with an explicit belief (estimated graphs: geometry-scaled P, VDM verdicts)."""
+        return self._set(key, p, source, turn)
+
     def _set(self, key: EdgeKey, p: float, source: str, turn: int | None) -> Edge:
         edge = self.edges.get(key)
         if edge is None:
