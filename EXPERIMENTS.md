@@ -1,5 +1,16 @@
 # cap-bg EXPERIMENTS
 
+## 20261101_bgest2_rim_smoke (2026-11-01) — 원시 Observe 기준 근소 미달, 융합 후 기준 통과 → 10×5 진행
+- 실행: kubectl baccus_cap-bg, bg d471268 (기하 거부권 + 미검출 표식 생략 + 'on = resting flat'), 21:50–22:04 UTC, task_06 × 2 (둘 다 과제 실패).
+- 결과 (baccus 보고 원문): 크래시 0 · 파싱 실패 0 · belief_trace 2/2 · 검출 5/5 · goal_match(·normalized) 2/2 · 진짜 누출 0
+  (검사에서 걸린 'plate_2' 는 VDM Notes 가 표식 번호를 그렇게 부른 것) · S5b 오발동 0 (앞 smoke 2·1).
+  on 진술 원시 Observe 정확도 47/53 = 88.7% (tr1 100%, tr2 진실1 3/8·진실0 16/17). tr2 오답 5건은 같은 테두리 장면(bowl_A 가 plate_C 테두리, d_xy 7.2 > r 5.2, dz 3.0) 반복 —
+  'on = resting flat' 문장에도 VDM 은 매번 1. 거부권 5/5 작동 → 목표 술어 20/20, S5b 0. 진행 오차 tr1 0 · tr2 5.
+  veto [발동, 정답] tr1 [1,0] · tr2 [8,5]. S4 [발동, 정답] tr1 [5,0] (전부 오발동) · tr2 [5,5]. marks_hidden 의도대로 작동. 이름 뒤바뀜 0.
+- 판단: 원시 기준(≥90%)은 근소 미달이지만 상관된 반복 오답이고 거부권이 belief·S5b 를 지킴 → 기준의 목적 충족으로 보고 10×5 진행.
+  10×5 에서 볼 것: 원시 vs 융합 후 정확도, S4 오발동 반복 여부(tr1 5/5), 거부권 정답률, 진행 오차.
+- 백로그: VDM Notes 의 표식 번호('plate_2')를 별칭으로 바꿔 다음 프롬프트에 넘기기.
+
 ## 20261101_bgest2_vocab_smoke (2026-11-01) — 통과, 단 t06 Observe 회귀 → 10×5 중단·진단
 - 실행: kubectl baccus_cap-bg, bg d16ede4 (SAM3 프롬프트 후보 + 재검출), 20:41–21:24 UTC, t06·t08·t09 × 2, 6 trial 모두 과제 실패.
 - 결과 (baccus 보고 원문): 크래시 0 · 누출 0 · Observe 파싱 실패 0 · belief_trace 6/6.
