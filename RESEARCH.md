@@ -60,6 +60,9 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     memory_mode=bg_est. 신호 S1·S2·S4·S5 (불확실하면 S5 억제). 평가 로그에 oracle 그림자 비교(정확도·진행 오차·이름 뒤바뀜). Phase A 모듈 → Phase B 통합.
 2c. [예정] 비교 파일럿 종료 후 kubectl: bg_est 실제 SAM3 smoke (몇 trial, 지각 정확도·이름 뒤바뀜·추가 호출 확인) → 이상 없으면
     bg_est 10×5 (같은 seed 로 none_v2·bg_oracle 과 짝 비교). 자원 제한 3/4, GPU 1개 비움 유지.
+1m. VDM 호출의 usage(토큰)도 all_responses 에 기록 (지금은 coding 모델만).
+2d. [예정] bg_oracle ablation: 좌표 제거(관계만) / 목표를 LLM 파싱으로 / 신호 끄기 — 메모리 조건 파일럿에서 bg_oracle 효과가
+    단순 과제(t0·t1·t3)·지시 모호 과제(t7)에 몰려 정답 지각·정답 목표 효과와 기억 구조 효과를 분리해야 함.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
