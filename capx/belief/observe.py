@@ -16,6 +16,7 @@ v1 way).
 
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -209,5 +210,11 @@ class VdmObserver:
         except Exception as exc:  # server error: geometry only
             res.error = f"query failed: {exc}"
             return res
-        res.parse = parse_observe(res.reply, statements, names)
+        try:
+            if not isinstance(res.reply, str):  # e.g. a list of content parts or a number
+                res.reply = json.dumps(res.reply) if isinstance(res.reply, (list, dict)) else str(res.reply)
+            res.parse = parse_observe(res.reply, statements, names)
+        except Exception as exc:  # an odd reply never ends the trial: parse failure -> geometry only
+            res.parse = ObserveParse(error=f"parse failed: {type(exc).__name__}: {exc}")
+            res.error = res.parse.error
         return res

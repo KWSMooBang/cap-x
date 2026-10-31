@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -106,6 +107,7 @@ class BgEst2Memory:
         self.turn = 0
         self.over_budget = False
         self.trace_path: str | None = None
+        self.trace_error: str | None = None  # first belief_trace I/O error (the trace is then off)
         self._log: dict[str, Any] = {}
         self._last_signals: list[Signal] = []
 
@@ -154,9 +156,13 @@ class BgEst2Memory:
         self.detectors = est2_detectors(self.enabled_signals)
         self.gate = FinishGate(self.max_finish_rejections if "S5" in self.enabled_signals else 0)
         self.trace_path = trace_path
+        self.trace_error = None
         if trace_path:
-            os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
-            open(trace_path, "w").close()
+            try:
+                os.makedirs(os.path.dirname(trace_path) or ".", exist_ok=True)
+                open(trace_path, "w").close()
+            except Exception as exc:  # the trace is a log: never let it end the trial
+                self._trace_failed(exc)
         first = self.estimator.start(low.get_observation(), instruction or "", goal_fn)
         self.last = first
         self.s2_baseline = first.progress
@@ -231,7 +237,7 @@ class BgEst2Memory:
         out = self.estimator.state()
         out.update(perception=self.perception_label, over_budget=self.over_budget,
                    uncertain=len(self.last.uncertain), suppress_completion=self.last.suppress_completion,
-                   calls=self.calls())
+                   calls=self.calls(), trace_error=self.trace_error)
         if self.shadow is not None:
             out["shadow_totals"] = self.shadow.totals
         return out
@@ -248,9 +254,23 @@ class BgEst2Memory:
         """Estimator details, the CoT record and the oracle shadow (logs only, never the prompt)."""
         return self._log
 
+    def _trace_failed(self, exc: BaseException) -> None:
+        """Stop writing the trace after the first error (one warning; ``state()['trace_error']``)."""
+        if self.trace_error is None:
+            print(f"[bg_est2] WARNING: belief_trace.jsonl disabled for this trial: {type(exc).__name__}: {exc}",
+                  file=sys.stderr)
+        self.trace_error = f"{type(exc).__name__}: {exc}"
+        self.trace_path = None
+
     def _write_trace(self, kind: str, extra: dict[str, Any] | None = None) -> None:
         if not self.trace_path or self.estimator is None:
             return
+        try:
+            self._append_trace(kind, extra)
+        except Exception as exc:  # disk full, permissions, an unserializable value ...
+            self._trace_failed(exc)
+
+    def _append_trace(self, kind: str, extra: dict[str, Any] | None = None) -> None:
         rec = self.estimator.trace(kind)
         rec["signals"] = [s.to_dict() for s in self._last_signals] if kind != "start" else []
         rec["perception"] = self.perception_label
