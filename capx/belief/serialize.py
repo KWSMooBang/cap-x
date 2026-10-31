@@ -9,8 +9,8 @@ Format:
 
 When the text is longer than ``max_chars``, the oldest events are dropped first (replaced by a
 "(k earlier omitted)" marker), then the objects line is shortened, then the objects and events
-lines are left out. The title, Progress and Signals lines are never cut; if they alone exceed
-``max_chars`` the text is returned over budget.
+lines are left out. The title, Progress and Signals lines (and any ``fixed_lines``) are never
+cut; if they alone exceed ``max_chars`` the text is returned over budget.
 """
 
 from __future__ import annotations
@@ -59,17 +59,29 @@ def serialize(
     max_chars: int = 3000,
     subjects: Sequence[str] | None = None,
     current_truths: dict[Pred, bool] | None = None,
+    title: str | None = None,
+    progress_text: str | None = None,
+    objects_text: str | None = None,
+    objects_prefix: str = OBJECTS_PREFIX,
+    fixed_lines: Sequence[str] = (),
 ) -> str:
-    title = f"Belief graph (turn {turn}):"
-    prog = progress_line(progress, current_truths) if progress is not None else None
-    objects = objects_line(graph, subjects)
+    """Prompt text for ``graph``. The keyword overrides serve the estimated graph (``bg_est``): its
+    own title, progress and objects texts, and ``fixed_lines`` (e.g. Violations) that go before the
+    Signals line and, like it, are never cut. Without them the output is the oracle format."""
+    title = title if title is not None else f"Belief graph (turn {turn}):"
+    if progress_text is not None:
+        prog = progress_text
+    else:
+        prog = progress_line(progress, current_truths) if progress is not None else None
+    objects = objects_text if objects_text is not None else objects_line(graph, subjects)
     sig = signals_line(signals)
+    tail = list(fixed_lines) + [sig]
 
     def compose(objects_text: str | None, events: list[Event], omitted: int) -> str:
         lines = [title] + ([prog] if prog else [])
         if objects_text is not None:
             lines += [objects_text, events_line(events, omitted)]
-        return "\n".join(lines + [sig])
+        return "\n".join(lines + tail)
 
     # 1. Drop the oldest events.
     events = list(graph.events)
@@ -82,7 +94,7 @@ def serialize(
     # 2. Shorten the objects line.
     if len(text) > max_chars:
         budget = len(objects) - (len(text) - max_chars) - len(TRUNCATION_MARK)
-        objects = objects[: max(budget, len(OBJECTS_PREFIX))] + TRUNCATION_MARK
+        objects = objects[: max(budget, len(objects_prefix))] + TRUNCATION_MARK
         text = compose(objects, events, omitted)
     # 3. Drop objects and events entirely. Title, progress and signals are never cut, even if
     #    they alone exceed max_chars.

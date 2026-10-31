@@ -126,8 +126,12 @@ class Progress:
         return len(self.done), len(steps)
 
 
-def progress_line(progress: Progress, current_truths: dict[Pred, bool] | None = None) -> str:
-    """One-line progress summary for the prompt."""
+def progress_line(
+    progress: Progress,
+    current_truths: dict[Pred, bool] | None = None,
+    complete_text: str = "all steps verified complete",
+) -> str:
+    """One-line progress summary for the prompt (``complete_text`` is added when no step remains)."""
     if not progress.known:
         done_text = "; ".join(format_step(s) for s in progress.done)
         return (
@@ -156,5 +160,5 @@ def progress_line(progress: Progress, current_truths: dict[Pred, bool] | None = 
         parts.append("next: " + (texts[0] if len(texts) == 1 else "one of " + " OR ".join(texts)))
     parts.append(f"remaining: {rem}")
     if rem == 0 and not progress.overshot:
-        parts.append("all steps verified complete")
+        parts.append(complete_text)
     return " | ".join(parts)
