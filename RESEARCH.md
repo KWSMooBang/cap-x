@@ -58,16 +58,17 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 1l. FINISH 턴의 판단 프롬프트도 저장 (save_multiturn_prompts 가 regenerate 턴만 저장).
 2b. [완료·bg 병합 63c7487] bg-est (L2 exp_cap-bg_bg-est, 2026-10-31 사람 요청): 정답 없이 API hook + SAM3 지각 + 검증형 VDM + LLM 목표 파싱으로 그래프 추정,
     memory_mode=bg_est. 신호 S1·S2·S4·S5 (불확실하면 S5 억제). 평가 로그에 oracle 그림자 비교(정확도·진행 오차·이름 뒤바뀜). Phase A 모듈 → Phase B 통합.
-2c. [예정] 비교 파일럿 종료 후 kubectl: bg_est 실제 SAM3 smoke (몇 trial, 지각 정확도·이름 뒤바뀜·추가 호출 확인) → 이상 없으면
+2c. [취소 2026-11-01] v1 10×5 는 돌리지 않음 (smoke 는 완료: 검출 4/4·누출 0·goal_match t06 0/2). 원래 계획: bg_est 실제 SAM3 smoke (몇 trial, 지각 정확도·이름 뒤바뀜·추가 호출 확인) → 이상 없으면
     bg_est 10×5 (같은 seed 로 none_v2·bg_oracle 과 짝 비교). 자원 제한 3/4, GPU 1개 비움 유지.
 1m. VDM 호출의 usage(토큰)도 all_responses 에 기록 (지금은 coding 모델만).
 2d. [예정] bg_oracle ablation: 좌표 제거(관계만) / 목표를 LLM 파싱으로 / 신호 끄기 — 메모리 조건 파일럿에서 bg_oracle 효과가
     단순 과제(t0·t1·t3)·지시 모호 과제(t7)에 몰려 정답 지각·정답 목표 효과와 기억 구조 효과를 분리해야 함.
-2e. [제안] bg_est v2 (설계: 아티팩트 XzQETnjANdUKkPtccTV8bS 「추정 BG v2 설계」 탭, 2026-11-01 갱신): B1K CoT 형식(Subtask·Effect·Observe·Belief·Delta),
+2e. [진행] bg_est v2 (L2 exp_cap-bg_bg-est2, memory_mode=bg_est2) (설계: 아티팩트 XzQETnjANdUKkPtccTV8bS 「추정 BG v2 설계」 탭, 2026-11-01 갱신): B1K CoT 형식(Subtask·Effect·Observe·Belief·Delta),
     VDM 이 표식(Set-of-Mark) 이미지를 보고 Observe 줄(1/0/?) 출력, code agent 가 # Subtask / # Effect 선언, 단계는 새로 참이 되는 predicate 만.
     선행: VDM Observe 오프라인 정확도 평가. 이전 v2 안: 하위 작업 층(pick/place/put_in/place_region 연산자,
     handempty·near·above·lifted predicate, 하위 작업 단위 S1·S2, 새 S3), belief_trace.jsonl 구조화 저장, 목표 파싱을 시점 명시 공간 서술로,
     보임 모델(시야·팔 가림), 교란 ×0.8. 근거: bg_oracle S2 다음 턴 진전 20/121(17%), 실패의 2/3 가 조작 실패, B1K 설계와의 차이.
+2f. [예정] v2 병합 후 kubectl: eval_observe(VDM Observe 오프라인 정확도) → bg_est2 smoke → bg_est2 10×5 (같은 seed 로 none_v2·bg_oracle 과 짝 비교).
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
