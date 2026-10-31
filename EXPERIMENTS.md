@@ -1,5 +1,14 @@
 # cap-bg EXPERIMENTS
 
+## sam3_prompt_probe (2026-11-01) — keep: SAM3 범주 프롬프트 선택
+- 실행: kubectl baccus_cap-bg, GPU pod 1개, agentview RGB 800×512, LIBERO-Mem task 0–9 × trial 1·2 = 20장, 정답 = problem.objects_dict, 판정 = Sam3PerceptionSource 규칙(점수 ≥0.4, IoU >0.5 중복 제거).
+- 결과 (baccus 보고 원문, '정답 개수와 정확히 맞은 장면 / 범주가 있는 장면', 평균 점수):
+  cream cheese: "small blue box" 4/4 0.86 · "blue box" 4/4 0.73 · "blue package" 3/4 · "cream cheese"·"cream cheese box"(v1)·"white box"·"carton" 0/4 (렌더가 작은 파란 상자). 없는 장면 오검출 0.
+  plate: "saucer" 16/16 0.84 · "plate"(v1) 15/16 0.65 (t07 접시가 모두 덮인 장면 0개). bowl: "bowl" 16/16 0.91 · "black bowl"(v1) 14/16 (t07 과검출).
+  bottle: "bottle" 12/12 0.96 · "wine bottle" 12/12 0.94. basket: "basket" 4/4 0.81 · "wicker basket" 3/4.
+- 판단: bg_est2 범주별 프롬프트 목록을 실측 1순위로 (L2 exp/bg-est2-vocab). 한계: 같은 장면 안 다른 물체를 잡았는지(위치 대조)는 미확인, "saucer" 의 접시 없는 장면 오검출 미확인.
+- 산출물(kubectl PVC): outputs/sam3_prompt_probe/{table.md,results.json,round2/,frames/}
+
 ## 20261101_bgest2_smoke (2026-11-01) — 미통과 (task_08 cream cheese 검출 실패), 그 외 통과
 - 실행: kubectl baccus_cap-bg, bg d72231a, 18:55–19:36 UTC. task_06·task_02·task_08 × 2, memory_mode=bg_est2, 실제 SAM3. 6 trial 모두 과제 실패.
 - 기준 (baccus 보고 원문): 크래시 0 ✓ · turn 0 검출 수 t06 2/2 ✓, t02 2/2 ✓, t08 0/2 ✗ (cream cheese 를 "cream cheese box" 로 한 번도 못 찾음) ·
