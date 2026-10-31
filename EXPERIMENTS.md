@@ -9,6 +9,11 @@
   목표 술어 17/24·14/16, 진행 오차 7·6, S5b 오발동 2·1.
 - 판단: 기준상 통과였지만 t06 회귀(접시 프롬프트 변경 의심)가 S5b 오발동으로 이어져, 21:27 UTC 에 시작한 20261101_mem10x5_bgest2 를 바로 중단하고
   표식 위치 진단 → 필요 시 plate 1순위 복귀 → t06 smoke → 10×5 재시작.
+- 진단 (baccus, 기존 산출물): 실제로 시작된 10×5 task 는 0 (pod 준비 중 중단). 원인은 프롬프트·표식 위치가 아님 — turn 0 표식 픽셀은 두 run 동일.
+  on 오답 10/40 중 9개가 VDM 1·정답 0 이고 모두 그릇이 접시 테두리에 걸쳐 기운 상태(d_xy 6.4–7.3 cm > r 5.4–6.3, dz 3.0–3.6 cm > 평평 1.8):
+  VDM 0.9 가 기하를 덮어써 단계 확정·S5b 오발동. 추가로 팔에 가려 미검출된 plate_C 의 표식이 팔 위에 그려져 VDM 이 "gripper holding plate_C" 로 답함.
+  → 수정 L2 exp/bg-est2-rim: 기하 거부권(d_xy > r 또는 dz 초과 시 VDM 1 거부, P 0.5·S4), 미검출 트랙 표식 생략, M2/M5 에 "on = resting flat" 문장.
+  진단 이미지: kubectl outputs/diag_t06_saucer/, 스크립트 /workspace/cap-bg/t06_*.py
 
 ## sam3_prompt_probe (2026-11-01) — keep: SAM3 범주 프롬프트 선택
 - 실행: kubectl baccus_cap-bg, GPU pod 1개, agentview RGB 800×512, LIBERO-Mem task 0–9 × trial 1·2 = 20장, 정답 = problem.objects_dict, 판정 = Sam3PerceptionSource 규칙(점수 ≥0.4, IoU >0.5 중복 제거).
