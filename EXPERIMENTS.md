@@ -1,5 +1,20 @@
 # cap-bg EXPERIMENTS
 
+## eval_observe (2026-11-01) — keep: VDM Observe 오프라인 정확도
+- 실행: kubectl baccus_cap-bg, CPU OSMesa, 코드 exp/bg-est2 fa342b4 (scripts/eval_observe.py). LIBERO-Mem t2·6·7·8·9 × 8 = 장면 40, 진술 440.
+  조건: init 10, arm 10, normal 6, tilted 3, table 5, in_basket 4, basket_center 2 (생성 보고 기준).
+- 결과 (baccus 보고 원문):
+  | VDM | 정확도(답한 진술) | ? 비율 | 1→0 오답 | 0→1 오답 | 비용 |
+  | Qwen/Qwen3.8-27B | 0.968 (425/439) | 1/440 | 6/141 (4.3%) | 8/298 (2.7%) | 0.37달러 |
+  | moonshotai/Kimi-K3 | 0.960 (413/430), 읽기 실패 응답 1 | 0 | 6.5% | 2.7% | 4.35달러 |
+  Qwen 조건별: init 1.00 · arm 1.00 · table 0.98 · in_basket 0.97 · normal 0.95 · tilted 0.92 · basket_center 0.72 (13/18).
+  predicate별(Qwen): on(진실0) 0.98 · on(진실1) 0.96 · in 0.93/1.00 · at(center) 진실1 0.50 (2개) · inhand 0.97 · handempty 0.97.
+  오답 사례: 기운 그릇을 '쥐고 있음'으로 봄(t02 tilted), 표식 위치 때문에 plate_B/C 를 바꿔 읽음(t06 normal, Notes 에 스스로 언급),
+  테이블 위 그릇을 접시 위로 봄(t07 table), basket_center 의 at·in 약함.
+- 판단: keep. Qwen3.8-27B 를 bg_est2 VDM 으로 유지 (정확도 같고 비용 약 1/12). 10×5 진행 조건(≥80%) 통과.
+  한계: arm 장면이 실제로는 물체를 거의 가리지 않아 '가리면 ? 를 쓰는지'는 미확인. 영역 목표(center) 판정이 약함. 표식 위치 오류가 오답 원인.
+- 산출물(kubectl PVC): outputs/eval_observe/{scenes,qwen3.8,kimi-k3}/{table.md,score.json,results.jsonl}
+
 ## 20261030_mem10x5_{none_v2,vdmhist,bgoracle} (2026-10-30 ~ 10-31) — keep (첫 메모리 조건 비교), 해석은 제한적
 - 실행: kubectl baccus_cap-bg, 큐 13:33 UTC(10/30) – 11:50 UTC(10/31), 인프라 재실행 12:10. 코드 bg 11008c5.
   pod 1–2개(worker 1–2)로 운영: pod kill 1회(15:37), 사람 작업(ferrari-vla)에 GPU 양보 1회, OOM 1회(00:23, 3.8h 미감지) → 중단 trial 은 resume·재실행.
