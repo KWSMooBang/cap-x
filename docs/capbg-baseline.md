@@ -453,7 +453,7 @@ verbatim, `capx/belief/prompts_v2.py`). `bg_est` is unchanged and can still be r
 
 | Module | Role |
 | --- | --- |
-| `som.py` | Marks: letters A, B, … for objects, numbers 1, 2, … for supports (plates, baskets), fixed per trial and in alias order (aliases go from the image left = robot base −y). Drawn at each track's projected center. A track not detected in this image gets no mark. |
+| `som.py` | Marks: letters A, B, … for objects, numbers 1, 2, … for supports (plates, baskets), fixed per trial and in alias order (aliases go from the image left = robot base −y). Drawn at each track's projected center. A track not detected in this image gets no mark (turn-end image 2: only the tracks SAM3 detected this turn; 'Marks now' lists the rest as `not detected`), and no mark except the held object's is drawn within `gripper_mark_radii` (2.5) mark radii of the fingertip's pixel (`under the gripper, not marked`). |
 | `observe.py` | Statement format `(on bowl_A plate_B)`, `(in cream_cheese_A basket_A)`, `(at basket_A center)`, `(inhand bowl_B)`, `(handempty)`. Lenient parser of the `Observe:` line (order, spaces, case, `true/false`), `Notes:` line, Notes flags (tilted / fallen / wrong mark). |
 | `prompts_v2.py` | M2 (initial Observe), M3 (goal), M4 (declaration rules), M5 (turn Observe). |
 | `declare.py` | Parses `# Subtask: op(args)` / `# Effect: (pred) a>b \| ...` from the first two lines of the block; checks them against the API calls. |
@@ -492,15 +492,27 @@ verbatim, `capx/belief/prompts_v2.py`). `bg_est` is unchanged and can still be r
   inference (`declared: false`). A declaration the calls contradict (place declared, the gripper opened above
   another tracked support; pick declared, another object grasped) is dropped and shown as `IGNORED`. A valid
   declaration also names the grasped object when several are within reach (a basket with the cheese inside).
-- **M5**: images before / now (marks only for objects detected now), the declaration, and at most
+- **M2 / M5 "on" rule** (bg_est2 only, before the statements): `"on" means resting flat on top; an object leaning on
+  the rim or tilted against it is 0, and say so in Notes.`
+- **M5**: images before / now (marks only for objects SAM3 detected now, none on the arm near the fingertip
+  except the held object's; `Marks now: ... | B, 2: not detected | 3: under the gripper, not marked`;
+  statements about those objects stay, so the VDM can answer `?`), the declaration, and at most
   `memory_est_observe_max_statements` (10) statements: declared Effects, the declared / moved objects'
   relations (target, previous support, table), goal-relevant predicates, unconfirmed counted steps, then where
   the goal objects are believed to be. Plates are never asked about.
 - **Fusion** per key: robot state (inhand, handempty, above(gripper, t), lifted, P 0.97, source `robot`) >
   Observe 1 / 0 (P 0.9 / 0.1, `vdm`) > geometry (only when Observe failed, or for a key with no belief yet)
   > expectation > memory. `?` keeps the memory. A relation set true lowers the object's other on / in / inhand
-  relations not observed now (regions overlap supports and are left alone). Observe on / in = 1 for objects
-  more than 2 support radii apart → P 0.5 + S4. Notes saying an object is tilted / fallen → its observed
+  relations not observed now (regions overlap supports and are left alone).
+  **Geometric veto** (replaces the 2-radii anomaly rule): Observe on / in = 1 with both objects detected now is
+  not accepted when the geometry shows the object is not resting flat — center distance d_xy > support radius r
+  + 0.5 cm (`veto_xy_margin`), or center height difference dz > the pair's flat dz + 1.0 cm (`veto_dz_margin`;
+  `flat_dz` = `{"bowl/plate": 0.018}`, other pairs: the dz of their first accepted Observe 1, no dz check before).
+  The key gets P 0.5, source `conflict`, a `vetoes` record and S4 `<obj> may be resting on the rim of <support>
+  (tilted), not on it` (d_xy beyond 2 radii: `a mark may be on the wrong object`); the step / place stays pending
+  and S5b is suppressed. It stays `conflict` until the key is observed again (or lowered by another location).
+  Set from task_06 of the vocab smoke: the 9 wrong 'VDM 1, truth 0' had d_xy 6.4–7.3 cm vs r 5.4–6.3 cm and
+  dz 3.0–3.6 cm (flat ≈ 1.8 cm). Observe 0 against geometry On: Observe wins, as before. Notes saying an object is tilted / fallen → its observed
   "on a support" relations P 0.5; "wrong mark" → all its observed relations P 0.5; S4 quotes the note. A reply
   with no readable statement → geometry only (the `bg_est` way), `Observe (tN): failed` in the block.
 - **Steps** are counted from hook snapshots as in `bg_est`; a count is confirmed only by an observation (Observe
@@ -513,7 +525,7 @@ verbatim, `capx/belief/prompts_v2.py`). `bg_est` is unchanged and can still be r
   whole task"), declared Effect contradicted, grasp missed / object dropped, count withdrawn. S2: remaining
   steps unchanged **and** no subtask done / pending this turn. S3: the next planned subtask's precondition is
   confidently false (in practice: the gripper holds another object). S4: a goal-relevant key `?` two turns in a
-  row, a geometric anomaly, a Notes flag, a count unconfirmed for 2 turns. S5b (oracle wording) and S5a are
+  row, a geometric veto, a Notes flag, a count unconfirmed for 2 turns. S5b (oracle wording) and S5a are
   suppressed while any count is pending or anything is uncertain.
 - **Event frames** (`memory_est_event_frames`, default off; needs recorded frames): the recorded frame right after
   each gripper close / open gets an extra Observe on that object (at most 4 per turn); its answers fill turn-end
@@ -546,17 +558,20 @@ shortened; title, Subtask, Effect, Delta, Subtasks and Signals are never cut.
   `memory_est.est.prompts` (category → SAM3 prompt in use), `memory_est.est.redetects` (this turn's
   re-detections: turn, category, prompt, previous, detections, reason `turn0_none` / `none_2_turns` /
   `goal_unknown_object`) and, at turn 0, `memory_est.est.goal_retry` (unknown names, categories, new tracks,
-  retried, parsed).
+  retried, parsed); `memory_est.est.vetoes` (this turn's vetoes: key, pred, observe, d_xy, r, dz, flat_dz +
+  source, xy_limit, dz_limit, why [`d_xy` / `dz`], kind [`rim` / `apart`]) and `memory_est.est.marks_hidden`
+  (`not_detected` / `near_gripper` aliases of image 2).
 - `<trial_dir>/belief_trace.jsonl`: one line at the start, per turn end and per event-frame Observe: `nodes`
-  (category, mark, pos, size, last_seen, pixel, flag), `robot` (eef, gripper, handempty, above, holding,
-  lifted), `keys` (per relation: P, source, obs, observe answer, last_seen_turn, geom {dz, d_xy, r}, `shadow` =
-  simulator truth), `goal` (+ region centers), `steps` (status, by, turn), `subtasks`, `plan`, `declaration`,
+  (category, mark, pos, size, last_seen, pixel, seen_now, marked_now, flag), `robot` (eef, gripper, handempty, above, holding,
+  lifted), `keys` (per relation: P, source, obs, observe answer, last_seen_turn, geom {dz, d_xy, r}, `veto` record or null, `shadow` =
+  simulator truth), `vetoes` (keys still vetoed), `goal` (+ region centers), `steps` (status, by, turn), `subtasks`, `plan`, `declaration`,
   `observe` (statements, reply, parsed, prompt text), `cot`, `prompts` (SAM3 prompt in use per category),
   `redetects` (every re-detection of the trial so far), `signals`, `est`, `shadow`. Written to
   `<output_dir>/belief_trace_trial_NN.jsonl` while the trial runs and copied into the trial directory.
 - Shadow totals (`memory_state.shadow_totals`): `bg_est`'s plus `observe` (per predicate: answers 1 / 0 with
   [n, right], `?`, missing), `observe_fail`, `declared` / `declared_valid` / `declared_dropped` /
-  `turns_with_code`, `effects_applied` / `effects_right`, `subtasks_judged` / `subtasks_right`, `S3`; start log
+  `turns_with_code`, `effects_applied` / `effects_right`, `subtasks_judged` / `subtasks_right`, `S3`, `veto` ([vetoes with a known truth, right = the relation is
+  false]) / `veto_no_truth` (per turn: `shadow.vetoes`); start log
   `goal_match_normalized` (both goals reduced to newly true predicates per step).
 
 ### Running `bg_est2`
@@ -596,13 +611,15 @@ simulator truth (`?` for objects the fake detector missed). Not an evaluation: i
 ### Known limitations (v2)
 
 - The VDM is the main observer of relations; its accuracy on marked LIBERO images is not yet measured
-  (`eval_observe` first). A wrong but confident Observe 1 / 0 overrides geometry; only the 2-radii anomaly rule
-  and Notes catch it.
+  (`eval_observe` first). A wrong but confident Observe 1 / 0 overrides geometry; only the geometric veto (Observe 1
+  vs not-flat geometry) and Notes catch it. The veto needs both objects detected now and trusts SAM3 centers;
+  flat dz is known only for bowl/plate.
 - Region centers are an estimate (the camera axis on the table), not the BDDL region; at(o, center) is judged by
   the VDM or by distance to that point.
 - Declarations are trusted when the API calls do not contradict them; a code agent that declares a target and
   drives elsewhere above no tracked support is not caught until Observe.
-- Marks sit at estimated centers; a stale track (not detected) gets no mark, so the VDM must answer `?`.
+- Marks sit at estimated centers; a stale track (not detected) gets no mark, so the VDM must answer `?`. The
+  gripper guard uses the fingertip only: an object covered by the upper arm but still detected keeps its mark.
 - Event frames are wired (frame index from the sim step and the recording rate) but untested on real frames.
 
 ## Privileged information

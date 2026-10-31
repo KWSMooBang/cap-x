@@ -56,6 +56,10 @@ These lines are not executed. After the block runs, the camera checks them, and 
 
 NO_DECLARATION = "The last code block made no declaration."
 
+# M2 and M5, right after the answer rule (bg-est2-rim: VDMs read a bowl leaning on a plate's rim as "on").
+ON_RULE = ('"on" means resting flat on top; an object leaning on the rim or tilted against it is 0, '
+           "and say so in Notes.")
+
 
 def _image(url: str) -> dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": url}}
@@ -70,14 +74,18 @@ def mark_list_lines(marks: Sequence[tuple[str, str, str, tuple[float, float]]]) 
     return "\n".join(f"- {m} = {a} ({c}), mark at pixel ({u:.0f}, {v:.0f})" for m, a, c, (u, v) in marks)
 
 
-def marks_now_text(shown: Sequence[tuple[str, str, tuple[float, float]]], missing: Sequence[str]) -> str:
+def marks_now_text(shown: Sequence[tuple[str, str, tuple[float, float]]], missing: Sequence[str],
+                   near_gripper: Sequence[str] = ()) -> str:
     """M5 ``Marks now:`` value: ``A = bowl_A (pixel 250, 205) | 1 = plate_A (250, 214) | B, 2: not detected``.
-    (The design writes the first entry with ``pixel``, the rest without.)"""
+    (The design writes the first entry with ``pixel``, the rest without.) ``near_gripper``: detected, but
+    not marked because the mark would sit on the robot arm -> ``3: under the gripper, not marked``."""
     parts = []
     for i, (m, a, (u, v)) in enumerate(shown):
         parts.append(f"{m} = {a} ({'pixel ' if i == 0 else ''}{u:.0f}, {v:.0f})")
     if missing:
         parts.append(f"{', '.join(missing)}: not detected")
+    if near_gripper:
+        parts.append(f"{', '.join(near_gripper)}: under the gripper, not marked")
     return " | ".join(parts) if parts else "none detected"
 
 
@@ -95,6 +103,7 @@ def observe_initial_prompt(
         f"{mark_list_lines(marks)}\n"
         "For each statement, answer 1 if it is true in the image, 0 if it is false, ? if the image does not let "
         "you tell (hidden, out of view, unclear).\n"
+        f"{ON_RULE}\n"
         "Statements:\n" + "\n".join(statements) + "\n" + OUTPUT_RULES
     )
     return [
@@ -128,6 +137,7 @@ def observe_turn_prompt(
         f"Marks now: {marks_now}\n"
         f"{decl}\n"
         "For each statement, answer for NOW (image 2): 1 true, 0 false, ? cannot tell.\n"
+        f"{ON_RULE}\n"
         "Statements:\n" + "\n".join(statements) + "\n" + OUTPUT_RULES_TURN
     )
     content.append(_text(tail))

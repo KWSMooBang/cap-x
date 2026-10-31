@@ -147,8 +147,11 @@ class OracleShadow:
                 items = []
                 for u in r.uncertain:
                     truth = self.truth(self.to_sim(u.key, est)) if u.key else None
+                    wrong = None if truth is None else (u.p > 0.5) != truth
+                    if u.reason == "veto" and truth is not None:  # bg_est2 only: the vetoed Observe 1 was wrong
+                        wrong = not truth
                     items.append({"pred": u.pred, "reason": u.reason, "est_p": round(u.p, 3), "oracle": truth,
-                                  "est_wrong": None if truth is None else (u.p > 0.5) != truth})
+                                  "est_wrong": wrong})
                 entry["items"] = items
                 entry["right"] = any(i["est_wrong"] for i in items) or any(i["reason"] == "unconfirmed" for i in items)
             elif sig.id == "S5b":
@@ -200,7 +203,25 @@ class OracleShadowV2(OracleShadow):
             "turns_with_code": 0, "declared": 0, "declared_valid": 0, "declared_dropped": 0,
             "effects_applied": 0, "effects_right": 0,
             "subtasks_judged": 0, "subtasks_right": 0,
+            # Geometric vetoes of an Observe 1: [vetoed with a known truth, right (truth 0)], and those
+            # with no truth (unmapped names).
+            "veto": [0, 0], "veto_no_truth": 0,
         })
+
+    def _veto_accuracy(self, r: Any, est: Any) -> list[dict[str, Any]]:
+        """Each veto this turn against the truth: right when the relation is false (the VDM's 1 was wrong)."""
+        out = []
+        t = self.totals
+        for v in getattr(r, "vetoes", None) or []:
+            truth = self.truth(self.to_sim(tuple(v["pred"]), est))
+            if truth is None:
+                t["veto_no_truth"] += 1
+            else:
+                t["veto"][0] += 1
+                t["veto"][1] += int(not truth)
+            out.append({"key": v["key"], "why": v["why"], "kind": v["kind"], "oracle": truth,
+                        "right": None if truth is None else not truth})
+        return out
 
     def to_sim(self, pred: tuple, est: Any) -> tuple | None:
         if pred and pred[0] == "at":
@@ -248,6 +269,7 @@ class OracleShadowV2(OracleShadow):
             log["est_goal_mapped"] = [[[" ".join(p) for p in s] for s in b] for b in mapped]
         log["oracle_goal_normalized"] = [[[" ".join(p) for p in s] for s in b] for b in oracle_norm]
         log["observe"] = self._observe_accuracy(est)
+        log["vetoes"] = self._veto_accuracy(getattr(est, "last2", None), est)
         return log
 
     def _observe_accuracy(self, est: Any) -> dict[str, Any]:
@@ -279,6 +301,7 @@ class OracleShadowV2(OracleShadow):
         log = super().compare(turn, est, r, fired, prev_oracle)
         t = self.totals
         log["observe"] = self._observe_accuracy(est)
+        log["vetoes"] = self._veto_accuracy(r, est)
         d = getattr(est, "decl", None)
         decl_log: dict[str, Any] = {"declared": False}
         if had_code:
