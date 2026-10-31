@@ -1,5 +1,31 @@
 # cap-bg EXPERIMENTS
 
+## 20261030_mem10x5_{none_v2,vdmhist,bgoracle} (2026-10-30 ~ 10-31) — keep (첫 메모리 조건 비교), 해석은 제한적
+- 실행: kubectl baccus_cap-bg, 큐 13:33 UTC(10/30) – 11:50 UTC(10/31), 인프라 재실행 12:10. 코드 bg 11008c5.
+  pod 1–2개(worker 1–2)로 운영: pod kill 1회(15:37), 사람 작업(ferrari-vla)에 GPU 양보 1회, OOM 1회(00:23, 3.8h 미감지) → 중단 trial 은 resume·재실행.
+- 설정: env_configs/capbg_baseline/libero_mem task_00..09 × 5, 조건별 --memory-mode. Kimi-K3 + Qwen3.8-27B VDM (Nebius), 앙상블 끔, VDM 켬,
+  seg 끔, 영상 on, step 8000 / wall 3600 / retries 1, max_tokens 32768. 세 조건을 task 단위로 섞은 큐, 같은 seed(trial 1–5) 짝.
+- 결과 (baccus 보고 원문, '인프라 재실행 반영' 기준; 재실행 2건(bg t1 tr1 HTTP 529, none t1 tr5 ReadTimeout)은 둘 다 실패):
+  | 조건 | 성공 | 진행률 | upstream init(t0,6,7,8) | 생성 init(t1-5,9) | 종료 사유 |
+  | none | 0/50 | 0.17 | 0/20 (0.09) | 0/30 (0.22) | step_cap 44, finish_but_fail 6 |
+  | vdm_history | 1/50 | 0.25 | 1/20 (0.21) | 0/30 (0.28) | step_cap 42, finish_but_fail 6, turn_limit 1 |
+  | bg_oracle | 7/50 | 0.42 | 3/20 (0.34) | 4/30 (0.47) | step_cap 39, finish_but_fail 4 |
+  wall timeout 0, 오염 0, finish_reason=length: none 1 / vdm 0 / bg 0.
+  짝 비교: bg vs none 성공 bg만 7 / none만 0 (부호검정 p≈0.016), 진행률 높음 23 / 같음 16 / 낮음 11 (p≈0.058).
+           vdm vs none 성공 1 / 0, 진행률 높음 16 / 같음 25 / 낮음 9 (p≈0.23).
+  task별 성공·진행률 (none | vdm | bg): t0 0/5 .20 | 1/5 .60 | 3/5 .60 · t1 0 .20 | 0 .20 | 2/5 1.00 · t2 0 .40 | 0 .60 | 0 .40 ·
+    t3 0 .00 | 0 .07 | 2/5 .80 · t4 .48 | .48 | .48 · t5 .14 | .14 | .14 · t6 .07 | .13 | .20 · t7 .00 | .00 | .55 · t8 .10 | .10 | .00 · t9 .10 | .20 | .00
+  bg 신호: S2 151회(41 trial), 다음 턴 진전 20/121. S5b 8회 중 FINISH 5. S5a 1회(두 번째 답 regenerate, 실패). overshot 5.
+- 토큰 (coding Kimi-K3 만; VDM usage 미기록): 입력 약 7.2M, 출력 약 8.4M (none 2.35/2.49, vdm 2.69/3.06, bg 2.07/2.72 M).
+  카탈로그 단가($3/$15 per M) 기준 coding 약 148달러 + VDM(Qwen) 미집계.
+- 판단: keep. bg_oracle 이 none 보다 뚜렷이 높음. 그러나 효과가 기억 과제(반복 t2·t4·t5, 교환 t6)가 아니라
+  단순 목표(t0·t1·t3, 특히 bottle 과제)와 t7(지시문 방향 모호)에 몰림 → 정답 물체 좌표(지각 대체)와 정답 목표 순서(BDDL) 효과일 가능성이 큼.
+  vdm_history 는 none 대비 유의한 차이 없음.
+- next: (1) bg_est (정답 없음) smoke → 10×5 로 같은 seed 비교. (2) bg_oracle ablation: 좌표 제거(관계만), 목표를 LLM 파싱으로 교체, 신호 끄기 —
+  정답 지각·정답 목표·기억 구조 효과 분리. (3) 영상 프레임 디스크 스트리밍(1i) 으로 worker 수 회복.
+- 산출물(kubectl PVC): outputs/capbg_baseline/20261030_memcond_COMPARE_{orig,reflected}.md, logs/20261030_memcond_final/{orig,reflected}/,
+  outputs/capbg_baseline/20261030_mem10x5_{none_v2,vdmhist,bgoracle}{,_infra_rerun}/, 중단분 _aborted_podkill, _aborted_podkill_vla, _aborted_oom.
+
 ## 20261030_mem10x5_capx (2026-10-30) — keep (첫 유효 기준선 파일럿, 단 floor effect)
 - 실행: kubectl baccus_cap-bg, 06:57–08:48 UTC. pod 3 × (A100, CPU 18, 40Gi), worker 3 (worker 5 는 영상 프레임 누적으로 OOM → 재시작,
   중단분 _aborted_w5/). GPU 약 6 GPU-h (재시작 전 포함).
