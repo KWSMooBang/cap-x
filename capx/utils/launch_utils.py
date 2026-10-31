@@ -85,7 +85,7 @@ DEFAULT_MAX_TOKENS = 2048 * 10
 def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, Any]:
     """memory_* keys (see capx.belief.memory): CLI > YAML > defaults (memory_mode none)."""
     from capx.belief.memory import DEFAULT_MAX_CHARS, EST_PERCEPTIONS, MEMORY_MODES
-    from capx.belief.signals import ALL_SIGNALS, EST_SIGNALS
+    from capx.belief.signals import ALL_SIGNALS, EST2_SIGNALS, EST_SIGNALS
 
     def pick(key: str, default: Any) -> Any:
         cli = getattr(args, key, None)
@@ -94,7 +94,7 @@ def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, 
     mode = pick("memory_mode", "none")
     if mode not in MEMORY_MODES:
         raise ValueError(f"memory_mode must be one of {MEMORY_MODES}, got {mode!r}")
-    implemented = EST_SIGNALS if mode == "bg_est" else ALL_SIGNALS
+    implemented = {"bg_est": EST_SIGNALS, "bg_est2": EST2_SIGNALS}.get(mode, ALL_SIGNALS)
     signals = pick("memory_signals", list(implemented))
     if isinstance(signals, str):  # CLI: "S2,S5" or "none"
         signals = [] if signals.strip().lower() in ("", "none") else [x.strip() for x in signals.split(",")]
@@ -108,7 +108,7 @@ def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, 
         "memory_in_initial_prompt": bool(pick("memory_in_initial_prompt", True)),
         "memory_max_finish_rejections": int(pick("memory_max_finish_rejections", 1)),
     }
-    if mode == "bg_est":
+    if mode in ("bg_est", "bg_est2"):
         perception = pick("memory_est_perception", "sam3")
         if perception not in EST_PERCEPTIONS:
             # SimPerceptionSource (simulator poses) must be asked for by its explicit test name.
@@ -125,6 +125,12 @@ def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, 
             "memory_est_shadow": bool(pick("memory_est_shadow", True)),
             "memory_est_goal_model": pick("memory_est_goal_model", None),
             "memory_est_goal_server_url": pick("memory_est_goal_server_url", None),
+        })
+    if mode == "bg_est2":
+        # memory_est_verify switches bg_est2's Observe VDM (it replaces the verification VDM).
+        out.update({
+            "memory_est_observe_max_statements": int(pick("memory_est_observe_max_statements", 10)),
+            "memory_est_event_frames": bool(pick("memory_est_event_frames", False)),
         })
     return out
 
@@ -618,10 +624,11 @@ def _save_trial_artifacts(
 
 def _bg_est_summary_line(config: dict[str, Any]) -> str | None:
     """bg_est runs name their perception in the summary; the fake one cannot pass unnoticed."""
-    if config.get("memory_mode") != "bg_est":
+    mode = config.get("memory_mode")
+    if mode not in ("bg_est", "bg_est2"):
         return None
     perception = config.get("memory_est_perception", "sam3")
-    line = f"Memory mode: bg_est (perception={perception}, goal_source={config.get('memory_est_goal_source', 'llm')})"
+    line = f"Memory mode: {mode} (perception={perception}, goal_source={config.get('memory_est_goal_source', 'llm')})"
     if perception == "sim_fake_for_tests":
         line += "  !!! perception=sim_fake: SIMULATOR POSES + noise, NOT A VALID EVALUATION !!!"
     return line

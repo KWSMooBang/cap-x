@@ -178,3 +178,144 @@ class OracleShadow:
             self.totals["S5a"][0] += 1
             self.totals["S5a"][1] += int(not complete)
         return {"s5a_rejected": rejected, "oracle_complete": complete, "right": (not complete) if rejected else None}
+
+
+# --- v2 (bg_est2) ------------------------------------------------------------------------------------
+
+REGION_SIM = {"center": "kitchen_table_the_center"}  # region word -> LIBERO-Mem BDDL region (logs only)
+PLACE_OPS = ("place", "put_in", "place_region")
+
+
+class OracleShadowV2(OracleShadow):
+    """``bg_est2`` shadow (EVALUATION LOGS ONLY): v1's metrics plus Observe accuracy (per predicate and
+    answer, ? rate), declaration compliance (declared share, declared Effects vs truth), subtask
+    judgement accuracy, and goal_match on goals normalized to newly-true predicates per step."""
+
+    def __init__(self, source: GroundTruthSource) -> None:
+        super().__init__(source)
+        self.totals.update({
+            "S3": [0, 0],
+            "observe": {},  # pred -> {"1": [n, right], "0": [n, right], "?": n}
+            "observe_fail": 0, "observe_calls": 0,
+            "turns_with_code": 0, "declared": 0, "declared_valid": 0, "declared_dropped": 0,
+            "effects_applied": 0, "effects_right": 0,
+            "subtasks_judged": 0, "subtasks_right": 0,
+        })
+
+    def to_sim(self, pred: tuple, est: Any) -> tuple | None:
+        if pred and pred[0] == "at":
+            subj = self.t0_map.get(pred[1])
+            return None if subj is None else ("on", subj, REGION_SIM.get(pred[2], pred[2]))
+        if pred and pred[0] in ("handempty", "above", "lifted"):
+            return (pred[0],) + tuple(pred[1:])
+        return super().to_sim(pred, est)
+
+    def truth(self, key: tuple | None) -> bool | None:
+        if key is None:
+            return None
+        if key[0] == "handempty":
+            try:
+                return not any(self.source.grasped(n) for n in self.source.movable_objects())
+            except Exception:
+                return None
+        if key[0] in ("above", "lifted"):
+            return None
+        return super().truth(key)
+
+    def _oracle_init(self) -> dict[str, frozenset]:
+        out: dict[str, set] = {}
+        for e in self.oracle.graph.edges.values():
+            if e.holds and e.predicate in ("on", "in"):
+                out.setdefault(e.subject, set()).add((e.predicate, e.target))
+        return {k: frozenset(v) for k, v in out.items()}
+
+    def start(self, est: Any) -> dict[str, Any]:
+        from .goal import normalize_steps
+
+        log = super().start(est)
+        oracle_norm = normalize_steps(self.oracle_branches, self._oracle_init())
+        log["goal_match_normalized"] = None
+        if est.goal.branches is not None:
+            mapped = []
+            for b in est.goal.branches:
+                steps = []
+                for s in b:
+                    keys = [self.to_sim(p, est) for p in s]
+                    steps.append(canonical_step([tuple(x for x in k if x is not None) for k in keys if k]))
+                mapped.append(steps)
+            log["goal_match_normalized"] = (sorted(repr(b) for b in mapped)
+                                            == sorted(repr([canonical_step(s) for s in b]) for b in oracle_norm))
+            log["est_goal_mapped"] = [[[" ".join(p) for p in s] for s in b] for b in mapped]
+        log["oracle_goal_normalized"] = [[[" ".join(p) for p in s] for s in b] for b in oracle_norm]
+        log["observe"] = self._observe_accuracy(est)
+        return log
+
+    def _observe_accuracy(self, est: Any) -> dict[str, Any]:
+        res = getattr(est, "last_observe", None)
+        t = self.totals
+        if res is None:
+            return {"asked": 0}
+        t["observe_calls"] += 1
+        if not res.ok:
+            t["observe_fail"] += 1
+            return {"asked": len(res.statements), "ok": False}
+        items = []
+        for key in res.statements:
+            v = res.parse.values.get(key)
+            truth = self.truth(self.to_sim(key, est))
+            entry = t["observe"].setdefault(key[0], {"1": [0, 0], "0": [0, 0], "?": 0, "missing": 0})
+            if v is None:
+                entry["missing"] += 1
+            elif v == "?":
+                entry["?"] += 1
+            elif truth is not None:
+                entry[v][0] += 1
+                entry[v][1] += int((v == "1") == truth)
+            items.append({"key": " ".join(str(x) for x in key if x is not None), "answer": v, "oracle": truth})
+        return {"asked": len(res.statements), "ok": True, "items": items}
+
+    def compare(self, turn: int, est: Any, r: Any, fired: list[Any], prev_oracle: Progress | None,
+                had_code: bool = True) -> dict[str, Any]:
+        log = super().compare(turn, est, r, fired, prev_oracle)
+        t = self.totals
+        log["observe"] = self._observe_accuracy(est)
+        d = getattr(est, "decl", None)
+        decl_log: dict[str, Any] = {"declared": False}
+        if had_code:
+            t["turns_with_code"] += 1
+        if d is not None and d.declared:
+            t["declared"] += 1
+            t["declared_valid"] += int(d.valid)
+            t["declared_dropped"] += int(d.dropped is not None)
+            effects = []
+            if d.valid and d.applied:
+                for e in d.effects:
+                    truth = self.truth(self.to_sim(e.key, est))
+                    if truth is None:
+                        continue
+                    t["effects_applied"] += 1
+                    t["effects_right"] += int(truth == e.after)
+                    effects.append({"effect": e.text, "oracle": truth, "right": truth == e.after})
+            decl_log = {"declared": True, "valid": d.valid, "dropped": d.dropped, "effects": effects}
+        log["declaration"] = decl_log
+        subs = []
+        for s in getattr(r, "judged", []):
+            if s["status"] not in ("done", "failed"):
+                continue
+            o, args = s["op"], s["args"]
+            if o in PLACE_OPS:
+                pred = {"place": "on", "put_in": "in", "place_region": "at"}[o]
+                key = self.to_sim((pred, args[0], args[1]), est)
+            elif o == "pick" and est.robot.get("holding") == args[0]:
+                key = self.to_sim(("inhand", args[0]), est)
+            else:
+                continue
+            truth = self.truth(key)
+            if truth is None:
+                continue
+            right = truth == (s["status"] == "done")
+            t["subtasks_judged"] += 1
+            t["subtasks_right"] += int(right)
+            subs.append({"subtask": f"{o}({', '.join(args)})", "status": s["status"], "oracle": truth, "right": right})
+        log["subtasks"] = subs
+        return log

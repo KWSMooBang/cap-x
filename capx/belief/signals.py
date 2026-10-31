@@ -222,3 +222,85 @@ class FinishGate:
             f"FINISH rejected: the task is not complete — {left}. Respond REGENERATE with new code to "
             "continue, or FINISH again to stop anyway.",
         )
+
+
+# --- v2 (bg_est2) ------------------------------------------------------------------------------------
+
+EST2_SIGNALS = ("S1", "S2", "S3", "S4", "S5")
+
+
+@dataclass
+class SignalContextV2(SignalContext):
+    """``bg_est2``: the estimator prepares the signal texts; detectors decide whether they fire."""
+
+    s1_items: list[str] = field(default_factory=list)  # failed subtasks / contradicted declared effects
+    subtask_progress: bool = False  # a subtask was completed (or placed, awaiting the camera) this turn
+    s3_items: list[str] = field(default_factory=list)  # false preconditions of the next subtask
+    s4_items: list[str] = field(default_factory=list)  # uncertain beliefs, phrased for the prompt
+
+
+class ExpectationViolationV2:
+    """S1: a declared Effect contradicted by Observe / the robot state, a failed subtask, a grasp lost."""
+
+    id = "S1"
+
+    def detect(self, ctx: SignalContext) -> Signal | None:
+        items = getattr(ctx, "s1_items", [])
+        if not ctx.executed or not items:
+            return None
+        return Signal("S1", f"{len(items)} item(s)", "; ".join(items))
+
+
+class ProgressStallV2:
+    """S2: remaining goal steps unchanged AND no subtask progress this turn."""
+
+    id = "S2"
+
+    def detect(self, ctx: SignalContext) -> Signal | None:
+        if getattr(ctx, "subtask_progress", False):
+            return None
+        sig = ProgressStall().detect(ctx)
+        if sig is None:
+            return None
+        return Signal("S2", sig.reason + ", no subtask progress",
+                      f"no progress this turn (remaining steps still {ctx.progress.remaining}, no subtask completed). "
+                      "Reconsider the strategy: work out why the last code did not complete the next subtask before "
+                      "writing new code; do not just repeat it.")
+
+
+class PreconditionFalse:
+    """S3: a precondition of the next subtask is (confidently) false."""
+
+    id = "S3"
+
+    def detect(self, ctx: SignalContext) -> Signal | None:
+        items = getattr(ctx, "s3_items", [])
+        if not ctx.executed or not items:
+            return None
+        return Signal("S3", f"{len(items)} precondition(s)", "; ".join(items))
+
+
+class UncertainBeliefV2:
+    id = "S4"
+
+    def detect(self, ctx: SignalContext) -> Signal | None:
+        items = getattr(ctx, "s4_items", [])
+        if not items:
+            return None
+        return Signal("S4", "; ".join(f"{u.pred}:{u.reason}" for u in ctx.uncertain), "uncertain: " + "; ".join(items))
+
+
+def est2_detectors(enabled: tuple[str, ...] | list[str] = EST2_SIGNALS) -> list[SignalDetector]:
+    """Detectors for ``bg_est2``, in prompt order S1, S2, S3, S4, S5b. S5b keeps the oracle wording."""
+    out: list[SignalDetector] = []
+    if "S1" in enabled:
+        out.append(ExpectationViolationV2())
+    if "S2" in enabled:
+        out.append(ProgressStallV2())
+    if "S3" in enabled:
+        out.append(PreconditionFalse())
+    if "S4" in enabled:
+        out.append(UncertainBeliefV2())
+    if "S5" in enabled:
+        out.append(CompletionVerified())
+    return out

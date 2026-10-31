@@ -126,13 +126,15 @@ class LaunchArgs:
     memory_mode: str | None = None
     """Memory in the multi-turn decision prompt: none (cap-x baseline, default), vdm_history (every
     turn's VDM description), bg_oracle (Belief Graph from simulator ground truth + S2/S5 signals) or
-    bg_est (Belief Graph estimated from cameras, robot state and API calls + S1/S2/S4/S5 signals)."""
+    bg_est (Belief Graph estimated from cameras, robot state and API calls + S1/S2/S4/S5 signals) or
+    bg_est2 (bg_est v2: VDM Observe on marked images, declared Subtask / Effect, S1-S5)."""
 
     memory_max_chars: int | None = None
     """Character budget of the memory block (default 3000)."""
 
     memory_signals: str | None = None
-    """Signals, comma-separated or "none". bg_oracle: S2,S5 (default). bg_est: S1,S2,S4,S5 (default)."""
+    """Signals, comma-separated or "none". bg_oracle: S2,S5 (default). bg_est: S1,S2,S4,S5 (default).
+    bg_est2: S1,S2,S3,S4,S5 (default)."""
 
     memory_in_initial_prompt: bool | None = None
     """bg_oracle: also put the initial Belief Graph into the first code-generation prompt (default True)."""
@@ -154,7 +156,7 @@ class LaunchArgs:
     """bg_est data association gate in m (default 0.10)."""
 
     memory_est_verify: bool | None = None
-    """bg_est: one verification VDM call per turn (default True)."""
+    """bg_est: one verification VDM call per turn (default True). bg_est2: the Observe VDM (M2 / M5) on or off."""
 
     memory_est_shadow: bool | None = None
     """bg_est: log the oracle shadow (simulator truth, logs only; default True)."""
@@ -164,6 +166,13 @@ class LaunchArgs:
 
     memory_est_goal_server_url: str | None = None
     """bg_est goal parsing server (default: the coding model's server)."""
+
+    memory_est_observe_max_statements: int | None = None
+    """bg_est2: statements per turn-end Observe (default 10)."""
+
+    memory_est_event_frames: bool | None = None
+    """bg_est2: extra Observe on the recorded frames right after gripper close / open (default False;
+    needs recorded frames, i.e. record_video)."""
 
     # Web UI configuration
     web_ui: bool | None = None

@@ -25,7 +25,7 @@ import numpy as np
 from PIL import Image
 
 from capx.belief.memory import DEFAULT_MAX_CHARS, make_memory
-from capx.belief.signals import ALL_SIGNALS, EST_SIGNALS
+from capx.belief.signals import ALL_SIGNALS, EST2_SIGNALS, EST_SIGNALS
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 
@@ -547,6 +547,7 @@ def _handle_multi_turn_step(
     memory: Any = None,
     turn: int = 0,
     executed: bool = True,
+    memory_frames: Any = None,
 ) -> tuple[str, str | None, str | None, dict | None, list | None]:
     """Execute one multi-turn decision step.
 
@@ -622,7 +623,13 @@ def _handle_multi_turn_step(
         visual_feedback_base64 = visual_feedback_base64_history[-1] if visual_feedback_base64_history else None
 
     # Memory (memory_mode): updated with this turn's VDM text; None text for memory_mode none.
-    mem_turn = memory.after_turn(turn, differencing_feedback, executed=executed) if memory is not None else None
+    # bg_est2 also reads the block that ran (its # Subtask / # Effect lines) and, optionally, frames.
+    mem_extra: dict[str, Any] = {}
+    if memory is not None and getattr(memory, "mode", None) == "bg_est2":
+        mem_extra = {"code": code_blocks[code_block_idx - 1] if code_block_idx > 0 else None,
+                     "turn_frames": memory_frames}
+    mem_turn = memory.after_turn(turn, differencing_feedback, executed=executed, **mem_extra) \
+        if memory is not None else None
     memory_text = mem_turn.text if mem_turn is not None else None
 
     # Build decision prompt
@@ -637,6 +644,9 @@ def _handle_multi_turn_step(
             obs, complete_multi_turn_prompt, visual_feedback_base64, differencing_feedback,
             is_video_feedback=is_video_feedback, memory_text=memory_text,
         )
+    rules = _memory_rules(memory)
+    if rules is not None:  # bg_est2 only: at the very end of the decision prompt
+        decision_prompt[-1]["content"].append({"type": "text", "text": rules})
 
     # Query model
     def query_decision(prompt):
@@ -801,7 +811,7 @@ def _run_single_trial(
         )
 
     # Memory condition (memory_mode); none adds nothing to any prompt.
-    memory = _make_trial_memory(config, env, args, visual_differencing_args)
+    memory = _make_trial_memory(config, env, args, visual_differencing_args, trial=trial)
 
     # --- 2. Capture initial visual feedback ---
     visual_feedback_imgs, visual_feedback_base64_history, task_description = (
@@ -824,10 +834,13 @@ def _run_single_trial(
     # bg_oracle: the initial Belief Graph goes into a copy of the first prompt only (later decision
     # prompts carry the current graph instead).
     initial_memory_text = memory.initial_text() if config.get("memory_in_initial_prompt", True) else None
+    initial_rules = _memory_rules(memory)
     initial_obs = obs
-    if initial_memory_text is not None:
+    if initial_memory_text is not None or initial_rules is not None:
         initial_obs = {**obs, "full_prompt": copy.deepcopy(obs["full_prompt"])}
-        initial_obs["full_prompt"][-1]["content"].append({"type": "text", "text": initial_memory_text})
+        for extra in (initial_memory_text, initial_rules):
+            if extra is not None:
+                initial_obs["full_prompt"][-1]["content"].append({"type": "text", "text": extra})
     query_start = time.time()
     if config["use_oracle_code"]:
         raw_code = env.oracle_code
@@ -981,6 +994,7 @@ def _run_single_trial(
                 memory=memory,
                 turn=code_block_idx,
                 executed=not skipped,
+                memory_frames=_memory_event_frames(config, env, recording_frames, frame_start, frame_end),
             )
             decision_s = time.time() - decision_start
 
@@ -1057,12 +1071,13 @@ def _run_single_trial(
 
         # Save intermediate artifacts (code, logs) per code block
         final_code = _annotate_code_blocks(code_blocks, code_block_metadata)
-        _save_trial_artifacts(
+        step_code_path = _save_trial_artifacts(
             config, trial, info_step["sandbox_rc"], reward,
             info_step.get("task_completed", False), final_code, raw_code,
             all_responses, ["-" * 100, "Generated program:", final_code],
             visual_feedback_imgs,
         )
+        _copy_belief_trace(memory, step_code_path)
 
         # Only save intermediate video if NOT doing per-turn saving
         # (per-turn saving is deferred to after the loop to avoid clearing the buffer)
@@ -1102,6 +1117,7 @@ def _run_single_trial(
         ensemble_data=ensemble_data,
         multiturn_ensemble_data=multiturn_ensemble_data,
     )
+    _copy_belief_trace(memory, code_path)
 
     # Save per-turn and combined videos
     if recording_frames and turn_frame_ranges:
@@ -1153,6 +1169,7 @@ def _make_trial_memory(
     env: CodeExecutionEnvBase,
     args: Any = None,
     visual_differencing_args: ModelQueryArgs | None = None,
+    trial: int = 0,
 ) -> Any:
     """Memory for this trial (capx.belief.memory), reset on the freshly reset low-level env.
 
@@ -1165,9 +1182,11 @@ def _make_trial_memory(
     """
     mode = config.get("memory_mode", "none")
     if hasattr(env, "api_call_wrapper"):
-        env.api_call_wrapper = None  # envs are reused across trials: only bg_est installs a hook
+        env.api_call_wrapper = None  # envs are reused across trials: only bg_est / bg_est2 install a hook
     if mode == "bg_est":
         signals = config.get("memory_signals", EST_SIGNALS)
+    elif mode == "bg_est2":
+        signals = config.get("memory_signals", EST2_SIGNALS)
     else:
         signals = config.get("memory_signals", ALL_SIGNALS)
     memory = make_memory(
@@ -1179,10 +1198,13 @@ def _make_trial_memory(
         max_categories=config.get("memory_est_max_categories", 5),
         gate_dist=config.get("memory_est_gate_dist", 0.10),
         verify=config.get("memory_est_verify", True),
+        observe=config.get("memory_est_verify", True),
         perception=config.get("memory_est_perception", "sam3"),
         shadow=config.get("memory_est_shadow", True),
+        observe_max_statements=config.get("memory_est_observe_max_statements", 10),
+        event_frames=config.get("memory_est_event_frames", False),
     )
-    if mode != "bg_est":
+    if mode not in ("bg_est", "bg_est2"):
         memory.reset(env.low_level_env)
         return memory
 
@@ -1202,8 +1224,40 @@ def _make_trial_memory(
         goal_query_fn=(lambda prompt: _query_model(goal_args, prompt)) if goal_args is not None else None,
         vdm_query_fn=(lambda prompt: _query_model(visual_differencing_args, prompt))
         if visual_differencing_args is not None and visual_differencing_args.model else None,
+        # Written next to all_responses.json while the trial runs; copied into the trial directory.
+        **({"trace_path": os.path.join(config["output_dir"], f"belief_trace_trial_{trial:02d}.jsonl")}
+           if mode == "bg_est2" else {}),
     )
     return memory
+
+
+def _copy_belief_trace(memory: Any, code_path: Any) -> None:
+    """bg_est2: <trial_dir>/belief_trace.jsonl (the trial directory is named only when artifacts are saved)."""
+    src = getattr(memory, "trace_path", None)
+    if not src or not code_path or not os.path.exists(src):
+        return
+    import shutil
+
+    try:
+        shutil.copyfile(src, os.path.join(os.path.dirname(str(code_path)), "belief_trace.jsonl"))
+    except OSError as exc:
+        print(f"[bg_est2] could not copy the belief trace: {exc}")
+
+
+def _memory_rules(memory: Any) -> str | None:
+    """bg_est2: the Subtask / Effect declaration rules (M4) for the first and every decision prompt."""
+    rules = getattr(memory, "prompt_rules", None)
+    return rules() if rules is not None else None
+
+
+def _memory_event_frames(config: dict[str, Any], env: Any, recording: bool, start: int, end: int) -> Any:
+    """bg_est2 with memory_est_event_frames: (this turn's recorded frames, sim steps per frame)."""
+    if config.get("memory_mode") != "bg_est2" or not config.get("memory_est_event_frames") or not recording:
+        return None
+    rate = getattr(getattr(env, "low_level_env", None), "_subsample_rate", None)
+    if not rate or not hasattr(env, "get_video_frames_range"):
+        return None
+    return env.get_video_frames_range(start, end), int(rate)
 
 
 def _memory_est_log(memory: Any) -> dict[str, Any]:

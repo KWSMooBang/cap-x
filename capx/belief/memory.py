@@ -6,6 +6,8 @@ memory_mode:
   bg_oracle   -- Belief Graph built from simulator ground truth, plus S2/S5 signals.
   bg_est      -- Belief Graph estimated from cameras, robot state, API-call hooks, VDM and the task
                  language only, plus S1/S2/S4/S5 signals; simulator truth is an evaluation-only shadow.
+  bg_est2     -- bg_est v2 (memory2.py): VDM Observe on marked images, declared Subtask / Effect,
+                 subtask layer, S1-S5, belief_trace.jsonl.
 
 All three expose the same calls, so the harness does not branch on the mode:
   reset(low_level_env, **context) after env.reset() (bg_est takes code_env, instruction and the
@@ -47,7 +49,7 @@ from .signals import (
 )
 from .verify import VdmVerifier
 
-MEMORY_MODES = ("none", "vdm_history", "bg_oracle", "bg_est")
+MEMORY_MODES = ("none", "vdm_history", "bg_oracle", "bg_est", "bg_est2")
 EST_PERCEPTIONS = ("sam3", "sim_fake_for_tests")
 DEFAULT_MAX_CHARS = 3000
 
@@ -411,4 +413,10 @@ def make_memory(mode: str = "none", **opts: Any) -> NoMemory | VdmHistoryMemory 
         keys = ("max_chars", "signals", "max_finish_rejections", "goal_source", "max_categories", "gate_dist",
                 "verify", "perception", "shadow")
         return BgEstMemory(**{k: opts[k] for k in keys if k in opts})
+    if mode == "bg_est2":
+        from .memory2 import BgEst2Memory
+
+        keys = ("max_chars", "signals", "max_finish_rejections", "goal_source", "max_categories", "gate_dist",
+                "observe", "perception", "shadow", "observe_max_statements", "event_frames")
+        return BgEst2Memory(**{k: opts[k] for k in keys if k in opts})
     raise ValueError(f"Unknown memory_mode {mode!r}; expected one of {MEMORY_MODES}")
