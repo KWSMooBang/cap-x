@@ -180,6 +180,7 @@ YAMLs as they are (`memory_mode` is not in them, so it defaults to `none`):
 | `vdm_history` | The VDM descriptions of all previous turns, as `turn k: ...` (unstructured text memory). The current turn's description is already in the VDM block, so the history leaves it out. |
 | `bg_oracle` | A Belief Graph built from LIBERO-Mem **simulator ground truth** (`capx/belief/`): progress over the BDDL goal steps, object positions and supports, location-change events, plus the S2 / S5 signals below. This is an upper bound, not a deployable method. |
 | `bg_est` | A Belief Graph **estimated** from what the robot can use (cameras, robot state, API calls, VDM, task language), with S1 / S2 / S4 / S5. See [Estimated Belief Graph](#estimated-belief-graph-bg_est). |
+| `bg_est2` | `bg_est` v2: the VDM reads marked images and answers `Observe:` statements, the code declares `# Subtask` / `# Effect`, goal steps hold only newly true predicates, a subtask layer, S1–S5, `belief_trace.jsonl`. See [Estimated Belief Graph v2](#estimated-belief-graph-v2-bg_est2). |
 
 The memory block goes after the VDM description and before the REGENERATE / FINISH instructions. Options (CLI
 flag or YAML key of the same name; CLI wins):
@@ -189,7 +190,7 @@ flag or YAML key of the same name; CLI wins):
 | `memory_max_chars` | 3000 | Budget of the memory block. `vdm_history` drops the oldest turns. `bg_oracle` drops the oldest events, then shortens and finally leaves out the objects line, but never cuts the Progress and Signals lines (`memory_state.over_budget` marks when those alone exceed the budget). |
 | `memory_signals` | `S2,S5` | `bg_oracle` signals (`none` turns them off). S2: an executed turn left the number of remaining steps unchanged. The prompt says "no progress this turn" and asks the model to rethink. S5b: every step is verified complete. The prompt says so, and the model still decides FINISH (the harness never ends a trial by itself). S5a: a FINISH while steps remain is rejected and the same prompt is asked again with the reply and the remaining steps appended. That answer stands. |
 | `memory_max_finish_rejections` | 1 | S5a rejections per trial. |
-| `memory_in_initial_prompt` | true | `bg_oracle` / `bg_est`: also append the turn-0 graph to the first code-generation prompt. |
+| `memory_in_initial_prompt` | true | `bg_oracle` / `bg_est` / `bg_est2`: also append the turn-0 graph to the first code-generation prompt (`bg_est2` appends its M4 rules either way). |
 
 Example (LIBERO-Mem task 6, oracle condition):
 
@@ -442,6 +443,133 @@ the grasp.
 and 50 % misses under the gripper. It prints a `perception=sim_fake` banner when created. The estimator records its perception source name in
 `state()` and in every turn log (`perception`). It exists for tests and CPU
 checks without SAM3 and must never be used for an evaluation run.
+
+## Estimated Belief Graph v2 (`bg_est2`)
+
+`bg_est2` keeps `bg_est`'s inputs (cameras, robot state, API calls, VDM, task language; no simulator state) and
+its tracks, data association, hooks and step counting, and changes how relations are observed and how the
+code agent takes part. Design: `/outputs/cap-bg/tasks/bg-est2-design.md` (prompt texts M2–M5 there are used
+verbatim, `capx/belief/prompts_v2.py`). `bg_est` is unchanged and can still be run for comparison.
+
+| Module | Role |
+| --- | --- |
+| `som.py` | Marks: letters A, B, … for objects, numbers 1, 2, … for supports (plates, baskets), fixed per trial and in alias order (aliases go from the image left = robot base −y). Drawn at each track's projected center. A track not detected in this image gets no mark. |
+| `observe.py` | Statement format `(on bowl_A plate_B)`, `(in cream_cheese_A basket_A)`, `(at basket_A center)`, `(inhand bowl_B)`, `(handempty)`. Lenient parser of the `Observe:` line (order, spaces, case, `true/false`), `Notes:` line, Notes flags (tilted / fallen / wrong mark). |
+| `prompts_v2.py` | M2 (initial Observe), M3 (goal), M4 (declaration rules), M5 (turn Observe). |
+| `declare.py` | Parses `# Subtask: op(args)` / `# Effect: (pred) a>b \| ...` from the first two lines of the block; checks them against the API calls. |
+| `subtasks.py` | Operators pick / place / put_in / place_region, expansion of goal steps, statuses. |
+| `estimator2.py` | `BeliefEstimatorV2` (a `BeliefEstimator` subclass). |
+| `memory2.py` | `BgEst2Memory` (`memory_mode: bg_est2`), `belief_trace.jsonl`. |
+| `shadow.py` | `OracleShadowV2` (evaluation logs only). |
+
+### Per trial and per turn
+
+- **Start.** Detection and aliases as in `bg_est`. **M2**: one marked image, every object × support relation
+  (most likely first by geometry) and every object on the table, at most 20. **M3** (goal model): the scene
+  as seen in the image — left/right in image terms (base −y is image left), distance from the camera (base x),
+  "empty" / "holds X" from M2 — and a region line when the instruction names one (`center`). Steps list only
+  newly true predicates; a reply with cumulative steps is normalized (a predicate already true before its step
+  is dropped when the step has a new one; a step with none new, a put-back or repeat, is kept).
+- **M4** is appended to the first prompt and to every decision prompt (bg_est2 only).
+- **Turn end.** The harness passes the block that ran. A valid declaration (op ∈ pick, place, put_in,
+  place_region, look; known names) whose operator API ran (pick: `close_gripper`; place*: `open_gripper`)
+  turns its Effects into expectations (P 0.7 / 0.3). No declaration or a malformed one → `bg_est`'s hook
+  inference (`declared: false`). A declaration the calls contradict (place declared, the gripper opened above
+  another tracked support; pick declared, another object grasped) is dropped and shown as `IGNORED`. A valid
+  declaration also names the grasped object when several are within reach (a basket with the cheese inside).
+- **M5**: images before / now (marks only for objects detected now), the declaration, and at most
+  `memory_est_observe_max_statements` (10) statements: declared Effects, the declared / moved objects'
+  relations (target, previous support, table), goal-relevant predicates, unconfirmed counted steps, then where
+  the goal objects are believed to be. Plates are never asked about.
+- **Fusion** per key: robot state (inhand, handempty, above(gripper, t), lifted, P 0.97, source `robot`) >
+  Observe 1 / 0 (P 0.9 / 0.1, `vdm`) > geometry (only when Observe failed, or for a key with no belief yet)
+  > expectation > memory. `?` keeps the memory. A relation set true lowers the object's other on / in / inhand
+  relations not observed now (regions overlap supports and are left alone). Observe on / in = 1 for objects
+  more than 2 support radii apart → P 0.5 + S4. Notes saying an object is tilted / fallen → its observed
+  "on a support" relations P 0.5; "wrong mark" → all its observed relations P 0.5; S4 quotes the note. A reply
+  with no readable statement → geometry only (the `bg_est` way), `Observe (tN): failed` in the block.
+- **Steps** are counted from hook snapshots as in `bg_est`; a count is confirmed only by an observation (Observe
+  or robot) with P ≥ 0.7, stays pending on declaration + API only, and is withdrawn (S1) on Observe 0.
+- **Subtasks.** pick = grasped and lifted (robot); place / put_in / place_region = released after a lift and
+  judged on the target relation at turn end: 1 → done, 0 → failed (S1), ? → pending (judged again later if the
+  object did not move). A region (`center`) is at(o, r) from the distance to the region center: where the
+  front camera's optical axis meets the table (shown in the Objects line), radius 0.10 m.
+- **Signals.** S1: failed subtask ("place(bowl_B, plate_B) failed: bowl_B is on table. Retry the place, not the
+  whole task"), declared Effect contradicted, grasp missed / object dropped, count withdrawn. S2: remaining
+  steps unchanged **and** no subtask done / pending this turn. S3: the next planned subtask's precondition is
+  confidently false (in practice: the gripper holds another object). S4: a goal-relevant key `?` two turns in a
+  row, a geometric anomaly, a Notes flag, a count unconfirmed for 2 turns. S5b (oracle wording) and S5a are
+  suppressed while any count is pending or anything is uncertain.
+- **Event frames** (`memory_est_event_frames`, default off; needs recorded frames): the recorded frame right after
+  each gripper close / open gets an extra Observe on that object (at most 4 per turn); its answers fill turn-end
+  `?` when the gripper did not close again afterwards.
+
+### Prompt block
+
+Turn 0 (first prompt) and later turns (decision prompt, after the VDM description, before the REGENERATE /
+FINISH instructions; M4 follows at the very end):
+
+```
+Belief graph (turn 2, ESTIMATED; names match the marks; xyz in the robot base frame, m: x away from the robot, y to the robot's left):
+Subtask (declared): place(bowl_B, plate_B)
+Effect (declared): (on bowl_B plate_B) 0>1 | (inhand bowl_B) 1>0
+Observe (t2): (on bowl_B plate_B) ? | (inhand bowl_B) ? | (on bowl_B plate_C) ? | (on bowl_B table) ? | (on bowl_A plate_A) 1
+Belief: (on bowl_A plate_A) 0.90 vdm | (on bowl_B plate_B) 0.70 exp | (on bowl_A plate_C) 0.10 mem | (handempty) 0.97 robot
+Delta: step 2/3 done | next: (on bowl_A plate_C) | remaining 1 | 1 counted step(s) not yet confirmed by the camera
+Subtasks: pick(bowl_B, plate_C) done -> place(bowl_B, plate_B) pending (not confirmed by the camera) | next: pick(bowl_A, plate_A) -> place(bowl_A, plate_C)
+Objects: bowl_A at (0.43, -0.13, 0.02) | bowl_B at (0.68, 0.00, 0.03), not seen since t1 | plate_A at (0.46, -0.14, -0.01) | ...
+Signals: none
+```
+
+Over `memory_max_chars`: Belief items are dropped from the end, then the Objects line, then the Observe line is
+shortened; title, Subtask, Effect, Delta, Subtasks and Signals are never cut.
+
+### Logs
+
+- `all_responses.json`: as `bg_est` (`memory_*`, `memory_est` with `est`, `shadow`) plus
+  `memory_est.cot_record` = `{turn, Subtask, Effect, declared, Observe, Notes, Belief, Delta, Subtasks, Signals}`.
+- `<trial_dir>/belief_trace.jsonl`: one line at the start, per turn end and per event-frame Observe: `nodes`
+  (category, mark, pos, size, last_seen, pixel, flag), `robot` (eef, gripper, handempty, above, holding,
+  lifted), `keys` (per relation: P, source, obs, observe answer, last_seen_turn, geom {dz, d_xy, r}, `shadow` =
+  simulator truth), `goal` (+ region centers), `steps` (status, by, turn), `subtasks`, `plan`, `declaration`,
+  `observe` (statements, reply, parsed, prompt text), `cot`, `signals`, `est`, `shadow`. Written to
+  `<output_dir>/belief_trace_trial_NN.jsonl` while the trial runs and copied into the trial directory.
+- Shadow totals (`memory_state.shadow_totals`): `bg_est`'s plus `observe` (per predicate: answers 1 / 0 with
+  [n, right], `?`, missing), `observe_fail`, `declared` / `declared_valid` / `declared_dropped` /
+  `turns_with_code`, `effects_applied` / `effects_right`, `subtasks_judged` / `subtasks_right`, `S3`; start log
+  `goal_match_normalized` (both goals reduced to newly true predicates per step).
+
+### Running `bg_est2`
+
+Same as `bg_est` with `--memory-mode bg_est2`. Extra keys:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `memory_signals` | `S1,S2,S3,S4,S5` | S3 exists only here. |
+| `memory_est_verify` | true | Switches the Observe VDM (M2 / M5), which replaces `bg_est`'s verification VDM. Off: geometry only. |
+| `memory_est_observe_max_statements` | 10 | Statements per turn-end Observe. |
+| `memory_est_event_frames` | false | Extra Observe on recorded frames right after gripper close / open. |
+
+`memory_est_perception`, `memory_est_goal_source`, `memory_est_goal_model`, `memory_est_shadow`,
+`memory_est_gate_dist`, `memory_est_max_categories` work as for `bg_est`. Extra model calls per trial: one M2 and
+one M3, then one M5 per turn (event frames: up to 4 more).
+
+Offline Observe accuracy (`scripts/eval_observe.py`): `scenes` makes labelled LIBERO-Mem scenes on CPU (needs the
+simulator, no keys); `query` sends them to the VDM as M5 prompts (`OBSERVE_VDM_URL`, `OBSERVE_VDM_MODEL`,
+`OBSERVE_VDM_API_KEY`) and writes `results.jsonl`, `table.md` (accuracy per predicate × condition × truth, `?`
+rate). `LIBERO_MEM_ROOT` points scene making at another LIBERO-Mem checkout (for its init states).
+
+### Known limitations (v2)
+
+- The VDM is the main observer of relations; its accuracy on marked LIBERO images is not yet measured
+  (`eval_observe` first). A wrong but confident Observe 1 / 0 overrides geometry; only the 2-radii anomaly rule
+  and Notes catch it.
+- Region centers are an estimate (the camera axis on the table), not the BDDL region; at(o, center) is judged by
+  the VDM or by distance to that point.
+- Declarations are trusted when the API calls do not contradict them; a code agent that declares a target and
+  drives elsewhere above no tracked support is not caught until Observe.
+- Marks sit at estimated centers; a stale track (not detected) gets no mark, so the VDM must answer `?`.
+- Event frames are wired (frame index from the sim step and the recording rate) but untested on real frames.
 
 ## Privileged information
 

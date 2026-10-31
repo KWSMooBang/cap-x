@@ -443,7 +443,7 @@ class BeliefEstimator:
         loc = dict(self.loc)
         thr = self.cfg.grasp_threshold
         # What the hooks saw (read by bg_est2's declaration check; no effect on bg_est).
-        facts: dict[str, list] = {"closed": [], "opened": [], "grasped": [], "missed": [], "lifted": [],
+        facts: dict[str, list] = {"closed": [], "opened": [], "grasped": [], "missed": [], "lifted": [], "events": [],
                                   "released": [], "dropped": []}
         self.last_record_facts = facts
 
@@ -466,6 +466,7 @@ class BeliefEstimator:
                 self.held, self.held_lifted, self.grasp_z = (cand.alias if cand else None), False, float(eef[2])
                 if cand is not None:
                     facts["grasped"].append(cand.alias)
+                    facts["events"].append((rec.index, rec.fn, cand.alias))
                     self.held_off = cand.pos - eef
                     expectations[("inhand", cand.alias, None)] = (True, rec.desc)
                 elif g is not None and near is not None:  # closed fully next to an object: grasp missed
@@ -480,6 +481,7 @@ class BeliefEstimator:
                     t = self.tracks[self.held]
                     at = eef + self.held_off  # where the released object is
                     support = self._support_below(t.alias, at)
+                    facts["events"].append((rec.index, rec.fn, t.alias))
                     facts["released"].append((t.alias, support.alias if support is not None else None,
                                               bool(self.held_lifted)))
                     expectations[("inhand", t.alias, None)] = (False, rec.desc)

@@ -26,7 +26,12 @@ from .hooks import ApiCallRecorder
 from .memory import DEFAULT_MAX_CHARS, EST_PERCEPTIONS, MemoryTurn, _CountingQuery, _usage_sum
 from .observe import VdmObserver, statement_text
 from .oracle import GroundTruthSource, LiberoMemSource
-from .perception import PerceptionSource, Sam3PerceptionSource, SimPerceptionSource, proprio_from_obs
+from .perception import (
+    PerceptionSource,
+    Sam3PerceptionSource,
+    SimPerceptionSource,
+    proprio_from_obs,
+)
 from .prompts_v2 import M4_RULES
 from .shadow import OracleShadowV2
 from .signals import EST2_SIGNALS, FinishGate, Signal, SignalContextV2, est2_detectors
@@ -42,6 +47,27 @@ def _jsonable(x: Any) -> Any:
     if isinstance(x, (str, int, float, bool)) or x is None:
         return x
     return str(x)
+
+
+MAX_EVENT_FRAMES = 4  # extra Observe calls per turn at most
+
+
+def select_event_frames(records: Sequence[Any], frames: Sequence[Any], rate: int,
+                        limit: int = MAX_EVENT_FRAMES) -> list[dict[str, Any]]:
+    """The recorded frame right after each close / open gripper call of the turn. Frame j of the turn
+    is taken ``rate`` sim steps after frame j - 1, the first at the first call's start step."""
+    if not frames or not records or not rate:
+        return []
+    start = next((r.step_before for r in records if r.step_before is not None), None)
+    if start is None:
+        return []
+    out = []
+    for r in records:
+        if r.fn not in ("close_gripper", "open_gripper") or r.step_after is None:
+            continue
+        j = min(max((r.step_after - start) // rate + 1, 0), len(frames) - 1)
+        out.append({"rgb": frames[j], "index": r.index, "step": r.step_after, "frame": j})
+    return out[-limit:]
 
 
 class BgEst2Memory:
@@ -160,10 +186,15 @@ class BgEst2Memory:
         return self.render()
 
     def after_turn(self, turn: int, vdm_text: str | None = None, executed: bool = True, code: str | None = None,
-                   event_frames: Sequence[dict[str, Any]] = ()) -> MemoryTurn:
+                   event_frames: Sequence[dict[str, Any]] = (), turn_frames: Any = None) -> MemoryTurn:
+        """``turn_frames``: ``(frames, rate)`` -- this turn's recorded agentview frames, one every ``rate``
+        sim steps from the turn start (``event_frames`` on: the frames right after each gripper call
+        get an extra Observe)."""
         assert self.estimator is not None, "reset() first"
         records = self.recorder.drain()
-        frames = event_frames if self.config.event_frames else ()
+        frames = list(event_frames) if self.config.event_frames else []
+        if self.config.event_frames and turn_frames is not None and not frames:
+            frames = select_event_frames(records, *turn_frames)
         r = self.estimator.end_turn(turn, self.low.get_observation(), records, executed=executed,
                                     code=code if executed else None, event_frames=frames)
         ctx = SignalContextV2(turn, self.estimator.graph, r.progress, self.s2_baseline, r.events, executed=executed,

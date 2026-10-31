@@ -49,7 +49,14 @@ from .goal import GoalResult, goal_preds, parse_goal_llm_v2, regions_in, scene_l
 from .graph import EdgeKey, format_location
 from .hooks import CallRecord
 from .observe import ObserveResult, VdmObserver, note_flags, statement_text
-from .perception import Category, PerceptionSource, VOCABULARY, categories_from_instruction, project_to_pixel, proprio_from_obs
+from .perception import (
+    VOCABULARY,
+    Category,
+    PerceptionSource,
+    categories_from_instruction,
+    project_to_pixel,
+    proprio_from_obs,
+)
 from .progress import Pred, Progress, Step
 from .prompts_v2 import marks_now_text, observe_initial_prompt, observe_turn_prompt
 from .signals import Uncertain, Violation
@@ -348,6 +355,8 @@ class BeliefEstimatorV2(BeliefEstimator):
                 return
             if k[1] != GRIPPER and k[1] not in self.tracks:
                 return
+            if k[1] in self.tracks and self.tracks[k[1]].category.key in FIXED_KEYS:
+                return  # plates are not moved in LIBERO-Mem: no statements about where they are
             if k[2] not in (None, TABLE) and k[2] not in self.tracks and k[2] not in self.region_xy:
                 return
             out.append(k)
@@ -402,7 +411,8 @@ class BeliefEstimatorV2(BeliefEstimator):
             elif v in ("1", "0"):
                 self.graph.set_edge(key, cfg.p_vdm if v == "1" else 1.0 - cfg.p_vdm, "obs", turn)
                 origin = "vdm"
-            elif (fallback or key not in self.graph.edges) and g is not None and v != "?":
+            elif (fallback or key not in self.graph.edges) and g is not None:
+                # Observe failed, or nothing is known about this key yet (? on the first look): geometry.
                 self.graph.set_edge(key, g[0], "obs", turn)
                 origin = "geo"
             elif e is not None:
@@ -602,7 +612,10 @@ class BeliefEstimatorV2(BeliefEstimator):
         moved |= {r[0] for r in f.get("released", [])} | set(f.get("grasped", []))
         statements = self._turn_statements(decl, moved, before)
         result.statements = [statement_text(k) for k in statements]
+        by_index = {i: (fn, a) for i, fn, a in f.get("events", [])}
         for ev in event_frames:
+            if ev.get("object") is None and ev.get("index") in by_index:  # the object the hooks saw at that call
+                ev = {**ev, "after": by_index[ev["index"]][0], "object": by_index[ev["index"]][1]}
             result.event_observes.append(self.observe_event(turn, ev))
         res = None
         rgb = self._rgb(obs)
@@ -694,7 +707,8 @@ class BeliefEstimatorV2(BeliefEstimator):
             failed_objs.add(o)
             where = self.location_text(o, final)
             flag = f" ({self.flags[o][0]}, per Notes)" if o in self.flags else ""
-            s1.append(f"{s.text} failed: {o} is {where}{flag}. Retry the {s.op}, not the whole task")
+            state = f"{o}'s location is unknown" if where == UNKNOWN_LOCATION else f"{o} is {where}"
+            s1.append(f"{s.text} failed: {state}{flag}. Retry the {s.op}, not the whole task")
         for key, after in contradicted:
             if key[1] in failed_objs:
                 continue
@@ -809,11 +823,11 @@ class BeliefEstimatorV2(BeliefEstimator):
                 st.status, st.by = self._place_verdict(key) if key else ("pending", "")
             out.append(st)
         # A declared subtask with no matching API activity (e.g. look, or a place that never opened).
-        if decl.valid and not any(s.op == decl.op and s.obj == (decl.args[0] if decl.args else None) for s in out):
-            if decl.op == "pick" and decl.args and self.robot.get("holding") == decl.args[0]:
-                st = Subtask("pick", tuple(decl.args) if len(decl.args) == 2 else (decl.args[0], current_support(before, decl.args[0])),
-                             "done" if self.robot.get("lifted") else "active", turn, "robot", True)
-                out.append(st)
+        # A declared pick of the object the robot still holds (grasped in an earlier turn).
+        unmatched = decl.valid and not any(s.op == decl.op and s.obj == (decl.args[0] if decl.args else None) for s in out)
+        if unmatched and decl.op == "pick" and decl.args and self.robot.get("holding") == decl.args[0]:
+            args = tuple(decl.args) if len(decl.args) == 2 else (decl.args[0], current_support(before, decl.args[0]))
+            out.append(Subtask("pick", args, "done" if self.robot.get("lifted") else "active", turn, "robot", True))
         for s in out:
             if decl.valid and s.op == decl.op and s.obj == (decl.args[0] if decl.args else None):
                 s.declared = True
@@ -1012,6 +1026,8 @@ class BeliefEstimatorV2(BeliefEstimator):
             if node is not None and node.last_seen_turn is not None and node.last_seen_turn < self.turn:
                 text += f", not seen since t{node.last_seen_turn}"
             out.append(text)
+        for r, c in self.region_xy.items():  # estimated: where the front camera looks at the table
+            out.append(f"{r} (table region) at ({c[0]:.2f}, {c[1]:.2f}), radius {self.cfg.region_radius:.2f}")
         return out
 
     def render(self, signals: Sequence[Any] = (), max_chars: int = 3000, uncertain: bool = False) -> str:  # type: ignore[override]
