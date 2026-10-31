@@ -63,6 +63,9 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 1m. VDM 호출의 usage(토큰)도 all_responses 에 기록 (지금은 coding 모델만).
 2d. [예정] bg_oracle ablation: 좌표 제거(관계만) / 목표를 LLM 파싱으로 / 신호 끄기 — 메모리 조건 파일럿에서 bg_oracle 효과가
     단순 과제(t0·t1·t3)·지시 모호 과제(t7)에 몰려 정답 지각·정답 목표 효과와 기억 구조 효과를 분리해야 함.
+2e. [제안] bg_est v2 (설계: 아티팩트 XzQETnjANdUKkPtccTV8bS 「추정 BG 설계」 탭): 하위 작업 층(pick/place/put_in/place_region 연산자,
+    handempty·near·above·lifted predicate, 하위 작업 단위 S1·S2, 새 S3), belief_trace.jsonl 구조화 저장, 목표 파싱을 시점 명시 공간 서술로,
+    보임 모델(시야·팔 가림), 교란 ×0.8. 근거: bg_oracle S2 다음 턴 진전 20/121(17%), 실패의 2/3 가 조작 실패, B1K 설계와의 차이.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
