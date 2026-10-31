@@ -1,5 +1,18 @@
 # cap-bg EXPERIMENTS
 
+## 20261101_bgest2_smoke (2026-11-01) — 미통과 (task_08 cream cheese 검출 실패), 그 외 통과
+- 실행: kubectl baccus_cap-bg, bg d72231a, 18:55–19:36 UTC. task_06·task_02·task_08 × 2, memory_mode=bg_est2, 실제 SAM3. 6 trial 모두 과제 실패.
+- 기준 (baccus 보고 원문): 크래시 0 ✓ · turn 0 검출 수 t06 2/2 ✓, t02 2/2 ✓, t08 0/2 ✗ (cream cheese 를 "cream cheese box" 로 한 번도 못 찾음) ·
+  goal_match_normalized t06 2/2 ✓ (v1 누적 표기 문제 해결), t02 2/2 ✓, t08 ✗ (검출 목록에 cheese 가 없어 목표 파싱이 unknown object 로 거부) ·
+  누출 0 ✓ · Observe 파싱 100% ✓ · belief_trace 6/6 ✓.
+- 보고 항목: 선언 비율 t06 5/5·10/10, t02 6/6·6/6, t08 0/6·1/7. Effect 정답 t06 1/5·14/16, t02 6/8·2/4. 하위 작업 판정 정답 t06 3/4·4/10, t02 2/3·0/3.
+  Observe 정확도(그림자) 약 97%, ? 1회. 목표 술어 정확도 t06 20/20·39/40, t02 6/6·5/6. 진행 오차 t06 0·1, t02 3·2. 이름 뒤바뀜 0.
+  신호 [발동, 정답]: S1 [2,2][7,3][3,1][3,2][0,0][3,3], S2 전부 정답, S4 [1,0][0,0][2,2], S5b [1,0] (t06 tr2 오발동), S5a [1,1]×2 (t02).
+  추가 호출: Observe 턴당 1 (Qwen 출력 3k–36k 토큰/trial), SAM3 14–24회/trial, goal parse 1–2회.
+- 판단: v1 문제(누적 표기·진행 오차)는 해결. 10×5 를 막는 것은 지각 어휘 하나 → SAM3 프롬프트 탐색 후 범주별 프롬프트 목록 + 재검출 로직 추가, t08·t09 재-smoke.
+  참고로 볼 것: Effect 정답률·하위 작업 판정 정확도가 trial 에 따라 낮음(t06 tr1 1/5, tr2 4/10), S5b 오발동 1.
+- 산출물(kubectl PVC): outputs/capbg_bg_est2_smoke/, logs/20261101_bgest2_smoke/
+
 ## eval_observe (2026-11-01) — keep: VDM Observe 오프라인 정확도
 - 실행: kubectl baccus_cap-bg, CPU OSMesa, 코드 exp/bg-est2 fa342b4 (scripts/eval_observe.py). LIBERO-Mem t2·6·7·8·9 × 8 = 장면 40, 진술 440.
   조건: init 10, arm 10, normal 6, tilted 3, table 5, in_basket 4, basket_center 2 (생성 보고 기준).
