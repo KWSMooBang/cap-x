@@ -1,5 +1,15 @@
 # cap-bg EXPERIMENTS
 
+## 20261101_bgest2_vocab_smoke (2026-11-01) — 통과, 단 t06 Observe 회귀 → 10×5 중단·진단
+- 실행: kubectl baccus_cap-bg, bg d16ede4 (SAM3 프롬프트 후보 + 재검출), 20:41–21:24 UTC, t06·t08·t09 × 2, 6 trial 모두 과제 실패.
+- 결과 (baccus 보고 원문): 크래시 0 · 누출 0 · Observe 파싱 실패 0 · belief_trace 6/6.
+  t08·t09: turn 0 검출 3/3 (cream cheese "small blue box", 재검출 0), cheese 표식 위치가 프레임의 파란 상자와 일치, goal_match(·normalized) True,
+  목표 술어 20/20·12/12·24/24·20/20, 진행 오차 0, Observe 답한 것 전부 정답. turn 0 의 (at cream_cheese center) 1건 불일치.
+  t06: 검출 5/5 (plate "saucer", bowl "bowl"), goal_match True 2/2. 그러나 Observe on(진실 1) 정답 3/10·8/10 (앞 smoke 10/11·17/18),
+  목표 술어 17/24·14/16, 진행 오차 7·6, S5b 오발동 2·1.
+- 판단: 기준상 통과였지만 t06 회귀(접시 프롬프트 변경 의심)가 S5b 오발동으로 이어져, 21:27 UTC 에 시작한 20261101_mem10x5_bgest2 를 바로 중단하고
+  표식 위치 진단 → 필요 시 plate 1순위 복귀 → t06 smoke → 10×5 재시작.
+
 ## sam3_prompt_probe (2026-11-01) — keep: SAM3 범주 프롬프트 선택
 - 실행: kubectl baccus_cap-bg, GPU pod 1개, agentview RGB 800×512, LIBERO-Mem task 0–9 × trial 1·2 = 20장, 정답 = problem.objects_dict, 판정 = Sam3PerceptionSource 규칙(점수 ≥0.4, IoU >0.5 중복 제거).
 - 결과 (baccus 보고 원문, '정답 개수와 정확히 맞은 장면 / 범주가 있는 장면', 평균 점수):
