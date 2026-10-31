@@ -4,6 +4,9 @@ Built on the v1 estimator (``estimator.py``: tracks, data association, geometry,
 step counting) with these changes (design: /outputs/cap-bg/tasks/bg-est2-design.md, sections 3-4):
 
 * Marks (``som.py``): every track has a mark (A, B, ... / 1, 2, ...) drawn at its image center.
+  Image 2 (now) draws only the tracks SAM3 detected this turn ('Marks now' lists the rest as not
+  detected), and no mark of an object other than the held one near the fingertip's pixel (the arm
+  covers that spot; listed as 'under the gripper').
 * Observe (``observe.py``) replaces v1's verification VDM: M2 once at the start (all candidate
   on / in relations), M5 at the end of every turn (at most ``observe_max_statements``: declared
   Effects, the moved / declared objects' relations, goal-relevant predicates). 1 / 0 -> P 0.9 / 0.1
@@ -17,12 +20,15 @@ step counting) with these changes (design: /outputs/cap-bg/tasks/bg-est2-design.
   as at(o, r), judged from the distance to the region center.
 * Subtasks (``subtasks.py``): goal steps expanded into pick / place / put_in / place_region.
 * Fusion priority: robot > Observe (vdm) > [geometry only when Observe failed] > expected > memory.
-  An Observe 1 for on / in whose objects are more than 2 support radii apart -> P 0.5 + S4; Notes
-  about a tilted / fallen object or a wrong mark -> that object's observed relations P 0.5 + S4.
+  Geometric veto: an Observe 1 for on / in (both objects detected now) whose geometry shows the object
+  is not resting flat (d_xy > support radius + 0.5 cm, or dz > the pair's flat dz + 1 cm) -> P 0.5,
+  source conflict, logged (``vetoes``), S4 ("may be resting on the rim"); it stays uncertain until the
+  key is observed again. Observe 0 vs geometry On: Observe wins (unchanged). Notes about a tilted /
+  fallen object or a wrong mark -> that object's observed relations P 0.5 + S4.
 * Steps: counted from hook snapshots like v1; confirmed only by an observation (Observe / robot);
   declaration + API only -> pending; Observe 0 -> withdrawn + S1.
 * Signals: S1 (declared Effect vs Observe, failed subtask, grasp lost), S2 (no step AND no subtask
-  progress), S3 (next subtask's precondition false), S4 (? twice in a row, geometric anomaly, Notes,
+  progress), S3 (next subtask's precondition false), S4 (? twice in a row, geometric veto, Notes,
   unconfirmed counts), S5 (suppressed while anything is pending / uncertain).
 * Vocabulary (``perception.VOCABULARY_V2``): per category an ordered list of SAM3 prompts. Turn 0: a
   category with no detection under its prompt is re-detected with the next candidates (instruction /
@@ -77,7 +83,7 @@ from .perception import (
 from .progress import Pred, Progress, Step
 from .prompts_v2 import marks_now_text, observe_initial_prompt, observe_turn_prompt
 from .signals import Uncertain, Violation
-from .som import MarkTable, draw_marks, is_support, spread_marks
+from .som import MarkTable, draw_marks, is_support, mark_radius, spread_marks
 from .subtasks import PLACE_OPS, Subtask, SubtaskLog, current_support, expand_step
 from .verify import encode_png
 
@@ -100,7 +106,18 @@ class Est2Config(EstConfig):
     observe_max_initial: int = 20  # M2 statements at the start
     p_robot: float = 0.97
     above_min_dz: float = 0.05  # m: fingertips this far above a support (and within its radius) -> above
-    anomaly_factor: float = 2.0  # Observe on=1 with the objects more than this many support radii apart -> P 0.5
+    # Geometric veto of an Observe 1 for on / in (both objects detected now): "not resting flat" when
+    # d_xy > support radius + veto_xy_margin, or dz (center height difference) > the pair's flat dz +
+    # veto_dz_margin -> P 0.5, source conflict, S4. Replaces the 2-radii anomaly rule; anomaly_factor
+    # now only picks the S4 wording (beyond it: a mark may be on the wrong object; within: the rim).
+    veto: bool = True
+    veto_xy_margin: float = 0.005  # m
+    veto_dz_margin: float = 0.010  # m
+    # "<object category>/<support category>" -> center dz of the object resting flat (m). Pairs not listed
+    # use the dz measured at their first accepted Observe 1 (no dz check before that).
+    flat_dz: dict[str, float] = field(default_factory=lambda: {"bowl/plate": 0.018})
+    anomaly_factor: float = 2.0
+    gripper_mark_radii: float = 2.5  # image 2: no mark (except the held object's) this close to the fingertip pixel
     region_radius: float = 0.10  # m: at(o, region) when o's center is this close (xy) to the region center
     region_center: tuple[float, float] | None = None  # base-frame xy; None: camera axis meets the table
     unseen_turns: int = 2  # the same goal-relevant key answered ? this many turns in a row -> S4
@@ -116,7 +133,8 @@ class EstTurn2(EstTurn):
     observe: dict[str, Any] | None = None
     statements: list[str] = field(default_factory=list)
     judged: list[dict[str, Any]] = field(default_factory=list)
-    anomalies: list[dict[str, Any]] = field(default_factory=list)
+    vetoes: list[dict[str, Any]] = field(default_factory=list)  # Observe 1 vetoed by geometry (the conflict log)
+    marks_hidden: dict[str, list[str]] = field(default_factory=dict)  # image 2: "not_detected" / "near_gripper" aliases
     notes_flags: dict[str, str] = field(default_factory=dict)
     s1_items: list[str] = field(default_factory=list)
     s3_items: list[str] = field(default_factory=list)
@@ -133,7 +151,7 @@ class EstTurn2(EstTurn):
     def to_log(self) -> dict[str, Any]:
         out = super().to_log()
         out.update(declaration=self.declaration, observe=self.observe, statements=self.statements,
-                   judged=self.judged, anomalies=self.anomalies, notes_flags=self.notes_flags,
+                   judged=self.judged, vetoes=self.vetoes, marks_hidden=self.marks_hidden, notes_flags=self.notes_flags,
                    s1_items=self.s1_items, s3_items=self.s3_items, s4_items=self.s4_items,
                    subtask_progress=self.subtask_progress, robot_conflicts=self.robot_conflicts,
                    facts=self.facts, fallback=self.fallback, event_observes=self.event_observes,
@@ -151,6 +169,18 @@ def pred_stmt(p: Pred) -> str:
 
 def step_stmt(step: Step) -> str:
     return " and ".join(pred_stmt(p) for p in step)
+
+
+def flat_veto(d_xy: float, r: float, dz: float | None, flat_dz: float | None,
+              xy_margin: float = 0.005, dz_margin: float = 0.010) -> list[str]:
+    """Why the geometry says the object is not resting flat on / in its support: ``"d_xy"`` (center
+    beyond the support radius + margin) and / or ``"dz"`` (higher than lying flat + margin). Empty: no veto."""
+    out = []
+    if d_xy > r + xy_margin:
+        out.append("d_xy")
+    if dz is not None and flat_dz is not None and dz > flat_dz + dz_margin:
+        out.append("dz")
+    return out
 
 
 class BeliefEstimatorV2(BeliefEstimator):
@@ -173,13 +203,16 @@ class BeliefEstimatorV2(BeliefEstimator):
         self.key_seen: dict[EdgeKey, int] = {}
         self.obs_now: dict[EdgeKey, str] = {}  # this turn's Observe values
         self.flags: dict[str, tuple[str, str]] = {}  # alias -> (kind, note) from this turn's Notes
-        self.anomaly_keys: set[EdgeKey] = set()
+        self.anomaly_keys: set[EdgeKey] = set()  # uncertain now: vetoed (``veto``) + flagged by Notes
+        self.veto: dict[EdgeKey, dict[str, Any]] = {}  # vetoed keys not observed since -> the veto record
+        self.flat_measured: dict[str, float] = {}  # unlisted category pair -> dz at its first accepted Observe 1
         self.subtasks = SubtaskLog()
         self.decl: Declaration | None = None
         self.last_observe: ObserveResult | None = None
         self.last_marked: str | None = None  # data URL of the last marked image (M5 image 1)
         self.pixels: dict[str, tuple[float, float]] = {}
         self.seen: set[str] = set()
+        self.marked_now: set[str] = set()  # aliases with a mark in the last turn image
         self.robot: dict[str, Any] = {}
         self.count_turn: dict[int, int] = {}
         self.last2: EstTurn2 | None = None
@@ -254,21 +287,62 @@ class BeliefEstimatorV2(BeliefEstimator):
                 out[a] = px
         return out
 
-    def _marked(self, rgb: np.ndarray, aliases: Sequence[str]) -> tuple[str | None, list[tuple[str, str, tuple[float, float]]]]:
-        """Data URL of ``rgb`` with the marks of ``aliases`` (those with a pixel inside the image)."""
+    def _gripper_pixel(self, obs: dict[str, Any]) -> tuple[float, float] | None:
+        """The fingertip's projection into the front camera (None without proprio / camera)."""
+        cam, proprio = self._cam(obs), proprio_from_obs(obs)
+        if cam is None or proprio is None:
+            return None
+        return project_to_pixel(proprio[0], cam[0], cam[1])
+
+    def _held_now(self) -> str | None:
+        return self.robot.get("holding") or self.held
+
+    def _marked(self, rgb: np.ndarray, aliases: Sequence[str], grip_px: tuple[float, float] | None = None,
+                hidden: dict[str, list[str]] | None = None) -> tuple[str | None, list[tuple[str, str, tuple[float, float]]]]:
+        """Data URL of ``rgb`` with the marks of ``aliases`` (the tracks detected in this image, with a pixel
+        inside it). With ``grip_px`` (the fingertip pixel), no mark of an object other than the held one is
+        drawn within ``gripper_mark_radii`` mark radii of it: the arm covers that spot, and a mark there
+        reads as the gripper (or what it holds). ``hidden`` collects the aliases left out and why."""
         h, w = rgb.shape[0], rgb.shape[1]
-        shown = []
+        near = self.cfg.gripper_mark_radii * mark_radius(rgb.shape)
+        held = self._held_now()
+
+        def by_gripper(a: str, px: tuple[float, float]) -> bool:
+            return (grip_px is not None and a != held
+                    and (px[0] - grip_px[0]) ** 2 + (px[1] - grip_px[1]) ** 2 < near ** 2)
+
+        shown, gone = [], {"not_detected": [], "near_gripper": []}
         for m, a in self.marks.ordered():
             px = self.pixels.get(a)
-            if a in aliases and px is not None and 0 <= px[0] < w and 0 <= px[1] < h:
+            if a not in aliases:
+                gone["not_detected"].append(a)
+            elif px is None or not (0 <= px[0] < w and 0 <= px[1] < h):
+                gone["not_detected"].append(a)  # outside the image: not visible now
+            elif by_gripper(a, px):
+                gone["near_gripper"].append(a)
+            else:
                 shown.append((m, a, px))
         spread = spread_marks([(m, px) for m, _, px in shown], rgb.shape)  # readable
-        shown = [(m, a, p) for (m, a, _), (_, p) in zip(shown, spread, strict=True)]
-        img = draw_marks(rgb, spread)
+        placed = []
+        for (m, a, _), (_, p) in zip(shown, spread, strict=True):
+            if by_gripper(a, p):  # spread onto the arm
+                gone["near_gripper"].append(a)
+            else:
+                placed.append((m, a, p))
+        if hidden is not None:
+            hidden.clear()
+            hidden.update({k: v for k, v in gone.items() if v})
+        img = draw_marks(rgb, [(m, p) for m, _, p in placed])
         try:
-            return encode_png(img), shown
+            return encode_png(img), placed
         except Exception:
-            return None, shown
+            return None, placed
+
+    def _marks_now(self, shown: Sequence[tuple[str, str, tuple[float, float]]], hidden: dict[str, list[str]]) -> str:
+        mark = self.marks.mark
+        return marks_now_text([(m, a, px) for m, a, px in shown],
+                              [mark(a) or a for a in hidden.get("not_detected", [])],
+                              [mark(a) or a for a in hidden.get("near_gripper", [])])
 
     def _assign_marks(self) -> None:
         for a in self.aliases:
@@ -446,6 +520,9 @@ class BeliefEstimatorV2(BeliefEstimator):
             elif e is not None:
                 self.graph.set_expected(key, turn, holds=e[0])
                 origin = "exp"
+            elif key in self.veto:  # vetoed earlier and not observed since: still uncertain
+                self.graph.edges[key].source = "conflict"
+                origin = "conflict"
             elif key in self.graph.edges:
                 edge = self.graph.edges[key]
                 if edge.source != "prior":
@@ -472,19 +549,53 @@ class BeliefEstimatorV2(BeliefEstimator):
                 self.graph.edges[other].source = "mem"
                 self.origin[other] = "excl"
 
+    def _pair(self, key: EdgeKey) -> str:
+        return f"{self.tracks[key[1]].category.key}/{self.tracks[key[2]].category.key}"
+
+    def _flat_dz(self, key: EdgeKey) -> tuple[float | None, str]:
+        """The pair's flat dz and where it comes from (config table / first accepted observation)."""
+        pair = self._pair(key)
+        if pair in self.cfg.flat_dz:
+            return float(self.cfg.flat_dz[pair]), "config"
+        if pair in self.flat_measured:
+            return self.flat_measured[pair], "measured"
+        return None, "none"
+
     def _anomalies(self, turn: int, values: dict[EdgeKey, str], seen: set[str], result: EstTurn2) -> None:
-        """Observe on/in = 1 while the two objects are far apart (both seen now): the mark may be wrong."""
-        self.anomaly_keys = set()
+        """Geometric veto: an Observe 1 for on / in (both objects detected now) is not accepted when the
+        geometry shows the object is not resting flat (``flat_veto``): P 0.5, source conflict, logged.
+        A vetoed key stays uncertain until it is observed again (or lowered by another location)."""
+        cfg = self.cfg
+        for key in list(self.veto):
+            e = self.graph.edges.get(key)
+            if e is None or self.origin.get(key) != "conflict" or e.p < 0.5:
+                self.veto.pop(key)
         for key, v in values.items():
             if v != "1" or key[0] not in ("on", "in") or key[2] in (None, TABLE) or key[2] not in self.tracks:
                 continue
-            if key[1] not in seen or key[2] not in seen:
+            if key[1] not in seen or key[2] not in seen or not cfg.veto:
                 continue
             g = self._geom(key) or {}
-            if g.get("d_xy", 0.0) > self.cfg.anomaly_factor * self._radius(key[2]):
-                self.graph.set_edge(key, 0.5, "obs", turn)
-                self.anomaly_keys.add(key)
-                result.anomalies.append({"key": key_text(key), **g})
+            if "d_xy" not in g:
+                continue
+            flat, flat_src = self._flat_dz(key)
+            why = flat_veto(g["d_xy"], g["r"], g.get("dz"), flat, cfg.veto_xy_margin, cfg.veto_dz_margin)
+            if not why:
+                pair = self._pair(key)
+                if flat is None and "dz" in g:  # first accepted Observe 1 of an unlisted pair: its flat dz
+                    self.flat_measured[pair] = float(g["dz"])
+                continue
+            kind = "apart" if g["d_xy"] > cfg.anomaly_factor * g["r"] else "rim"
+            rec = {"turn": turn, "key": key_text(key), "pred": list(key), "observe": v, **g,
+                   "flat_dz": None if flat is None else round(flat, 3), "flat_dz_source": flat_src,
+                   "xy_limit": round(g["r"] + cfg.veto_xy_margin, 3),
+                   "dz_limit": None if flat is None else round(flat + cfg.veto_dz_margin, 3),
+                   "why": why, "kind": kind}
+            self.graph.set_edge(key, 0.5, "conflict", turn)
+            self.origin[key] = "conflict"
+            self.veto[key] = rec
+            result.vetoes.append(rec)
+        self.anomaly_keys = set(self.veto)
 
     def _apply_notes(self, turn: int, res: ObserveResult | None, values: dict[EdgeKey, str], result: EstTurn2) -> None:
         self.flags = {}
@@ -674,6 +785,8 @@ class BeliefEstimatorV2(BeliefEstimator):
             self.origin.clear()
             self.key_seen.clear()
             self.q_streak.clear()
+            self.veto.clear()
+            self.flat_measured.clear()
             result = self._initial_belief(obs, proprio, result.detections + len(found))
             self.goal = self._parse_goal()
             self.goal.attempts += first.attempts
@@ -707,6 +820,7 @@ class BeliefEstimatorV2(BeliefEstimator):
         if rgb is not None:
             image, shown = self._marked(rgb, self.aliases)
             self.last_marked = image
+            self.marked_now = {a for _, a, _ in shown}
             if self.observer is not None and image is not None:
                 marks = [(m, a, self.tracks[a].category.prompt, px) for m, a, px in shown]
                 prompt = observe_initial_prompt(instruction, image, marks, [statement_text(k) for k in statements])
@@ -805,11 +919,14 @@ class BeliefEstimatorV2(BeliefEstimator):
         rgb = self._rgb(obs)
         image_before = self.last_marked
         if rgb is not None:
-            image, shown = self._marked(rgb, sorted(seen))
+            # Only the tracks SAM3 detected now get a mark (not their remembered position), and none on the arm.
+            hidden: dict[str, list[str]] = {}
+            image, shown = self._marked(rgb, sorted(seen), self._gripper_pixel(obs), hidden)
             self.last_marked = image
+            self.marked_now = {a for _, a, _ in shown}
+            result.marks_hidden = hidden
             if self.observer is not None and image is not None and statements:
-                missing = [m for m, a in self.marks.ordered() if a not in {s[1] for s in shown}]
-                marks_now = marks_now_text([(m, a, px) for m, a, px in shown], missing)
+                marks_now = self._marks_now(shown, hidden)
                 declared = (decl.subtask_text, decl.effect_text or "none") if decl.valid else None
                 prompt = observe_turn_prompt(self.instruction, image_before, image, marks_now, declared,
                                              [statement_text(k) for k in statements])
@@ -927,12 +1044,12 @@ class BeliefEstimatorV2(BeliefEstimator):
         if ev.get("after") == "open_gripper":
             keys += [self._rel_key(o, s) for s in self.supports() if s != o][: self.cfg.observe_max_statements - 2]
             keys.append(("on", o, TABLE))
-        image, shown = self._marked(np.asarray(ev["rgb"]), self.aliases)
+        hidden: dict[str, list[str]] = {}
+        image, shown = self._marked(np.asarray(ev["rgb"]), sorted(self.seen), None, hidden)  # detected now only
         if image is None:
             out["skipped"] = True
             return out
-        missing = [m for m, a in self.marks.ordered() if a not in {s[1] for s in shown}]
-        prompt = observe_turn_prompt(self.instruction, None, image, marks_now_text([(m, a, px) for m, a, px in shown], missing),
+        prompt = observe_turn_prompt(self.instruction, None, image, self._marks_now(shown, hidden),
                                      None, [statement_text(k) for k in keys])
         res = self.observer.observe("event", prompt, keys, self.aliases)
         for k, v in res.parse.values.items():
@@ -1074,6 +1191,8 @@ class BeliefEstimatorV2(BeliefEstimator):
         for j in sorted(self.pending):
             step = self.counter.done[j]
             key = _pred_key(step[0])
+            if key in self.veto:  # vetoed by geometry: reported below with the reason (S4 now, not after 2 turns)
+                continue
             prob, src, seen = self.pred_belief(step[0])
             out.append(Uncertain(f"{step_stmt(step)} (step {j + 1}, counted from the API calls, not yet seen)",
                                  prob, src, seen, "unconfirmed", key))
@@ -1101,11 +1220,14 @@ class BeliefEstimatorV2(BeliefEstimator):
                 kind, note = self.flags[a]
                 out.append(Uncertain(key_text(key), e.p if e else 0.5, "vdm", self.key_seen.get(key), "notes", key))
                 texts.append(f"{key_text(key)}: {a} may be {kind} (Notes: {note}) — look again before relying on it")
-            else:
-                g = self._geom(key) or {}
-                out.append(Uncertain(key_text(key), e.p if e else 0.5, "vdm", self.key_seen.get(key), "anomaly", key))
-                texts.append(f"{key_text(key)} was answered 1 but {key[1]} and {key[2]} are {g.get('d_xy', 0):.2f} m "
-                             "apart in the estimate — a mark may be on the wrong object; look again")
+            elif key in self.veto:
+                rec = self.veto[key]
+                out.append(Uncertain(key_text(key), e.p if e else 0.5, "conflict", self.key_seen.get(key), "veto", key))
+                if rec["kind"] == "apart":
+                    texts.append(f"{key_text(key)} was answered 1 but {key[1]} and {key[2]} are {rec['d_xy']:.2f} m "
+                                 "apart in the estimate — a mark may be on the wrong object; look again")
+                else:
+                    texts.append(f"{key_text(key)}: {key[1]} may be resting on the rim of {key[2]} (tilted), not on it")
             flagged.add(key)
         for a, (kind, note) in self.flags.items():
             if not any(u.key and u.key[1] == a for u in out):
@@ -1304,6 +1426,7 @@ class BeliefEstimatorV2(BeliefEstimator):
                 "obs": self.origin.get(key) in OBSERVED_ORIGINS and self.key_seen.get(key) == self.turn,
                 "observe": self.obs_now.get(key), "last_seen_turn": self.key_seen.get(key),
                 "geom": self._geom(key),
+                "veto": self.veto.get(key),
             }
         return out
 
@@ -1318,7 +1441,8 @@ class BeliefEstimatorV2(BeliefEstimator):
                         "size": [round(float(v), 4) for v in t.size],
                         "last_seen": node.last_seen_turn if node else None,
                         "pixel": [round(px[0], 1), round(px[1], 1)] if px else None,
-                        "seen_now": a in self.seen, "flag": self.flags.get(a, (None,))[0]}
+                        "seen_now": a in self.seen, "marked_now": a in self.marked_now,
+                        "flag": self.flags.get(a, (None,))[0]}
         steps = [{"i": i, "step": step_stmt(s), "status": "pending" if i in self.pending else "confirmed",
                   "by": self.confirmed_by.get(i), "turn": self.count_turn.get(i)}
                  for i, s in enumerate(self.counter.done)]
@@ -1338,6 +1462,7 @@ class BeliefEstimatorV2(BeliefEstimator):
             "cot": self.cot,
             "prompts": self.prompts(),
             "redetects": self.redetect_log,
+            "vetoes": {key_text(k): v for k, v in self.veto.items()},  # vetoed keys still uncertain
             "est": r.to_log() if r is not None else None,
         }
 

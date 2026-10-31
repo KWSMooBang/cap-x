@@ -335,7 +335,7 @@ def test_geometric_anomaly_and_robot_priority():
     est, rec, vdm, _, _ = setup(world, SWAP2_GOAL, SWAP)
     vdm.sticky = {"(on bowl_A plate_C)": "1", "(inhand bowl_A)": "1"}  # bowl_A is still on plate_A
     r = turn(est, world, rec, 1, declared("place(bowl_A, plate_C)", "(on bowl_A plate_C) 0>1 | (inhand bowl_A) 1>0", "..."))
-    assert est.graph.edges[("on", "bowl_A", "plate_C")].p == 0.5 and r.anomalies
+    assert est.graph.edges[("on", "bowl_A", "plate_C")].p == 0.5 and r.vetoes and r.vetoes[0]["kind"] == "apart"
     assert est.graph.edges[("inhand", "bowl_A", None)].p == pytest.approx(0.03) and r.robot_conflicts
     assert "S4" in signals(est, r) and any("mark may be on the wrong object" in t for t in r.s4_items)
     assert len(r.progress.done) == 0
