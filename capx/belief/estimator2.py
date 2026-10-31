@@ -24,10 +24,19 @@ step counting) with these changes (design: /outputs/cap-bg/tasks/bg-est2-design.
 * Signals: S1 (declared Effect vs Observe, failed subtask, grasp lost), S2 (no step AND no subtask
   progress), S3 (next subtask's precondition false), S4 (? twice in a row, geometric anomaly, Notes,
   unconfirmed counts), S5 (suppressed while anything is pending / uncertain).
+* Vocabulary (``perception.VOCABULARY_V2``): per category an ordered list of SAM3 prompts. Turn 0: a
+  category with no detection under its prompt is re-detected with the next candidates (instruction /
+  goal categories first) until one finds something. Later turns: a category with no detection for
+  ``redetect_turns`` turns in a row tries its next untried candidate once. A goal parse rejected for an
+  unknown object -> the instruction's undetected categories are re-detected and, if that finds a new
+  object, the initial belief is rebuilt and the goal parsed once more. Shown names stay semantic
+  (``Category.prompt``); the SAM3 prompt in use is logged (``prompts``, ``redetects``).
 """
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,13 +54,21 @@ from .estimator import (
     StepCounter,
     _pred_key,
 )
-from .goal import GoalResult, goal_preds, parse_goal_llm_v2, regions_in, scene_lines_v2
+from .goal import (
+    GoalResult,
+    goal_preds,
+    parse_goal_llm_v2,
+    regions_in,
+    scene_lines_v2,
+    unknown_objects,
+)
 from .graph import EdgeKey, format_location
 from .hooks import CallRecord
 from .observe import ObserveResult, VdmObserver, note_flags, statement_text
 from .perception import (
-    VOCABULARY,
+    VOCABULARY_V2,
     Category,
+    Detection,
     PerceptionSource,
     categories_from_instruction,
     project_to_pixel,
@@ -90,6 +107,7 @@ class Est2Config(EstConfig):
     pending_turns: int = 2  # a counted step unconfirmed for this many turns -> S4
     max_belief_items: int = 12
     event_frames: bool = False  # extra Observe on recorded frames right after gripper close / open
+    redetect_turns: int = 2  # a category with no detection this many turns in a row tries its next SAM3 prompt
 
 
 @dataclass
@@ -108,6 +126,9 @@ class EstTurn2(EstTurn):
     facts: dict[str, Any] = field(default_factory=dict)
     fallback: bool = False  # Observe failed: geometry only
     event_observes: list[dict[str, Any]] = field(default_factory=list)
+    prompts: dict[str, str] = field(default_factory=dict)  # category -> SAM3 prompt in use after this turn
+    redetects: list[dict[str, Any]] = field(default_factory=list)  # re-detections tried this turn
+    goal_retry: dict[str, Any] | None = None  # turn 0: goal re-parse after an unknown-object rejection
 
     def to_log(self) -> dict[str, Any]:
         out = super().to_log()
@@ -115,7 +136,8 @@ class EstTurn2(EstTurn):
                    judged=self.judged, anomalies=self.anomalies, notes_flags=self.notes_flags,
                    s1_items=self.s1_items, s3_items=self.s3_items, s4_items=self.s4_items,
                    subtask_progress=self.subtask_progress, robot_conflicts=self.robot_conflicts,
-                   facts=self.facts, fallback=self.fallback, event_observes=self.event_observes)
+                   facts=self.facts, fallback=self.fallback, event_observes=self.event_observes,
+                   prompts=self.prompts, redetects=self.redetects, goal_retry=self.goal_retry)
         return out
 
 
@@ -138,7 +160,7 @@ class BeliefEstimatorV2(BeliefEstimator):
         config: Est2Config | None = None,
         goal_query_fn: Callable[[list[dict[str, Any]]], Any] | None = None,
         observer: VdmObserver | None = None,
-        vocabulary: Sequence[Category] = VOCABULARY,
+        vocabulary: Sequence[Category] = VOCABULARY_V2,
         categories: Sequence[Category] | None = None,
     ) -> None:
         super().__init__(perception, config or Est2Config(), goal_query_fn, None, vocabulary, categories)
@@ -164,6 +186,10 @@ class BeliefEstimatorV2(BeliefEstimator):
         self.cot: dict[str, Any] = {}
         self.event_values: dict[EdgeKey, tuple[str, int, int | None]] = {}  # event Observe: key -> (value, turn, sim step)
         self._grasp_hint: str | None = None  # the object the current declaration names
+        self.tried0: dict[str, set[str]] = {}  # category -> SAM3 prompts already run on the turn-0 image
+        self.retried: dict[str, set[str]] = {}  # category -> candidates tried after turn 0
+        self.miss_streak: dict[str, int] = {}  # category -> turns in a row without a detection
+        self.redetect_log: list[dict[str, Any]] = []  # every re-detection of the trial
 
     # --- names / helpers ------------------------------------------------------------------------
     @property
@@ -481,24 +507,193 @@ class BeliefEstimatorV2(BeliefEstimator):
     def start(self, obs: dict[str, Any], instruction: str,
               goal_fn: Callable[[BeliefEstimator], GoalResult] | None = None) -> EstTurn2:
         self.instruction = instruction
-        self.categories = self.fixed_categories or categories_from_instruction(
+        cats = self.fixed_categories or categories_from_instruction(
             instruction, self.cfg.max_categories, self.vocabulary)
+        self.categories = [c.with_query(c.sam3_text) for c in cats]
         self.regions = regions_in(instruction)
         proprio = proprio_from_obs(obs)
         eef = proprio[0] if proprio else None
         if proprio is not None and proprio[1] <= self.cfg.grasp_threshold:
             self.gripper_cmd = "closed"
-        dets = self._dedup(self.perception.detect(obs, self.categories))
+        redetects: list[dict[str, Any]] = []
+        dets = self._detect0(obs, redetects)
         self._initial_tracks(dets)
         if dets:
             self.table_z = min(float(d.center[2] - 0.5 * d.size[2]) for d in dets)
         for _ in range(self.cfg.init_passes - 1):
             self._associate(self._dedup(self.perception.detect(obs, self.categories)), eef, 0)
+        result = self._initial_belief(obs, proprio, len(dets))
+
+        if goal_fn is not None:
+            self.goal = goal_fn(self)
+        elif self.goal_query_fn is not None:
+            self.goal = self._parse_goal()
+            missing = unknown_objects(self.goal)
+            if missing:
+                result = self._goal_retry(obs, proprio, missing, redetects, result)
+        result.redetects = redetects
+        result.prompts = self.prompts()
+        self.counter = StepCounter(self.goal.branches or [])
+        if self.goal.branches:
+            self.counter.feed(self.loc)
+        self.turn = 0
+        result.progress = self.counter.progress()
+        result.uncertain, result.s4_items = self._uncertain()
+        result.suppress_completion = (not result.progress.known) or bool(result.uncertain)
+        self.last2 = result
+        self.cot = self._cot(result, [])
+        return result
+
+    def _parse_goal(self) -> GoalResult:
+        return parse_goal_llm_v2(self.goal_query_fn, self.instruction, self.scene_lines(), self.aliases,
+                                 dict(self.loc), regions=tuple(self.regions))
+
+    # --- SAM3 prompt candidates / re-detection --------------------------------------------------
+    def prompts(self) -> dict[str, str]:
+        """Category -> the SAM3 prompt in use (logs only, never a model prompt)."""
+        return {c.key: c.sam3_text for c in self.categories}
+
+    def _priority(self, cats: Sequence[Category]) -> list[Category]:
+        """Categories named in the instruction or the goal first (stable otherwise)."""
+        text = self.instruction.lower()
+        goal = {self.tracks[a].category.key for p in goal_preds(self.goal.branches or []) for a in p[1:]
+                if a in self.tracks}
+        return sorted(cats, key=lambda c: not (c.key in goal or any(k in text for k in c.keywords)))
+
+    def _set_query(self, key: str, text: str) -> None:
+        self.categories = [c.with_query(text) if c.key == key else c for c in self.categories]
+        for t in self.tracks.values():
+            if t.category.key == key:
+                t.category = t.category.with_query(text)
+
+    def _detect_with(self, obs: dict[str, Any], cat: Category, text: str, turn: int, reason: str,
+                     log: list[dict[str, Any]]) -> list[Detection]:
+        """One detector run of ``cat`` with SAM3 prompt ``text``; on a hit ``text`` becomes its prompt."""
+        dets = [d for d in self.perception.detect(obs, [cat.with_query(text)]) if d.category == cat.key]
+        rec = {"turn": turn, "category": cat.key, "prompt": text, "previous": cat.sam3_text,
+               "detections": len(dets), "reason": reason}
+        log.append(rec)
+        self.redetect_log.append(rec)
+        if dets:
+            self._set_query(cat.key, text)
+        return dets
+
+    def _detect0(self, obs: dict[str, Any], log: list[dict[str, Any]]) -> list[Detection]:
+        """Turn 0: each category's first prompt; a category with no detection tries its next candidates
+        (instruction / goal categories first) until one finds something (that one is kept)."""
+        dets = list(self.perception.detect(obs, self.categories))
+        for c in self.categories:
+            self.tried0.setdefault(c.key, set()).add(c.sam3_text)
+        counts = Counter(d.category for d in dets)
+        for cat in self._priority(self.categories):
+            if counts[cat.key]:
+                continue
+            for text in cat.candidates:
+                if text in self.tried0[cat.key]:
+                    continue
+                self.tried0[cat.key].add(text)
+                found = self._detect_with(obs, cat, text, 0, "turn0_none", log)
+                if found:
+                    dets += found
+                    break
+        return self._dedup(dets)
+
+    def _redetect(self, obs: dict[str, Any], dets: list[Detection], turn: int,
+                  log: list[dict[str, Any]]) -> list[Detection]:
+        """Later turns: a category without any detection ``redetect_turns`` turns in a row tries its next
+        untried candidate once (the streak restarts either way)."""
+        counts = Counter(d.category for d in dets)
+        extra: list[Detection] = []
+        for cat in self._priority(self.categories):
+            if counts[cat.key]:
+                self.miss_streak[cat.key] = 0
+                continue
+            self.miss_streak[cat.key] = self.miss_streak.get(cat.key, 0) + 1
+            if self.miss_streak[cat.key] < self.cfg.redetect_turns:
+                continue
+            self.miss_streak[cat.key] = 0
+            tried = self.retried.setdefault(cat.key, set())
+            text = next((p for p in cat.candidates if p != cat.sam3_text and p not in tried), None)
+            if text is None:
+                continue
+            tried.add(text)
+            extra += self._detect_with(obs, cat, text, turn, f"none_{self.cfg.redetect_turns}_turns", log)
+        return self._dedup(dets + extra) if extra else dets
+
+    def _missing_categories(self, names: Sequence[str]) -> list[Category]:
+        """Undetected categories behind a goal rejection: those of the rejected names, then the
+        instruction's (all of them, not only the first ``max_categories``) without a track."""
+        have = {t.category.key for t in self.tracks.values()}
+        out: list[Category] = []
+        for n in names:
+            text = re.sub(r"[_\s]+[a-z0-9]$", "", n.lower().strip()).replace("_", " ")
+            for c in self.vocabulary:
+                if c.key.replace("_", " ") in text or any(k in text for k in c.keywords):
+                    out.append(c)
+                    break
+        out += categories_from_instruction(self.instruction, len(self.vocabulary), self.vocabulary)
+        seen: set[str] = set()
+        res = []
+        for c in out:
+            if c.key in have or c.key in seen:
+                continue
+            seen.add(c.key)
+            res.append(next((x for x in self.categories if x.key == c.key), c.with_query(c.sam3_text)))
+        return res
+
+    def _goal_retry(self, obs: dict[str, Any], proprio: tuple[np.ndarray, float] | None,
+                    names: Sequence[str], log: list[dict[str, Any]], result: EstTurn2) -> EstTurn2:
+        """The goal LLM rejected an object that is not in the detections: re-detect the missing
+        categories with the candidates not yet run on this image; if that finds an object, rebuild the
+        initial belief (one more M2 Observe) and parse the goal once more."""
+        missing = self._missing_categories(names)
+        info: dict[str, Any] = {"unknown": list(names), "categories": [c.key for c in missing],
+                                "new_tracks": [], "retried": False}
+        found: list[Detection] = []
+        for cat in missing:
+            if all(c.key != cat.key for c in self.categories):
+                self.categories.append(cat)
+            tried = self.tried0.setdefault(cat.key, set())
+            for text in cat.candidates:
+                if text in tried:
+                    continue
+                tried.add(text)
+                dets = self._detect_with(obs, cat, text, 0, "goal_unknown_object", log)
+                if dets:
+                    found += dets
+                    break
+        if found:
+            before = set(self.tracks)
+            self._initial_tracks(self._dedup(found))
+            info["new_tracks"] = sorted(set(self.tracks) - before)
+            if self.table_z is None:
+                self.table_z = min(float(d.center[2] - 0.5 * d.size[2]) for d in found)
+            first = self.goal
+            self.graph.edges.clear()
+            self.graph.events.clear()
+            self.origin.clear()
+            self.key_seen.clear()
+            self.q_streak.clear()
+            result = self._initial_belief(obs, proprio, result.detections + len(found))
+            self.goal = self._parse_goal()
+            self.goal.attempts += first.attempts
+            self.goal.replies = first.replies + self.goal.replies
+            self.goal.errors = first.errors + self.goal.errors
+            self.goal.usage = first.usage + self.goal.usage
+            info["retried"] = True
+            info["parsed"] = self.goal.branches is not None
+        result.goal_retry = info
+        return result
+
+    def _initial_belief(self, obs: dict[str, Any], proprio: tuple[np.ndarray, float] | None,
+                        n_dets: int) -> EstTurn2:
+        """Marks, regions, the initial Observe (M2) and fusion over the current tracks."""
+        instruction = self.instruction
         self._assign_marks()
         self._region_setup(obs)
         self.seen = set(self.tracks)
         self.pixels = self._compute_pixels(obs)
-        result = EstTurn2(0, self.counter.progress(), detections=len(dets), new_tracks=sorted(self.tracks),
+        result = EstTurn2(0, self.counter.progress(), detections=n_dets, new_tracks=sorted(self.tracks),
                           perception=self.perception_name)
 
         raw = self._observe_relations(0, set(self.tracks), proprio)
@@ -527,21 +722,6 @@ class BeliefEstimatorV2(BeliefEstimator):
         self._update_streaks(statements, values)
         self.obs_now = dict(values)
         self.loc = self._snapshot()
-
-        if goal_fn is not None:
-            self.goal = goal_fn(self)
-        elif self.goal_query_fn is not None:
-            self.goal = parse_goal_llm_v2(self.goal_query_fn, instruction, self.scene_lines(), self.aliases,
-                                          dict(self.loc), regions=tuple(self.regions))
-        self.counter = StepCounter(self.goal.branches or [])
-        if self.goal.branches:
-            self.counter.feed(self.loc)
-        self.turn = 0
-        result.progress = self.counter.progress()
-        result.uncertain, result.s4_items = self._uncertain()
-        result.suppress_completion = (not result.progress.known) or bool(result.uncertain)
-        self.last2 = result
-        self.cot = self._cot(result, [])
         return result
 
     def scene_lines(self) -> list[str]:
@@ -598,6 +778,8 @@ class BeliefEstimatorV2(BeliefEstimator):
         proprio = proprio_from_obs(obs)
         eef = proprio[0] if proprio else None
         dets = self._dedup(self.perception.detect(obs, self.categories))
+        dets = self._redetect(obs, dets, turn, result.redetects)
+        result.prompts = self.prompts()
         seen, result.new_tracks, result.unmatched_tracks, result.rematched = self._associate(dets, eef, turn)
         result.detections = len(dets)
         self._assign_marks()
@@ -1154,6 +1336,8 @@ class BeliefEstimatorV2(BeliefEstimator):
             "observe": (self.last_observe.to_dict() | {"prompt_text": self.last_observe.prompt_text})
             if self.last_observe is not None else None,
             "cot": self.cot,
+            "prompts": self.prompts(),
+            "redetects": self.redetect_log,
             "est": r.to_log() if r is not None else None,
         }
 

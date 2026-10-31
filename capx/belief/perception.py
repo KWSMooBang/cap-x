@@ -8,6 +8,9 @@ Only robot-usable inputs: the agentview RGB-D image with its intrinsics and extr
 * ``Sam3PerceptionSource`` runs a SAM3 text prompt per category on the agentview RGB image and lifts
   each instance mask with depth + intrinsics + extrinsics to 3D points in the robot base frame (the
   frame the generated code works in): center = median point, size = 5-95 percentile extent.
+* bg_est2 uses ``VOCABULARY_V2``: per category an ordered list of SAM3 prompts (``Category.prompts``,
+  the one in use ``Category.query``) measured on LIBERO-Mem renders, while ``Category.prompt`` is the
+  semantic name shown to models ("cream cheese", not "small blue box"). v1 (``VOCABULARY``) unchanged.
 * ``SimPerceptionSource`` is a FAKE detector for tests and CPU checks: simulator poses with noise,
   dropped detections and arm occlusion. It must never be used for a real evaluation; it announces
   itself loudly and memory logs record ``perception=sim_fake``.
@@ -20,7 +23,7 @@ from __future__ import annotations
 import re
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 import numpy as np
@@ -29,11 +32,28 @@ import numpy as np
 @dataclass(frozen=True)
 class Category:
     key: str  # alias base, e.g. "bowl" -> bowl_A, bowl_B
-    prompt: str  # SAM3 text prompt
+    prompt: str  # v1: SAM3 text prompt AND the name shown to models; v2 (VOCABULARY_V2): the shown name only
     keywords: tuple[str, ...]  # matched in the task language (substring, lower case)
     size: tuple[float, float, float]  # nominal extent (m), used by the fake detector only
     container: bool = False  # In(x, this) instead of On(x, this)
     sim_keys: tuple[str, ...] = ()  # fake detector only: substrings of simulator object names
+    # bg_est2 only: ordered SAM3 prompt candidates (first = best) and the one in use now. Both empty
+    # (v1 VOCABULARY): SAM3 gets ``prompt``. These strings never go into a model prompt.
+    prompts: tuple[str, ...] = ()
+    query: str = ""
+
+    @property
+    def candidates(self) -> tuple[str, ...]:
+        """SAM3 prompt candidates in order (v1: just ``prompt``)."""
+        return self.prompts or (self.prompt,)
+
+    @property
+    def sam3_text(self) -> str:
+        """The SAM3 text prompt to use now."""
+        return self.query or self.candidates[0]
+
+    def with_query(self, text: str) -> Category:
+        return replace(self, query=text)
 
 
 # Objects of LIBERO / LIBERO-Mem scenes. Order matters only for overlapping keywords (first wins).
@@ -51,6 +71,29 @@ VOCABULARY: tuple[Category, ...] = (
     Category("juice", "orange juice carton", ("juice",), (0.07, 0.07, 0.15), sim_keys=("juice",)),
     Category("tray", "tray", ("tray",), (0.30, 0.20, 0.03), container=True, sim_keys=("tray",)),
 )
+
+# bg_est2: SAM3 prompt candidates per category, best first. Measured on LIBERO-Mem agentview 800x512,
+# tasks 0-9 x 2 scenes, score >= 0.4 and mask NMS 0.5 (Sam3PerceptionSource): cream cheese renders as a
+# small blue box ("small blue box" 4/4, "blue box" 4/4, "blue package" 3/4; "cream cheese box" 0/4,
+# no false hits in 16 cheese-free scenes); "saucer" 16/16 vs "plate" 15/16 (0 when every plate is under
+# a bowl); "bowl" 16/16 vs "black bowl" 14/16; "bottle" / "wine bottle" 12/12; "basket" 4/4 vs
+# "wicker basket" 3/4. ``prompt`` stays the semantic name shown to the code agent, VDM and goal LLM.
+V2_PROMPTS: dict[str, tuple[str, ...]] = {
+    "cream_cheese": ("small blue box", "blue box", "blue package"),
+    "plate": ("saucer", "plate"),
+    "bowl": ("bowl", "black bowl"),
+    "bottle": ("bottle", "wine bottle"),
+    "basket": ("basket", "wicker basket"),
+}
+V2_NAMES: dict[str, str] = {"cream_cheese": "cream cheese"}  # shown name where v1's SAM3 prompt is not one
+
+
+def _v2(cat: Category) -> Category:
+    prompts = V2_PROMPTS.get(cat.key, (cat.prompt,))
+    return replace(cat, prompt=V2_NAMES.get(cat.key, cat.prompt), prompts=prompts, query=prompts[0])
+
+
+VOCABULARY_V2: tuple[Category, ...] = tuple(_v2(c) for c in VOCABULARY)
 
 
 def categories_from_instruction(
@@ -180,10 +223,11 @@ class Sam3PerceptionSource:
         out: list[Detection] = []
         for cat in categories:
             self.calls += 1
+            text = cat.sam3_text
             try:
-                results = self.segment_fn(rgb, text_prompt=cat.prompt) or []
+                results = self.segment_fn(rgb, text_prompt=text) or []
             except Exception as exc:  # the service is down: no detections this time
-                print(f"[bg_est] SAM3 failed for {cat.prompt!r}: {exc}", file=sys.stderr)
+                print(f"[bg_est] SAM3 failed for {text!r}: {exc}", file=sys.stderr)
                 results = []
             kept: list[dict[str, Any]] = []
             for r in sorted(results, key=lambda r: -float(r.get("score", 0.0))):
