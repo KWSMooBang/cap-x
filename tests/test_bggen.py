@@ -475,7 +475,7 @@ def test_swap_eval_two_lines(swap_run):
     for tag in ("forward", "forward+backward"):
         assert res[tag]["relations"]["accuracy"] >= 0.98
     assert res["name_consistency"]["rate"] == 1.0
-    assert res["goal_consistency"] == {"final_graph_satisfies_goal": True, "oracle_success": True}
+    assert res["goal_consistency"] == {"final_graph_satisfies_goal": True, "oracle_success": True, "goal_known": True}
     md = (out / "eval.md").read_text()
     assert "| forward |" in md and "| forward+backward |" in md
 
@@ -650,5 +650,6 @@ def test_serialize_one_hz_effect_window():
     hz = [c for c in rows if c["kind"] == "hz"]
     assert [c["sec"] for c in hz] == [0, 1, 2]
     assert hz[1]["Effect"] == "none" and hz[2]["Effect"] == "(on bowl_A plate_A) 0>1"
-    assert hz[1]["Subtask"] == "place(bowl_A, plate_A)"  # mode A: the segment's intent
+    # a row's Subtask holds from its frame on (bggen-fix2: the backward pass puts each boundary on its event row)
+    assert hz[1]["Subtask"] == r0.subtask and hz[2]["Subtask"] == "place(bowl_A, plate_A)"
     assert row_fields(r1)["Belief"].startswith("(on bowl_A plate_A) 0.90 obs")

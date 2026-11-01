@@ -81,17 +81,32 @@ def report(s: dict[str, Any], rows: list[Any], rename: dict[str, str]) -> str:
     from .serialize import row_fields, text
 
     m = s.get("models", {})
-    lines = [f"# BG generator report — {s.get('benchmark')} (mode {s.get('mode')})", "",
-             f"Instruction: {s.get('instruction')}", f"Frames: {s.get('n_frames')} at {s.get('fps')} fps; rows: {s['rows']}", "",
-             "## Events", ", ".join(f"{k} {v}" for k, v in sorted(s["events"].items())), "",
-             "## Model calls", "prompt tok = as reported by the server (real APIs include images; the FAKE server counts text only)",
-             "| role | model | calls | failures | images sent | prompt tok | completion tok | s |", "|---|---|---|---|---|---|---|---|"]
+    lines = [f"# BG generator report — {s.get('benchmark')} (mode {s.get('mode')})", ""]
+    if s.get("init_failed"):
+        lines += ["> **!!! INIT FAILED — NO GOAL !!!** " + str(s["init_failed"]),
+                  "> Goal progress, `done` and goal consistency of this run are meaningless; the initial statements",
+                  "> came from the default list. See trace line 0 (`init.replies`, `init.attempts`: finish_reason).", ""]
+    lines += [f"Instruction: {s.get('instruction')}", f"Frames: {s.get('n_frames')} at {s.get('fps')} fps; rows: {s['rows']}", "",
+              "## Events", ", ".join(f"{k} {v}" for k, v in sorted(s["events"].items())), "",
+              "## Model calls", "prompt tok = as reported by the server (real APIs include images; the FAKE server counts text only). "
+              "cut = finish_reason length; requery = asked again with the larger limit; incomplete = still cut / empty.",
+              "| role | model | calls | failures | images sent | prompt tok | completion tok | reasoning tok | cut | empty | requery | incomplete | s |",
+              "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r, u in m.items():
         lines.append(f"| {r} | {u.get('model')} | {u.get('calls')} | {u.get('failures')} | {u.get('images')} | {u.get('prompt_tokens')} | "
-                     f"{u.get('completion_tokens')} | {u.get('seconds')} |")
+                     f"{u.get('completion_tokens')} | {u.get('reasoning_tokens')} | {u.get('cut')} | {u.get('empty')} | "
+                     f"{u.get('requeries')} | {u.get('incomplete')} | {u.get('seconds')} |")
+    ti = s.get("track_identity", {})
     lines += ["", f"Agent format failures -> fallback plan: {s['agent_fallbacks']} {s.get('agent_fallback_reasons', {})}",
               f"Provisional grasps (close events): {s.get('grasp_checks', [])}",
               f"Detector: {s['detector']}; re-detections: {len(s['redetects'])}; track merges: {len(s['merges'])}", "",
+              "## Track identity",
+              f"splits (new track of an already-tracked category after t=0): {ti.get('new_after_init')}; "
+              f"new categories after t=0: {ti.get('new_category_after_init')}; reacquired: {ti.get('reacquired')}; "
+              f"merged at release place: {ti.get('merged_on_detect')} on detect + {ti.get('merged_late')} late; "
+              f"bound to expected: {ti.get('bound_expected')}; closed-world assigned / dropped: "
+              f"{ti.get('closed_assigned')} / {ti.get('closed_dropped')}; duplicate masks dropped: {ti.get('duplicates_dropped')}",
+              f"tracks per category: {ti.get('tracks_per_category')}; expected never seen: {ti.get('expected_unbound')}", "",
               "## Verifier decisions by rule", ", ".join(f"{k} {v}" for k, v in sorted(s["verifier_rules"].items())), "",
               "## Goal", f"branches: {s['goal']['branches']}", f"done per branch: {s['goal']['done']} at frames {s['goal']['done_t']}",
               f"final graph satisfies the goal: {s['goal']['final_satisfied']}", ""]

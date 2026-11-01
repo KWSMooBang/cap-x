@@ -81,9 +81,8 @@ def cot_rows(rows: Sequence[Any], fps: float, rename: dict[str, str] | None = No
         while j + 1 < len(rows) and rows[j + 1].t <= frame:
             j += 1
         base = rows[j]
-        nxt = rows[j + 1] if j + 1 < len(rows) and rows[j].t < frame else rows[j]
         f = row_fields(base, rename, max_items, goal_keys)
-        f["Subtask"] = (nxt.subtask if offline else base.subtask)
+        f["Subtask"] = base.subtask  # a row's Subtask holds from its frame on (forward and backward rows alike)
         inside = [r for r in rows if prev_frame < r.t <= frame]
         f["Effect"] = " | ".join(e for r in inside if (e := effect_text(r, rename)) != NONE) or NONE
         f["Observe"] = " | ".join(o for r in inside if (o := observe_text(r, rename)) != NONE) or NONE

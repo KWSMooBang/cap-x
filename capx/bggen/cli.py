@@ -46,7 +46,9 @@ def main(argv: list[str] | None = None) -> int:
                 ("--fake-models", {"action": "store_true", "help": "scripted local server instead of models (format smoke)"}),
                 ("--detector", {"default": "sam3", "choices": ("sam3", "format_fake")}), ("--init-model", opt),
                 ("--agent-model", opt), ("--vdm-model", opt), ("--no-touch-rule", flag), ("--keyframe-s", {"type": float})],
-        "eval": [("--root", req), ("--out", req)],
+        "eval": [("--root", req), ("--out", req),
+                 ("--tol", {"type": int, "default": None, "help": "event-boundary tolerance in frames (default 5; b1k 15)"}),
+                 ("--map-radius", {"type": float, "default": None, "help": "oracle <-> track 3D match radius, m (default 0.15; b1k 0.6)"})],
     }
     for name, args in specs.items():
         s = sub.add_parser(name)
@@ -91,7 +93,7 @@ def main(argv: list[str] | None = None) -> int:
         return run(a)
     elif a.cmd == "eval":
         from .evaluate import evaluate
-        res = evaluate(a.out, a.root)
+        res = evaluate(a.out, a.root, tol=a.tol, map_radius=a.map_radius)
         print((Path(a.out) / "eval.md").read_text())
         return 0 if res else 1
     return 0
@@ -160,18 +162,22 @@ def run(a: argparse.Namespace) -> int:
         cfg = replace(cfg, verifier=replace(cfg.verifier, touch_rule=False))
     if a.keyframe_s is not None:
         cfg = replace(cfg, events=replace(cfg.events, keyframe_s=a.keyframe_s))
-    det = FormatFakeDetector() if a.detector == "format_fake" else Sam3Detector()
+    det = FormatFakeDetector() if a.detector == "format_fake" else Sam3Detector()  # SAM3 HTTP client only (no capx.envs)
     names = {k: v for k, v in (("init", a.init_model), ("agent", a.agent_model), ("vdm", a.vdm_model)) if v}
     if a.fake_models:
         from .fake_models import FakeBrain, FakeServer
 
         with FakeServer(FakeBrain(bad_every=5)) as srv:
-            models = Models.from_env(env=srv.env())
+            models = Models.from_env(env=srv.env(), max_tokens=cfg.max_tokens)
             s = run_episode(a.root, a.out, cfg, models, det, a.benchmark)
     else:
-        models = Models.from_env(names)
+        models = Models.from_env(names, max_tokens=cfg.max_tokens)
         s = run_episode(a.root, a.out, cfg, models, det, a.benchmark)
-    _print({k: s.get(k) for k in ("events", "rows", "agent_fallbacks", "models", "backward")} | {"goal": s["goal"]["done"]})
+    if s.get("init_failed"):
+        print("\n" + "!" * 78 + f"\n!!  bggen INIT FAILED: {s['init_failed']}\n!!  no goal: progress / goal consistency of "
+              f"{a.out} are meaningless (report.md)\n" + "!" * 78, file=sys.stderr)
+    _print({k: s.get(k) for k in ("init_failed", "events", "rows", "agent_fallbacks", "models", "backward", "track_identity")}
+           | {"goal": s["goal"]["done"]})
     return 0
 
 

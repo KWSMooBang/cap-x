@@ -55,11 +55,23 @@ RELATIONS_TEXT = {
 }
 
 
+EXPECTED_TEXT = ("Objects the task names that are NOT visible yet (out of view or behind a door): {lines}. Use these names "
+                 "for them; each name is bound to the object when it is first detected. Another not-yet-visible object of "
+                 "one of these categories takes the next free letter (e.g. {example}).\n")
+
+
 def init_prompt(instruction: str, image: str, object_lines: Sequence[str], view: str, relations: Sequence[str],
-                max_obs: int = 20) -> list[dict[str, Any]]:
+                max_obs: int = 20, expected: Sequence[str] = ()) -> list[dict[str, Any]]:
+    """``expected``: "alias (category)" of objects the task names that were not detected in the first image."""
     rel = "; ".join(RELATIONS_TEXT[r] for r in relations if r in RELATIONS_TEXT)
     head = f"Task: {instruction}\n{VIEWS.get(view, view)}"
-    tail = ("Detected objects (each has a mark at its center in the image; xyz in m):\n" + "\n".join(object_lines) + "\n"
+    exp = ""
+    if expected:
+        first = expected[0].split(" ")[0]
+        example = first[:-1] + chr(ord(first[-1]) + 1) if first[-1:].isupper() and first[-1] != "Z" else first + "_B"
+        exp = EXPECTED_TEXT.format(lines=", ".join(expected), example=example)
+    tail = ("Detected objects (each has a mark at its center in the image; xyz in m):\n"
+            + ("\n".join(object_lines) if object_lines else "(none)") + "\n" + exp
             + INIT_RULES.format(max_obs=max_obs, relations=rel))
     return [{"role": "system", "content": INIT_SYSTEM},
             {"role": "user", "content": [_text(head), _image(image), _text(tail)]}]
@@ -73,7 +85,7 @@ AGENT_SYSTEM = ("You keep a robot's belief graph up to date. At each event you c
 TOOLS_TEXT = """Tools (robot_rel -- grippers holding / empty / lifted -- is always computed from the robot state):
 - {{"tool": "observe", "statements": ["(on bowl_A plate_A)", ...]}}  the visual model answers 1 / 0 / ? from the marked image (at most {max_obs} statements)
 - {{"tool": "geometry", "pairs": [["bowl_A", "plate_A"], ...]}}  3D / mask check of whether X rests flat on / inside Y
-- {{"tool": "detect", "categories": ["bowl"]}}  detect a category again with its next text prompt (use when an object is missing)
+- {{"tool": "detect", "categories": ["{cat0}"]}}  detect a category again with its next text prompt (use when an object is missing; only these categories: {categories})
 - {{"tool": "look", "camera": "<one of: {cameras}>"}}  use this camera's image for this event's observe
 {hindsight}Optional "expect": [{{"statement": "(on bowl_A plate_A)", "value": 1}}] -- what this event should have caused (used only where the camera cannot tell).
 Format: {{"calls": [...], "expect": [...], "why": "one sentence"}}"""
@@ -84,8 +96,10 @@ HINDSIGHT_TEXT = ('- {{"tool": "hindsight", "statements": [...], "after_s": 1.0}
 
 def agent_prompt(event_text: str, graph_text: str, goal_text: str, remember: Sequence[str], recheck: Sequence[str],
                  marks_text: str, suggestions: Sequence[str], image: str | None, cameras: Sequence[str],
-                 offline: bool, max_obs: int = 10) -> list[dict[str, Any]]:
-    tools = TOOLS_TEXT.format(max_obs=max_obs, cameras=", ".join(cameras),
+                 offline: bool, max_obs: int = 10, categories: Sequence[str] = ()) -> list[dict[str, Any]]:
+    """``categories``: the only categories ``detect`` accepts (the instruction's / init's / existing tracks')."""
+    cats = list(categories) or ["bowl"]
+    tools = TOOLS_TEXT.format(max_obs=max_obs, cameras=", ".join(cameras), cat0=cats[0], categories=", ".join(cats),
                               hindsight=HINDSIGHT_TEXT.format() if offline else "")
     lines = [f"[event] {event_text}", f"[graph] {graph_text}", f"[goal] {goal_text}",
              f"[remember] {' | '.join(remember) if remember else 'none'}",

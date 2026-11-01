@@ -81,17 +81,61 @@ def detections_from_masks(cam: CameraFrame, cat: Category, results: Sequence[dic
     return out
 
 
+SAM3_URL = "http://127.0.0.1:8114"
+
+
+def sam3_http_client(url: str | None = None, timeout_s: float = 120.0, retries: int = 3) -> Callable[..., list[dict[str, Any]]]:
+    """``segment_fn(rgb, text_prompt) -> [{"mask", "score", "box", "label"}]`` for cap-x's SAM3 FastAPI service
+    (``capx.serving.launch_sam3_server``: POST ``/segment`` {image_base64, text_prompt} -> {results: [{mask_base64,
+    shape, box, score, label}]}). Same protocol as ``capx.integrations.vision.sam3``, but standalone: importing
+    that module runs ``capx.integrations/__init__`` (every robot API -> ``capx.envs`` / simulators), which the
+    generator does not need. URL: ``url``, else ``BGGEN_SAM3_URL``, else ``http://127.0.0.1:8114``."""
+    import base64
+    import io
+    import os
+    import time
+
+    import requests
+    from PIL import Image
+
+    base = (url or os.environ.get("BGGEN_SAM3_URL") or SAM3_URL).rstrip("/")
+
+    def segment_fn(image: np.ndarray, text_prompt: str) -> list[dict[str, Any]]:
+        arr = np.clip(image, 0, 255).astype(np.uint8) if image.dtype != np.uint8 else image
+        buf = io.BytesIO()
+        Image.fromarray(arr).convert("RGB").save(buf, format="PNG")
+        payload = {"image_base64": base64.b64encode(buf.getvalue()).decode(), "text_prompt": text_prompt}
+        last: Exception | None = None
+        for k in range(retries + 1):
+            try:
+                r = requests.post(f"{base}/segment", json=payload, timeout=timeout_s)
+                r.raise_for_status()
+                items = r.json().get("results") or []
+                break
+            except Exception as exc:  # noqa: BLE001 -- service restarting: retry, then raise to the caller
+                last = exc
+                if k == retries:
+                    raise RuntimeError(f"SAM3 service at {base} failed: {last}") from exc
+                time.sleep(min(2.0 * 2 ** k, 20.0))
+        out = []
+        for it in items:
+            mask = np.frombuffer(base64.b64decode(it["mask_base64"]), dtype=np.uint8).reshape(tuple(it["shape"])).astype(bool)
+            out.append({"mask": mask, "box": it.get("box"), "score": it.get("score", 0.0), "label": it.get("label")})
+        return out
+
+    return segment_fn
+
+
 class Sam3Detector:
-    """``segment_fn(rgb, text_prompt=...) -> [{"mask", "score"}]``; default: cap-x's SAM3 service client."""
+    """``segment_fn(rgb, text_prompt=...) -> [{"mask", "score"}]``; default: the standalone SAM3 HTTP client
+    (``sam3_http_client``; does not import ``capx.integrations`` / ``capx.envs``)."""
 
     name = "sam3"
 
     def __init__(self, segment_fn: Callable[..., list[dict[str, Any]]] | None = None, score_threshold: float = 0.4,
                  nms_iou: float = 0.5, min_points: int = 30, max_depth: float = 8.0) -> None:
         if segment_fn is None:
-            from capx.integrations.vision.sam3 import init_sam3
-
-            segment_fn = init_sam3()
+            segment_fn = sam3_http_client()
         self.segment_fn = segment_fn
         self.score_threshold, self.nms_iou, self.min_points, self.max_depth = score_threshold, nms_iou, min_points, max_depth
         self.calls = 0

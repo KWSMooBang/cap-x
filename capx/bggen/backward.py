@@ -10,7 +10,9 @@ Rule: the label at t says only what was knowable from observations up to t. Allo
   neighbours. A ``?`` is never touched.
 * B3 Effect = state difference between a segment's start and the row where its end state is
   confirmed (decided by an observing source); attached to that row only.
-* B4 Subtask = the segment's intent, from the approach before the segment starts (Ver1 style).
+* B4 Subtask = the segment's intent, from the approach before the segment starts (Ver1 style). A row's
+  Subtask holds from its frame on: pick -> place switches at the close event row, the next pick starts at the
+  release row (its approach); the row that confirms the end state (Effect) never moves a boundary.
 
 Forbidden (enforced, and tested): filling ``?`` from later frames, changing Delta / goal progress,
 writing a hidden process state (cooked behind a closed door) as an observation.
@@ -204,23 +206,32 @@ def subtasks(rows: list[Any], segs: list[Segment], categories: dict[str, str], b
             s.label_pick, s.label_place = f"pick({s.obj}, {src})", f"{op}({s.obj}, {dst})"
             if s.uncertain:  # the grasp was never verified: an attempt, not a known pick-and-place
                 s.label_pick, s.label_place = "maybe_" + s.label_pick, "maybe_" + s.label_place
+        # A row's Subtask holds from its frame on (as the forward rows and the 1 Hz rows read it):
+        # approach rows after the previous release .. the row before the close -> pick; the close row (the pick ->
+        # place transition is the close event itself) .. the row before the release -> place; the release row
+        # starts the next segment's approach. The row where the end state is confirmed (``er``, Effect) does not
+        # move a boundary: confirmation time is evidence only.
         for i in range(prev_end + 1, len(rows)):
             t = rows[i].t
-            if i <= s.start_row:
+            if i < s.start_row:
                 lab = s.label_pick
                 if navigation and any(a <= t < b for a, b in base_moving):
                     lab = f"move_to({s.obj})"
                 rows[i].subtask = lab
-            elif i <= er:
+            elif i < s.end_row or (i == s.end_row and s.end_row == s.start_row):
                 rows[i].subtask = s.label_place
             else:
                 break
-        prev_end = er
-        log.append({"rule": "B4", "segment": [s.start_t, s.end_t, s.obj], "pick": s.label_pick, "place": s.label_place})
-    for i in range(prev_end + 1, len(rows)):  # "done" only from the row where the goal was confirmed
+        prev_end = max(s.end_row - 1, s.start_row)
+        log.append({"rule": "B4", "segment": [s.start_t, s.end_t, s.obj], "pick": s.label_pick, "place": s.label_place,
+                    "pick_to_place_t": s.start_t, "next_from_t": s.end_t, "confirmed_t": rows[er].t})
+    last = segs[-1] if segs else None
+    for i in range(prev_end + 1, len(rows)):  # after the last release: "done" only from the row where the goal was confirmed
         r = rows[i]
         if done and r.goal_total and r.goal_done >= r.goal_total:
             r.subtask = "done"
+        elif last is not None:
+            r.subtask = last.label_place  # the last place, not yet confirmed as the goal
 
 
 def check_forbidden(fwd: Sequence[Any], bwd: Sequence[Any], hidden_keys: Sequence[tuple[int, EdgeKey]] = ()) -> list[str]:

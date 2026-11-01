@@ -62,6 +62,7 @@ class FakeBrain:
         self.n = {"init": 0, "agent": 0, "vdm": 0}
         self.lock = threading.Lock()
         self.prompts: list[tuple[str, str]] = []
+        self.max_tokens: int | None = None  # the request's output limit (set by the server before reply)
 
     # --- roles ------------------------------------------------------------------------------------
     def init(self, messages: list[dict[str, Any]]) -> str:
@@ -126,10 +127,19 @@ def make_handler(brain: FakeBrain) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
             body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            brain.max_tokens = body.get("max_tokens")  # a test brain may reply differently per output limit
             content = brain.reply(body.get("model", ""), body.get("messages", []))
-            data = json.dumps({"model": body.get("model"), "choices": [{"message": {"role": "assistant", "content": content},
-                                                                        "finish_reason": "stop"}],
-                               "usage": fake_usage(body.get("messages", []), content)})
+            # a reply may be {"content", "finish_reason", "reasoning_content"} (tests: a reasoning model cut by the limit)
+            finish, reasoning = "stop", None
+            if isinstance(content, dict):
+                finish, reasoning = content.get("finish_reason", "stop"), content.get("reasoning_content")
+                content = content.get("content") or ""
+            msg = {"role": "assistant", "content": content, **({"reasoning_content": reasoning} if reasoning else {})}
+            usage = fake_usage(body.get("messages", []), content)
+            if reasoning:
+                usage["completion_tokens_details"] = {"reasoning_tokens": len(reasoning) // 4}
+                usage["completion_tokens"] += len(reasoning) // 4
+            data = json.dumps({"model": body.get("model"), "choices": [{"message": msg, "finish_reason": finish}], "usage": usage})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))

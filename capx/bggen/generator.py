@@ -14,8 +14,9 @@ Never reads ground truth: the episode has none, and nothing here imports ``oracl
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -40,8 +41,10 @@ from .vocab import (
     STATE_PREDS,
     TABLE,
     TOGGLEABLE_KEYS,
+    VOCABULARY,
     EdgeKey,
     categories_for,
+    category,
     is_container,
     is_support,
     parse_statement,
@@ -74,6 +77,10 @@ class GenConfig:
     cam_still_m: float = 0.01  # 2D path: the camera counts as unmoved since the close within 1 cm and 1 deg
     cam_still_deg: float = 1.0
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
+    # output limit per role (the client re-queries a cut / empty reply once with twice this); the harness baseline
+    max_tokens: dict[str, int] = field(default_factory=lambda: {"init": 32768, "agent": 32768, "vdm": 32768})
+    # categories the instruction names that the first image does not show -> expected objects (bound on first detection)
+    expect_missing: bool = True
     init_retry: int = 1
     cook_s: float | None = None  # process model: in(X, C) and toggled_on(C) this long -> cooked(X) 0.7 mem
     redetect_after: int = 2  # a category undetected this many events in a row tries its next prompt
@@ -181,13 +188,22 @@ class Generator:
     def _names(self) -> list[str]:
         return self.tracker.aliases()
 
-    def _query(self, role: str, messages: list[dict[str, Any]]) -> tuple[str, Any, str | None]:
+    def _query(self, role: str, messages: list[dict[str, Any]]) -> tuple[str, Any, str | None, dict[str, Any]]:
+        """(content, usage, error, meta). meta = finish_reason, reasoning tokens, every attempt (the client
+        re-queries a cut / empty reply once with a larger limit) and ``incomplete`` (still cut / empty). An
+        empty content is an error (the caller retries or falls back); a cut one is still parsed."""
         client = getattr(self.models, role)
         try:
             out = client.query(messages)
-            return str(out.get("content") or ""), out.get("usage"), None
         except Exception as exc:
-            return "", None, str(exc)
+            return "", None, str(exc), {"finish_reason": None, "incomplete": "error"}
+        text = str(out.get("content") or "")
+        meta = {"finish_reason": out.get("finish_reason"), "reasoning_tokens": out.get("reasoning_tokens"),
+                "incomplete": out.get("incomplete"), "attempts": out.get("attempts")}
+        err = None
+        if not text.strip():
+            err = f"empty reply (finish_reason={out.get('finish_reason')}, after {len(out.get('attempts') or [1])} attempt(s))"
+        return text, out.get("usage"), err, meta
 
     def _detect(self, cam: CameraFrame, cats: Sequence[Category], t: int) -> list[Detection]:
         dets = list(self.det.detect(cam, cats))
@@ -214,6 +230,12 @@ class Generator:
                 if t > 0:
                     break  # later events: one new candidate per streak
         return dets
+
+    def _detect_categories(self) -> list[str]:
+        """Categories the agent may ``detect``: the instruction's / config's / init's categories (``self.categories``)
+        and so every existing track's category (tracks only come from these, expected objects included). Others
+        (e.g. bowl / cup in a B1K kitchen) are not offered in the prompt and are dropped by the parser."""
+        return list(dict.fromkeys(c.key for c in self.categories))
 
     def _set_query(self, key: str, text: str) -> None:
         self.categories = [c.with_query(text) if c.key == key else c for c in self.categories]
@@ -359,11 +381,17 @@ class Generator:
         return [k for k in dict.fromkeys(out) if k[1] in self.tracker.tracks or k[0] == "handempty"], geo
 
     # --- initialization ---------------------------------------------------------------------------
+    def _expected_lines(self) -> list[str]:
+        return [f"{a} ({next((c.prompt for c in self.categories if c.key == self.tracker.tracks[a].category), '?')})"
+                for a in self.tracker.expected()]
+
     def _object_lines(self, cam: CameraFrame) -> list[str]:
         h, w = cam.rgb.shape[:2]
         lines = []
         for mark, alias in self.marks.ordered():
             tr = self.tracker.tracks[alias]
+            if tr.expected:
+                continue
             px = tr.pixel.get(cam.name)
             where = ""
             if px is not None:
@@ -376,11 +404,39 @@ class Generator:
             lines.append(f"- {mark} = {alias} ({cat}): {pxs}{xyz}{where}")
         return lines
 
+    _NAME = re.compile(r"^([a-z][a-z0-9]*?)_([A-Z]{1,2})$", re.I)
+
+    def _new_names(self, data: dict[str, Any]) -> dict[str, str]:
+        """Names in the init reply that are not tracks yet but have the alias form of a known category
+        (``hotdog_B``): not-yet-visible objects -> {alias: category}. They become expected tracks instead of
+        making the goal unparsable (B1K t=0 sees only the countertop)."""
+        known = {n.lower() for n in self._names()} | {TABLE}
+        cats = {c.key for c in self.categories} | {c.key for c in VOCABULARY}
+        args: list[str] = []
+        for b in data.get("goal_branches") or []:
+            for s in b if isinstance(b, list) else []:
+                preds = [s] if isinstance(s, list) and s and isinstance(s[0], str) else s
+                for p in preds if isinstance(preds, list) else []:
+                    if isinstance(p, list):
+                        args += [str(x) for x in p[1:]]
+        for s in data.get("observe") or []:
+            args += re.findall(r"[A-Za-z][A-Za-z0-9]*_[A-Za-z]{1,2}\b", str(s))
+        out: dict[str, str] = {}
+        for a in args:
+            m = self._NAME.match(a)
+            if m is None or a.lower() in known:
+                continue
+            cat = m.group(1).lower()
+            if cat in cats:
+                out.setdefault(f"{cat}_{m.group(2).upper()}", cat)
+        return out
+
     def _parse_init(self, text: str) -> dict[str, Any]:
         data = extract_json(text)
         if not isinstance(data, dict):
             raise PlanError("reply is not a JSON object")
-        names = self._names()
+        new = self._new_names(data)
+        names = self._names() + list(new)
         branches: list[list[Step]] = []
         for b in data.get("goal_branches") or []:
             if not isinstance(b, list) or not b:
@@ -406,7 +462,9 @@ class Generator:
             if k is not None and k not in obs:
                 obs.append(k)
         remember = [str(x)[:200] for x in data.get("remember") or [] if isinstance(x, (str, int, float))]
-        return {"branches": branches, "observe": obs, "remember": remember}
+        used = {x for b in branches for s in b for k in s for x in k[1:]} | {x for k in obs for x in k[1:]}
+        return {"branches": branches, "observe": obs, "remember": remember,
+                "expected": {a: c for a, c in new.items() if a in used}}
 
     def _default_init_statements(self) -> list[EdgeKey]:
         out = []
@@ -446,6 +504,13 @@ class Generator:
             self.tried[c.key] = {c.sam3_text}
         dets = self._detect(cam, self.categories, 0)
         self.tracker.initialize(0, cam.name, dets, self._img_base(cam))
+        # categories the task names that the first image does not show (B1K: fridge / microwave / hot dog are out
+        # of view at t=0): one expected object each, bound to its first detection later
+        if cfg.expect_missing:
+            seen = {d.category for d in dets}
+            for c in self.categories:
+                if c.key not in seen and c.key not in cfg.extra_categories:
+                    self.tracker.expect(c.key)
         self.geo.observe_sizes()
         for alias in sorted(self.tracker.tracks):
             self.marks.assign(alias, self.tracker.tracks[alias].category)
@@ -454,13 +519,15 @@ class Generator:
         self.prev_image[cam.name] = url
         kf = self._save_keyframe(0, cam.name, img)
         lines = self._object_lines(cam)
-        msgs = init_prompt(self.ep.instruction, url, lines, cfg.view, cfg.relations, cfg.max_init_obs)
-        info: dict[str, Any] = {"prompt": text_only(msgs), "replies": [], "errors": [], "categories":
+        msgs = init_prompt(self.ep.instruction, url, lines, cfg.view, cfg.relations, cfg.max_init_obs,
+                           expected=self._expected_lines())
+        info: dict[str, Any] = {"prompt": text_only(msgs), "replies": [], "errors": [], "attempts": [], "categories":
                                 {c.key: c.sam3_text for c in self.categories}, "detections": [d.to_dict() for d in dets]}
         parsed = None
         for _ in range(cfg.init_retry + 1):
-            text, usage, err = self._query("init", msgs)
+            text, usage, err, meta = self._query("init", msgs)
             info["replies"].append(text)
+            info["attempts"].append({"usage": usage, **meta})
             if err:
                 info["errors"].append(err)
                 continue
@@ -472,8 +539,20 @@ class Generator:
                 msgs = msgs + [{"role": "assistant", "content": text}, {"role": "user", "content": [
                     {"type": "text", "text": f"That reply could not be used: {exc}. Answer again with JSON only."}]}]
         if parsed is None:
-            parsed = {"branches": [], "observe": [], "remember": []}
+            parsed = {"branches": [], "observe": [], "remember": [], "expected": {}}
             info["fallback"] = True
+            # never silently "no goal": summary / report / CLI show it loudly
+            info["failed"] = "init failed: no goal (" + ("; ".join(info["errors"][-2:]) or "no usable reply") + ")"
+        elif not parsed["branches"]:
+            info["failed"] = "init reply has no goal branches"
+        for alias, cat in parsed.get("expected", {}).items():
+            self.tracker.expect(cat, alias)
+            self.marks.assign(alias, cat)
+            if all(c.key != cat for c in self.categories) and (vc := category(cat)) is not None:
+                vc = replace(vc, query=vc.query or vc.candidates[0])
+                self.categories.append(vc)  # init named a category the instruction parser missed: detect it too
+                self.tried[cat] = {vc.sam3_text}
+        info["expected"] = self.tracker.expected()
         self.graph.remember = parsed["remember"]
         statements = parsed["observe"] or self._default_init_statements()
         statements = statements[: cfg.max_init_obs]
@@ -492,7 +571,7 @@ class Generator:
             s = self._support_of(a)
             if s is not None:
                 self.graph.notes[f"orig({a})"] = s
-        empty = [s for s in self.tracker.supports() if not any(
+        empty = [s for s in self.tracker.supports() if not self.tracker.tracks[s].expected and not any(
             k[2] == s and k[0] in ("on", "in") and e.p >= 0.5 for k, e in self.graph.edges.items())]
         if empty:
             self.graph.notes["empty_at_start"] = ",".join(empty)
@@ -517,8 +596,8 @@ class Generator:
                  statements: Sequence[EdgeKey], view: str | None = None) -> tuple[dict[EdgeKey, str], dict[str, Any]]:
         stmts = [statement_text(k) for k in statements]
         msgs = observe_prompt(self.ep.instruction, before, now, marks_text, event_text, stmts, view or self.cfg.view)
-        text, usage, err = self._query("vdm", msgs)
-        info: dict[str, Any] = {"statements": stmts, "reply": text, "error": err, "usage": usage}
+        text, usage, err, meta = self._query("vdm", msgs)
+        info: dict[str, Any] = {"statements": stmts, "reply": text, "error": err, "usage": usage, **meta}
         if err:
             return {}, info
         vals, notes, bad = parse_values(text, statements, self._names(), self.arms)
@@ -659,22 +738,25 @@ class Generator:
                                 self.graph.remember + [f"{k}={v}" for k, v in self.graph.notes.items()],
                                 [statement_text(k) for k in self.verifier.recheck_keys()], marks_text,
                                 [statement_text(k) for k in sugg], now_url,
-                                [cfg.camera] + list(cfg.look_views), cfg.offline, cfg.max_obs)
+                                [cfg.camera] + list(cfg.look_views), cfg.offline, cfg.max_obs,
+                                categories=self._detect_categories())
             agent_rec["prompt"] = text_only(msgs)
             plan = None  # type: ignore[assignment]
             replies = []
             reason = ""
             for _ in range(cfg.agent_retry + 1):
-                text, usage, err = self._query("agent", msgs)
-                replies.append({"reply": text, "error": err, "usage": usage})
+                text, usage, err, meta = self._query("agent", msgs)
+                replies.append({"reply": text, "error": err, "usage": usage, **meta})
                 try:
                     if err:
                         raise PlanError(f"query failed: {err}")
                     plan = parse_plan(text, self._names(), self.arms, [cfg.camera] + list(cfg.look_views),
-                                      [c.key for c in self.categories], cfg.offline, cfg.max_obs)
+                                      self._detect_categories(), cfg.offline, cfg.max_obs)
                     break
                 except PlanError as exc:
                     reason = str(exc)
+                    if meta.get("incomplete") == "length":
+                        reason += f" (reply cut at max_tokens, finish_reason={meta.get('finish_reason')})"
             if plan is None:
                 self.agent_failures += 1
                 plan = default_plan(sugg, sugg_geo, reason, cfg.max_obs)
@@ -1005,7 +1087,13 @@ class Generator:
             r = (tline.get("plan") or {}).get("fallback_reason")
             if r:
                 reasons[r] = reasons.get(r, 0) + 1
-        return {"events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
+        cats: dict[str, int] = {}
+        for tr in self.tracker.tracks.values():
+            cats[tr.category] = cats.get(tr.category, 0) + 1
+        identity = {**self.tracker.counts, "tracks_per_category": cats, "expected_unbound": self.tracker.expected(),
+                    "late_merges": len(self.tracker.merges)}
+        return {"init_failed": self.init_info.get("failed"), "track_identity": identity,
+                "events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
                 "agent_fallback_reasons": reasons, "grasp_checks": self.grasp_checks,
                 "verifier_rules": rules, "redetects": self.redetects, "merges": self.tracker.merges,
                 "tracks": [t.to_dict() for t in self.tracker.tracks.values()],

@@ -17,8 +17,15 @@
 #       backward forbidden_violations == [].
 #   3   real models + SAM3 (GPU 1): starts the SAM3 server, runs mode A on both episodes (rows_forward = mode B).
 #       Needs NEBIUS_SERVER_URL / NEBIUS_API_KEY (or BGGEN_<ROLE>_URL / _MODEL for a vLLM server).
-#   4   oracle evaluation: eval.md (forward vs forward+backward), name / goal consistency.
-set -euo pipefail
+#       Run folders: runs/${RUN_TAG}_{libero,b1k}_A (RUN_TAG default "real"; RUN_TAG=fix2 keeps the first run's outputs).
+#       Prints each run's init state; exits 3 after both runs if an init failed (no goal), unless ALLOW_INIT_FAIL=1.
+#   4   oracle evaluation (same RUN_TAG): eval.md (forward vs forward+backward), name / goal consistency.
+#
+# Exit codes: any failing command fails its step and the script (set -Eeuo pipefail; the ERR trap names the step
+# and line). Step 3 also exits 3 after both runs when an init failed (no goal), unless ALLOW_INIT_FAIL=1.
+set -Eeuo pipefail
+STEP=${1:-}
+trap 'rc=$?; echo "[runbook] step ${STEP} FAILED (exit ${rc}) at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 OUT=${OUT:-/workspace/cap-bg/outputs/agent-bg-gen}
@@ -39,7 +46,8 @@ lm_ep() {
 
 step_1a() {
   $PY -m capx.bggen.cli download-libero --dest "$OUT/data/libero_mem"
-  $PY -m capx.bggen.cli dump-libero --h5 "$OUT/data/libero_mem/$LM_H5" --out "$OUT/data/libero_mem/structure.json" | head -80
+  $PY -m capx.bggen.cli dump-libero --h5 "$OUT/data/libero_mem/$LM_H5" --out "$OUT/data/libero_mem/structure.json" > "$OUT/logs/dump_libero.json"
+  head -80 "$OUT/logs/dump_libero.json"  # from a file: piping into head would SIGPIPE the writer and fail the step under pipefail
   lm_ep
   # GPU node: EGL; CPU: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1
   MUJOCO_GL=${MUJOCO_GL:-egl} PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-egl} \
@@ -50,7 +58,8 @@ step_1a() {
 
 step_1b() {
   $PY -m capx.bggen.cli download-b1k --dest "$OUT/data/b1k" --wrist
-  $PY -m capx.bggen.cli dump-b1k --src "$OUT/data/b1k" --out "$OUT/data/b1k/structure.json" | tail -40
+  $PY -m capx.bggen.cli dump-b1k --src "$OUT/data/b1k" --out "$OUT/data/b1k/structure.json" > "$OUT/logs/dump_b1k.json"
+  tail -40 "$OUT/logs/dump_b1k.json"
   $PY -m capx.bggen.cli prep-b1k --src "$OUT/data/b1k" --root "$B1K_EP" --wrist --image-stride 6 | tee "$OUT/logs/prep_b1k.json"
   $PY -m capx.bggen.cli check-episode --root "$B1K_EP" | tee "$OUT/logs/check_b1k.json"
 }
@@ -68,27 +77,54 @@ print('$r', 'fallbacks', s['agent_fallbacks'], 'violations', s['backward']['forb
   done
 }
 
+SAM3_PORT=${SAM3_PORT:-8114}
+export BGGEN_SAM3_URL=${BGGEN_SAM3_URL:-http://127.0.0.1:$SAM3_PORT}
+
 sam3_up() {
-  if ! curl -s -m 2 http://127.0.0.1:8114 >/dev/null 2>&1; then
-    nohup $PY -m capx.serving.launch_sam3_server --device cuda --port 8114 --host 127.0.0.1 > "$OUT/logs/sam3.log" 2>&1 &
-    for _ in $(seq 60); do curl -s -m 2 http://127.0.0.1:8114 >/dev/null 2>&1 && break; sleep 5; done
+  if ! curl -s -m 2 "$BGGEN_SAM3_URL" >/dev/null 2>&1; then
+    nohup $PY -m capx.serving.launch_sam3_server --device cuda --port "$SAM3_PORT" --host 127.0.0.1 > "$OUT/logs/sam3.log" 2>&1 &
+    for _ in $(seq 60); do curl -s -m 2 "$BGGEN_SAM3_URL" >/dev/null 2>&1 && break; sleep 5; done
   fi
+  # never run on with a dead detector (every detection would be empty)
+  curl -s -m 2 "$BGGEN_SAM3_URL" >/dev/null 2>&1 || { echo "[runbook] SAM3 server not up at $BGGEN_SAM3_URL (log: $OUT/logs/sam3.log)" >&2; return 1; }
+}
+
+# RUN_TAG names the run folders (default "real" = the first kubectl run; e.g. RUN_TAG=fix2 keeps that run's outputs)
+RUN_TAG=${RUN_TAG:-real}
+
+init_check() {  # $1 = run folder; prints the init state, returns 1 when the init failed (no goal)
+  $PY - "$1" <<'PY'
+import json, sys
+s = json.load(open(sys.argv[1] + "/summary.json"))
+f = s.get("init_failed")
+print(f"[runbook] {sys.argv[1]}: init {'FAILED: ' + f if f else 'ok'}; goal branches {len(s['goal']['branches'])}; "
+      f"track identity {s.get('track_identity')}")
+sys.exit(1 if f else 0)
+PY
 }
 
 step_3() {
   : "${NEBIUS_SERVER_URL:?set NEBIUS_SERVER_URL (or BGGEN_<ROLE>_URL)}"
   sam3_up
   lm_ep
-  $PY -m capx.bggen.cli run --root "$LM_EP" --out "$OUT/runs/real_libero_A" --benchmark libero_mem --mode A \
-    | tee "$OUT/logs/real_libero.json"
-  $PY -m capx.bggen.cli run --root "$B1K_EP" --out "$OUT/runs/real_b1k_A" --benchmark b1k --mode A \
-    | tee "$OUT/logs/real_b1k.json"
+  $PY -m capx.bggen.cli run --root "$LM_EP" --out "$OUT/runs/${RUN_TAG}_libero_A" --benchmark libero_mem --mode A \
+    | tee "$OUT/logs/${RUN_TAG}_libero.json"
+  $PY -m capx.bggen.cli run --root "$B1K_EP" --out "$OUT/runs/${RUN_TAG}_b1k_A" --benchmark b1k --mode A \
+    | tee "$OUT/logs/${RUN_TAG}_b1k.json"
+  local bad=0
+  init_check "$OUT/runs/${RUN_TAG}_libero_A" || bad=1
+  init_check "$OUT/runs/${RUN_TAG}_b1k_A" || bad=1
+  if [ "$bad" = 1 ] && [ "${ALLOW_INIT_FAIL:-0}" != 1 ]; then
+    echo "[runbook] init failed (no goal) in at least one run: see report.md; ALLOW_INIT_FAIL=1 to continue" >&2
+    exit 3
+  fi
 }
 
 step_4() {
   lm_ep
-  $PY -m capx.bggen.cli eval --root "$LM_EP" --out "$OUT/runs/real_libero_A"
-  $PY -m capx.bggen.cli eval --root "$B1K_EP" --out "$OUT/runs/real_b1k_A"
+  $PY -m capx.bggen.cli eval --root "$LM_EP" --out "$OUT/runs/${RUN_TAG}_libero_A"
+  $PY -m capx.bggen.cli eval --root "$B1K_EP" --out "$OUT/runs/${RUN_TAG}_b1k_A"
+  for r in libero b1k; do echo "== ${RUN_TAG}_${r}_A"; cat "$OUT/runs/${RUN_TAG}_${r}_A/eval.md"; done
 }
 
 case "${1:-}" in

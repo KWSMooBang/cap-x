@@ -18,14 +18,14 @@ Branch `exp/agent-bg-gen` only: this code is not merged into bg or main. `capx/b
 | `adapters/libero_mem.py`, `adapters/b1k.py` | benchmark data → `<root>/episode/` + `<root>/oracle/` (download only the needed files, dump the structure, prepare) |
 | `events.py` | per-arm gripper events, base start / stop (debounced), keyframes every `keyframe_s`. A close is `grasp` / `close_empty` when the robot's fully-closed width is known (B1K). Otherwise it is `close`: the generator holds the nearest track provisionally and confirms or retracts it by co-motion (LIBERO-Mem: a bowl-rim grasp closes to 4–6 mm, the same as an empty hand). |
 | `perception.py` | SAM3 per category on any camera; depth path lifts masks to 3D (as bg_est2); 2D path keeps masks only. `FormatFakeDetector` (fixed boxes, smoke only) |
-| `tracks.py` | association, aliases from the image left, held objects follow the EEF, names from events (release place → last held object; late merges recorded) |
+| `tracks.py` | association, aliases from the image left, held objects follow the EEF, names from events (release place → last held object; late merges recorded); identity before a new name: reacquire an unmatched known track (`reacquire_radius`), bind an expected object, closed world / `fixed_closed` / `max_instances` (a new instance needs more detections of the category in one frame than known tracks); large objects associate by box gap (`large_extent`); `counts` → report |
 | `vocab.py` | edge keys / statement text (`(on a b)`, `(inhand_left x)`, `(handempty)`); categories = bg_est2 `VOCABULARY_V2` + B1K (hot dog, refrigerator, microwave, countertop) with prompt candidates |
 | `geometry.py` | depth path: d_xy, support radius (median over frames), dz, container `inside`; 2D path: mask overlap / bottom contact + release-time EEF |
 | `verifier.py` | the only writer of P (rules below) |
 | `graph.py` | edges (P, source obs/robot/exp/mem/conflict), goal branches of newly-true steps, causal progress |
 | `prompts.py` | init (JSON remember / goal_branches / observe), agent (tool calls), observe = bg_est2 M5 format with its ON_RULE ("on = resting flat") |
 | `agent.py` | reply → plan; format failure → default plan (objects around the event + re-checks + next goal relations), reason logged |
-| `models.py` | one OpenAI-compatible client, roles init / agent / vdm, URL / key / model from env only, usage counted |
+| `models.py` | one OpenAI-compatible client, roles init / agent / vdm, URL / key / model from env only, usage counted (incl. reasoning tokens, cut / empty replies). Output limit 32768 per role (`GenConfig.max_tokens`, `BGGEN_<ROLE>_MAX_TOKENS`); a cut (`finish_reason` length) or empty reply is asked once more with twice the limit; every attempt's finish_reason / reasoning size goes to the trace |
 | `generator.py` | forward pass: init, then per event robot state → detect/track → marked image → agent → tools → verifier → row + trace |
 | `backward.py` | mode A refinements (allowed / forbidden list below) |
 | `serialize.py` | Ver1 lines, event rows + 1 Hz expansion, B1K renames on/in → ontop/inside |
@@ -55,7 +55,7 @@ Marks are drawn only for tracks detected in the current image. A non-held object
 | allowed | B1 track-ID unification (tracker merges) |
 | allowed | B2 single-shot noise: a 0 / 1 that disagrees with both neighbouring 0 / 1 answers (which agree each other), with no robot contact in between. Hindsight answers count as neighbours. Rows in between where the key was answered ? keep their value. |
 | allowed | B3 Effect = state difference from segment start to the row where the end state is confirmed; attached to that row only |
-| allowed | B4 Subtask = the segment's intent from the approach on: pick / place / put_in / open / close / toggle_on / move_to; "done" only from the row where the goal was confirmed |
+| allowed | B4 Subtask = the segment's intent from the approach on: pick / place / put_in / open / close / toggle_on / move_to; "done" only from the row where the goal was confirmed. A row's Subtask holds from its frame on: pick → place at the close event row, the next pick from the release row; the confirming row (Effect) never moves a boundary |
 | forbidden (checked by `check_forbidden`, logged in `backward_log.json`) | filling ? from later frames |
 | forbidden | changing Delta / progress |
 | forbidden | writing a hidden process state as obs |
@@ -72,7 +72,7 @@ The forward rows are kept unchanged (`rows_forward.jsonl`, `cot_rows_forward.jso
 | `keyframes/` | marked images |
 | `backward_log.json` | backward decisions |
 | `summary.json`, `report.md` | events, model calls / tokens per role, fallbacks, verifier rule counts, goal, final graph, labels |
-| `eval.json`, `eval.md` | written by `cli eval`: forward vs forward+backward |
+| `eval.json`, `eval.md` | written by `cli eval`: forward vs forward+backward. Oracle object ↔ track map over the whole episode (3D, `--map-radius`, default 0.15 m / B1K 0.6 m; single-instance categories map every track), event tolerance ±`--tol` frames (default 5 / B1K 15), accuracy per relation kind, articulated grasps (door / switch segments) counted apart, boundary error vs `intent` (segment starts) and `contact` (oracle inhand changes) |
 
 ## Data (what the adapters read)
 
@@ -149,6 +149,7 @@ kubectl:
 
 ```bash
 bash scripts/bggen/kubectl_runbook.sh 1a|1b|2|3|4
+RUN_TAG=fix2 bash scripts/bggen/kubectl_runbook.sh 3   # runs/fix2_{libero,b1k}_A; default RUN_TAG=real
 ```
 
 What each step checks is in the script header. Outputs go under `/workspace/cap-bg/outputs/agent-bg-gen/`.
@@ -156,10 +157,15 @@ What each step checks is in the script header. Outputs go under `/workspace/cap-
 Models:
 
 - **Defaults:** init / agent `moonshotai/Kimi-K3`, vdm `Qwen/Qwen3.8-27B`.
-- **Overrides:** `BGGEN_<ROLE>_URL` / `_MODEL` / `_API_KEY`. Otherwise `NEBIUS_SERVER_URL` / `NEBIUS_API_KEY`.
+- **Overrides:** `BGGEN_<ROLE>_URL` / `_MODEL` / `_API_KEY` / `_MAX_TOKENS`. Otherwise `NEBIUS_SERVER_URL` / `NEBIUS_API_KEY`.
+- **SAM3:** `BGGEN_SAM3_URL` (default `http://127.0.0.1:8114`); the client is `perception.sam3_http_client` (no `capx.integrations` / `capx.envs` import).
 - **vLLM:** `BGGEN_AGENT_URL=http://host:8000/v1`.
 
 ## Known limits
+
+- **bggen-fix2 settings not yet measured on the real episodes:** LIBERO `reacquire_radius` 0.12 m + closed world + `fixed_closed`; B1K `reacquire_radius` 0.25 m, one countertop / fridge / microwave (`max_instances`, an ASSUMPTION for this kitchen), `large_extent` 0.4 m; eval map radius 0.15 / 0.6 m. A closed-world assignment of a SAM3 false positive moves a track to the wrong place (counted in `closed_assigned`).
+- **Expected objects** (named by the task / init, not detected at t=0) have no position until bound; the first unexplained detection of the category is bound to them, in alphabetical order (two hot dogs first seen together may get swapped names; events name them afterwards).
+- **Init failure** (no goal) is reported (summary `init_failed`, report banner, CLI stderr, runbook step 3 exit 3), but the run still completes with the default initial statements.
 
 - **Thresholds still unmeasured:**
   - LIBERO-Mem fully-closed width: `closed_width=None`, so co-motion decides.

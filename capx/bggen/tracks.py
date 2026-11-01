@@ -10,6 +10,12 @@
   again) is that object. If the new detection was first given a fresh alias, the fresh alias is
   merged into the released object's alias and recorded in ``merges`` (the backward pass rewrites
   earlier rows that used it).
+* Identity before a new name (``Tracker._identify``): an unmatched detection is first the released object
+  (above), then an unmatched known track within ``reacquire_radius`` (held / unseen included), then an
+  expected object (named by the task / init, not visible at t=0: ``expect``), and under ``closed_world`` /
+  ``fixed_closed`` / ``max_instances`` a new instance needs evidence (more detections of the category in the
+  frame than known tracks, under the cap). ``counts`` (report) records splits and every identification.
+* Large tracks (``large_extent``; countertop / fridge on a moving head camera) associate by box gap.
 * Grasp target: the track nearest to the EEF by point-to-box distance (``grasp_radius``); movable
   objects win over supports / containers at the same distance (a door handle grasp -> the fridge).
 """
@@ -35,6 +41,23 @@ class TrackConfig:
     merge_px: float = 60.0
     grasp_radius: float = 0.08  # m, EEF to object box
     fixed_categories: tuple[str, ...] = ("plate",)  # never move (LIBERO-Mem plates); not grasp targets
+    # --- identity before a new name (kubectl bggen run 1: bowls renamed after grasps, B1K countertop_A..U) ---
+    # an unmatched detection is first given to an existing track of its category that is not matched this frame
+    # (seen or not, held included: a held track follows the EEF) within this distance; 0 = off
+    reacquire_radius: float = 0.0  # m
+    reacquire_px: float = 0.0  # 2D path
+    # a new track of a category that already has tracks needs MORE detections of it in this frame than known tracks
+    # (evidence of one more instance); otherwise the detection is the nearest unmatched known track (movable) or a
+    # duplicate (fixed categories: only within reacquire_radius)
+    closed_world: bool = False
+    # fixed categories (they never move, the camera sees them at t=0) get no new tracks after the first frame
+    fixed_closed: bool = False
+    # at most this many tracks per category (large fixed objects of a mobile-robot scene: one fridge / microwave /
+    # countertop); further detections are that object
+    max_instances: dict[str, int] = field(default_factory=dict)
+    # tracks this large (max extent, m) associate by box gap instead of center distance (a moving camera sees a
+    # different part of a countertop each time, so the mask center moves); 0 = off
+    large_extent: float = 0.0
 
 
 @dataclass
@@ -52,12 +75,16 @@ class Track:
     hold_offset: np.ndarray | None = None
     released_at: tuple[int, np.ndarray | None, tuple[float, float] | None] | None = None  # (t, world eef, pixel)
     created: int = 0
+    # named by the task / init but not detected yet: no position; the first unexplained detection of the
+    # category is bound to this name (``Tracker.update``)
+    expected: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {"alias": self.alias, "category": self.category,
                 "pos": None if self.pos is None else [round(float(x), 3) for x in self.pos],
                 "size": None if self.size is None else [round(float(x), 3) for x in self.size],
-                "last_seen": self.last_seen, "seen_now": self.seen_now, "held_by": self.held_by}
+                "last_seen": self.last_seen, "seen_now": self.seen_now, "held_by": self.held_by,
+                **({"expected": True} if self.expected else {})}
 
 
 def box_distance(p: np.ndarray, center: np.ndarray, size: np.ndarray | None) -> float:
@@ -73,6 +100,10 @@ class Tracker:
         self.merges: list[dict[str, Any]] = []  # {"t", "from", "into", "why"}
         self.log: list[dict[str, Any]] = []
         self.last_released: str | None = None
+        self.init_t: int | None = None
+        # identity counters (report): new tracks after the first frame of a category already tracked (splits),
+        # reacquired / event-merged / expected-bound / capped detections
+        self.counts: dict[str, int] = dict.fromkeys(("new_after_init", "new_category_after_init", "reacquired", "merged_on_detect", "merged_late", "bound_expected", "closed_assigned", "closed_dropped", "duplicates_dropped"), 0)
 
     # --- names -----------------------------------------------------------------------------------
     def _next_alias(self, cat: str) -> str:
@@ -103,14 +134,37 @@ class Tracker:
 
     def initialize(self, t: int, cam: str, dets: Sequence[Detection], base_pose: np.ndarray | None = None) -> None:
         """First frame: one track per detection, aliases per category from the image left."""
+        self.init_t = t
+        per_cat: dict[str, int] = {}
         for d in sorted(dets, key=lambda d: (d.category, d.pixel[0])):
+            cap = self.cfg.max_instances.get(d.category)
+            if cap is not None and per_cat.get(d.category, 0) >= cap:
+                self.counts["closed_dropped"] += 1  # e.g. a second countertop mask: the same countertop
+                continue
+            per_cat[d.category] = per_cat.get(d.category, 0) + 1
             self._new(t, cam, d, base_pose)
+
+    def expect(self, category: str, alias: str | None = None) -> str:
+        """A track for an object the task names that is not detected yet (no position). ``alias`` (e.g. the init
+        model's ``hotdog_B``) or the next free letter."""
+        alias = alias or self._next_alias(category)
+        if alias not in self.tracks:
+            self.tracks[alias] = Track(alias, category, created=self.init_t or 0, expected=True)
+            self.log.append({"kind": "expected", "alias": alias, "category": category})
+        return alias
+
+    def expected(self) -> list[str]:
+        return [a for a, tr in self.tracks.items() if tr.expected]
 
     def _new(self, t: int, cam: str, d: Detection, base_pose: np.ndarray | None) -> Track:
         tr = Track(self._next_alias(d.category), d.category, created=t)
         self._fill(tr, t, cam, d, base_pose)
         self.tracks[tr.alias] = tr
         return tr
+
+    def _known(self, cat: str) -> list[str]:
+        """Tracks of the category with a detection behind them (expected names not yet bound excluded)."""
+        return [a for a, tr in self.tracks.items() if tr.category == cat and not tr.expected]
 
     @staticmethod
     def _world_size(d: Detection, base_pose: np.ndarray | None) -> np.ndarray:
@@ -128,16 +182,36 @@ class Tracker:
         if d.mask is not None:
             tr.mask[cam] = d.mask
         tr.last_seen, tr.seen_now = t, True
+        tr.expected = False
         if tr.released_at is not None and t > tr.released_at[0]:
             tr.released_at = None
 
-    def _dist(self, tr: Track, d: Detection, cam: str, base_pose: np.ndarray | None) -> float | None:
+    def _metric(self, tr: Track, d: Detection, cam: str, base_pose: np.ndarray | None) -> tuple[str, float] | None:
+        """("m", 3D distance) or ("px", pixel distance) between a track and a detection; None if not comparable.
+        Large tracks (``large_extent``): the gap between the two boxes (0 when they overlap)."""
         w = self._world(d, base_pose)
         if w is not None and tr.pos is not None:
-            return float(np.linalg.norm(w - tr.pos)) / self.cfg.assoc_radius
+            if self.cfg.large_extent > 0 and tr.size is not None and float(np.max(tr.size)) >= self.cfg.large_extent:
+                half = 0.5 * (np.asarray(tr.size) + (self._world_size(d, base_pose) if d.size is not None else 0.0))
+                return "m", float(np.linalg.norm(np.maximum(np.abs(w - tr.pos) - half, 0.0)))
+            return "m", float(np.linalg.norm(w - tr.pos))
         if cam in tr.pixel:
-            return float(np.hypot(d.pixel[0] - tr.pixel[cam][0], d.pixel[1] - tr.pixel[cam][1])) / self.cfg.assoc_px
+            return "px", float(np.hypot(d.pixel[0] - tr.pixel[cam][0], d.pixel[1] - tr.pixel[cam][1]))
         return None
+
+    def _dist(self, tr: Track, d: Detection, cam: str, base_pose: np.ndarray | None) -> float | None:
+        m = self._metric(tr, d, cam, base_pose)
+        if m is None:
+            return None
+        return m[1] / (self.cfg.assoc_radius if m[0] == "m" else self.cfg.assoc_px)
+
+    def _reacq_dist(self, tr: Track, d: Detection, cam: str, base_pose: np.ndarray | None) -> float | None:
+        """Distance in units of the reacquire radius (None: off / not comparable)."""
+        m = self._metric(tr, d, cam, base_pose)
+        if m is None:
+            return None
+        r = self.cfg.reacquire_radius if m[0] == "m" else self.cfg.reacquire_px
+        return m[1] / r if r > 0 else None
 
     def update(self, t: int, cam: str, dets: Sequence[Detection], base_pose: np.ndarray | None = None,
                detected_categories: Sequence[str] | None = None) -> dict[str, Any]:
@@ -164,28 +238,90 @@ class Tracker:
             used_t.add(a)
             self._fill(self.tracks[a], t, cam, dets[i], base_pose)
             rep["matched"][a] = round(dist, 3)
+        # a duplicate of a track matched this frame (two masks of one object) is dropped
+        rest = []
         for i, d in enumerate(dets):
             if i in used_d:
                 continue
-            # a duplicate of a track matched this frame (two masks of one object) is dropped
             if any((self._dist(self.tracks[a], d, cam, base_pose) or 9.0) <= 1.5 for a in used_t
                    if self.tracks[a].category == d.category):
                 rep["dropped"] += 1
+                self.counts["duplicates_dropped"] += 1
                 continue
-            target = self._released_near(d, cam, base_pose, exclude=used_t)
+            rest.append(i)
+        # detections of each category this frame (duplicates excluded): evidence for the number of instances
+        n_det: dict[str, int] = {}
+        for i, d in enumerate(dets):
+            if i in used_d or i in rest:
+                n_det[d.category] = n_det.get(d.category, 0) + 1
+        for i in sorted(rest, key=lambda i: -dets[i].score):
+            d = dets[i]
+            target, why = self._identify(d, t, cam, base_pose, used_t, n_det.get(d.category, 0))
+            if why == "drop":
+                rep["dropped"] += 1
+                continue
             if target is not None:
                 self._fill(self.tracks[target], t, cam, d, base_pose)
                 used_t.add(target)
-                rec = {"t": t, "from": None, "into": target, "why": "detection at the release place of the last held object"}
-                rep["merged"].append(rec)
-                self.log.append({"kind": "merge_on_detect", **rec})
+                rec = {"t": t, "from": None, "into": target, "why": why}
+                if why.startswith("detection at the release place"):
+                    rep["merged"].append(rec)
+                    self.log.append({"kind": "merge_on_detect", **rec})
+                else:
+                    rep.setdefault("identified", []).append(rec)
+                    self.log.append({"kind": "identified", **rec})
                 continue
+            new_cat = not self._known(d.category)
             tr = self._new(t, cam, d, base_pose)
             used_t.add(tr.alias)
             rep["new"].append(tr.alias)
+            if self.init_t is not None and t > self.init_t:
+                self.counts["new_category_after_init" if new_cat else "new_after_init"] += 1
             self.log.append({"kind": "new_track", "t": t, "alias": tr.alias})
         rep["merged"] += self._late_merges(t, cam)
         return rep
+
+    def _identify(self, d: Detection, t: int, cam: str, base_pose: np.ndarray | None, used: set[str],
+                  n_det: int) -> tuple[str | None, str]:
+        """Which existing track an unmatched detection is, before it gets a new name, in this order:
+
+        1. the released, not-yet-re-seen object whose release place is near (an event names it);
+        2. the nearest unmatched track of the category within ``reacquire_radius`` (held / unseen included);
+        3. an expected name of the category (named by the task / init, not detected before);
+        4. closed world / ``max_instances`` / ``fixed_closed``: a new instance needs evidence (more detections of
+           the category this frame than known tracks, under the cap); otherwise the nearest unmatched known track
+           (movable objects: any distance; fixed ones only within the reacquire radius) or a dropped duplicate.
+
+        Returns (alias | None, why); (None, "drop") drops the detection, (None, "new") makes a new track."""
+        cat, cfg = d.category, self.cfg
+        target = self._released_near(d, cam, base_pose, exclude=used)
+        if target is not None:
+            self.counts["merged_on_detect"] += 1
+            return target, "detection at the release place of the last held object"
+        free = [a for a in self._known(cat) if a not in used]
+        near = sorted((x, a) for a in free if (x := self._reacq_dist(self.tracks[a], d, cam, base_pose)) is not None and x <= 1.0)
+        if near:
+            self.counts["reacquired"] += 1
+            return near[0][1], f"reacquired: unmatched track within the reacquire radius ({near[0][0]:.2f})"
+        exp = sorted(a for a in self.expected() if self.tracks[a].category == cat and a not in used)
+        if exp:
+            self.counts["bound_expected"] += 1
+            return exp[0], "bound to the expected object named by the task / init"
+        known = self._known(cat)
+        cap = cfg.max_instances.get(cat)
+        fixed = cat in cfg.fixed_categories
+        closed = (cap is not None and len(known) >= cap) \
+            or (fixed and cfg.fixed_closed and self.init_t is not None and t > self.init_t and bool(known)) \
+            or (cfg.closed_world and bool(known) and n_det <= len(known))
+        if not closed:
+            return None, "new"
+        if not fixed or cap is not None:
+            cands = sorted((self._metric(self.tracks[a], d, cam, base_pose) or ("?", 1e9))[1:] + (a,) for a in free)
+            if cands:
+                self.counts["closed_assigned"] += 1
+                return cands[0][-1], "closed world: the nearest unmatched known track of the category"
+        self.counts["closed_dropped"] += 1
+        return None, "drop"
 
     def _released_near(self, d: Detection, cam: str, base_pose: np.ndarray | None, exclude: set[str]) -> str | None:
         """The released, not-yet-re-seen object of this category whose release place is near ``d``."""
@@ -228,6 +364,7 @@ class Tracker:
                     tr.last_seen, tr.seen_now, tr.released_at = keep.last_seen, True, None
                     rec = {"t": t, "from": b, "into": a, "why": "new track at the release place of the last held object"}
                     self.merges.append(rec)
+                    self.counts["merged_late"] += 1
                     self.log.append({"kind": "merge_late", **rec})
                     out.append(rec)
                     break
