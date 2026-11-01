@@ -194,8 +194,9 @@ def test_init_caps_and_a_full_category_goes_to_the_nearest_track_with_distance()
     tr.update(200, "head", [_det("hotdog", 1.0, 0.1, 0.95, (0.15, 0.05, 0.05))])  # 0.10 m: reacquired as hotdog_A
     rep = tr.update(300, "head", [_det("hotdog", 2.0, 0.5, 0.95, (0.15, 0.05, 0.05)), _det("hotdog", 1.0, 0.1, 0.95, (0.15, 0.05, 0.05))])
     assert rep["new"] == [] and sorted(a for a in tr.tracks if a.startswith("hotdog")) == ["hotdog_A", "hotdog_B"]
-    # t=3364 (1.53 m from hotdog_A's last place): both names taken by now -> the nearest free track, distance logged
-    rep = tr.update(3364, "head", [_det("hotdog", 2.5, 1.6, 0.95, (0.15, 0.05, 0.05))])
+    # t=3364: both names taken by now -> the nearest free track, distance logged (bggen-fix4 C: within the 1.0 m
+    # cap_assign_radius of hotdog_B, 0.67 m; the original 1.21 m case is now dropped, tests/test_bggen_fix4.py)
+    rep = tr.update(3364, "head", [_det("hotdog", 2.3, 1.1, 0.95, (0.15, 0.05, 0.05))])
     assert rep["new"] == [] and tr.counts["capped_assigned"] >= 1
     last = tr.capped[-1]
     assert last["t"] == 3364 and last["why"].startswith("cap full (2 hotdog): the nearest existing track, distance ")

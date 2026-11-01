@@ -45,9 +45,17 @@ def b1k(mode: str = "A") -> GenConfig:
         # bggen-fix3 B3 (batch1 00450030: hotdog_A..F for two hot dogs): a category the init's goal names is capped at
         # the number of names it has after init (hotdog_A / hotdog_B expected -> 2). reacquire_radius stays 0.25 m (the
         # two hot dogs lie close together; a larger radius would join them).
+        # bggen-fix4 C (batch2 040: microwave_A took detections 4.1 m away 4 times between t1229-3905, hotdog_B ones 1.08
+        # and 2.55 m away; the boundaries 5771 / 6002 vanished): a full category's detection joins an existing track only
+        # within 1.0 m (large objects: box gap). Why 1.0 m: 4x reacquire_radius (0.25 m, the same unmoved hot dog seen
+        # again) for depth / base-pose drift of the moving head camera at kitchen range; an object the robot moved is
+        # measured from the hand / release place. ASSUMPTION: re-measure from summary ``capped`` / ``capped_dropped``.
+        # The countertop is exempt: the one countertop of the scene is several slabs (an L-shaped counter), a far slab is
+        # still it.
         tracks=TrackConfig(assoc_radius=0.15, assoc_px=60.0, merge_radius=0.15, grasp_radius=0.10, fixed_categories=(),
                            reacquire_radius=0.25, max_instances={"countertop": 1, "fridge": 1, "microwave": 1},
-                           large_extent=0.4, cap_from_init=True),
+                           large_extent=0.4, cap_from_init=True, cap_assign_radius=1.0,
+                           cap_assign_exempt=("countertop",)),
         verifier=VerifierConfig(flat_dz={}),  # LIBERO table does not apply; first accepted Observe 1 per pair
         cook_s=10.0, navigation_subtask=True,
     )

@@ -425,11 +425,14 @@ def test_swap_forward_matches_design(swap_run):
     assert s["init"]["notes"]["orig(bowl_A)"] == "plate_B" and s["init"]["notes"]["orig(bowl_B)"] == "plate_C"
     rel = [t for t in trace if t["event"]["kind"] == "release"]
     assert [t["event"]["obj"] for t in rel] == ["bowl_A", "bowl_B", "bowl_A"]
-    # the 2nd release lands on the rim: geometric veto -> 0.5 conflict + S4, confirmed at a later keyframe
-    assert any(d["rule"] == "R5" and d["key"] == "(on bowl_B plate_B)" for d in rel[1]["decisions"]) and rel[1]["s4"]
-    assert rel[1]["graph"]["(on bowl_B plate_B)"] == [0.5, "conflict"]
-    after = [t for t in trace if rel[1]["t"] < t["t"] < rel[2]["t"]]
-    assert any(t["graph"].get("(on bowl_B plate_B)", [0])[0] == 0.9 for t in after)
+    # the 2nd release lands on the rim and slides to the center: bggen-fix4 B (mode A) takes the release geometry at the
+    # first settled frame (the bowl still at the center), so no rim veto; mode B keeps the release-frame veto
+    # (tests/test_bggen_fix4.py::test_mode_b_keeps_the_release_frame_rim_veto)
+    st = rel[1]["tools"]["settle"]
+    assert st["frame"] == "settle" and st["why"] == "object still" and st["t"] > rel[1]["t"]
+    g = rel[1]["tools"]["geometry"]["(on bowl_B plate_B)"]
+    assert g["frame"] == "settle" and g["d_xy"] < g["r"]
+    assert not any(d["rule"] == "R5" for d in rel[1]["decisions"]) and rel[1]["graph"]["(on bowl_B plate_B)"] == [0.9, "obs"]
     # the VDM's wrong 0 for the untouched bowl_B is held and re-checked (R7), never applied
     holds = [(t["t"], d) for t in trace for d in t.get("decisions", []) if d["rule"] == "R7-hold"]
     assert holds and all(d["key"] == "(on bowl_B plate_B)" and d["after"] == 0.9 for _, d in holds)

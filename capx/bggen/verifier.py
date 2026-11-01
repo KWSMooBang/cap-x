@@ -30,6 +30,16 @@ Rules (each decision is logged with its rule id):
   obs), ``?`` keeps the key pending and it is asked again at the next event (whose 0 then lowers it). Why: the
   front camera sees a basket's wall, not its inside (t08 d2 / d3: one VDM 0 overruled geometry that put the
   cheese in the basket).
+  bggen-fix4 A: the geometry need not be computed at the same event: an 'in' answered 0 without positive geometry now
+  (and not measured apart in 3D now) gets the pair's last positive geometry (R9 release geometry, an earlier
+  observe), valid while neither object was grasped since and neither track moved (``geometry.GeoMemory``; the
+  validity record -- grasps, movement per object -- is in the decision and in the trace's ``geometry_memory``). Why:
+  t08 d1 / d2 put the cheese in the basket by R9 (0.7) at the release and lowered it with the next keyframe's VDM 0
+  (R1), whose event computed no geometry. 'on' is not included: a front camera sees a plate's top (no wall hides
+  it), so an 'on' answered 0 is ordinary evidence (R7 / R5 already guard it).
+  bggen-fix4 B: the geometry of a release (R9, R10) is that of the first settled frame after it (mode A) -- the
+  released object detected with the hand gone or the object still -- else of the release frame with its height
+  vetoing nothing (``frame`` / ``t_geo`` in the geometry say which; t08 d3: 13.3 cm above the basket, still falling).
 * Marks: only tracks detected in the current image are marked (the generator draws them).
 """
 

@@ -13,9 +13,11 @@ Never reads ground truth: the episode has none, and nothing here imports ``oracl
 
 from __future__ import annotations
 
+import copy
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,7 @@ from capx.belief.verify import encode_png
 
 from .agent import Plan, PlanError, default_plan, extract_json, parse_plan
 from .events import Event, EventConfig, detect_events
-from .geometry import Geometry
+from .geometry import GeoMemory, Geometry
 from .graph import BeliefGraph, GoalTracker, Step, decided
 from .perception import Detection, Detector
 from .prompts import agent_prompt, init_prompt, observe_prompt, text_only
@@ -87,6 +89,21 @@ class GenConfig:
     # frame of the same quiet interval this many seconds after the event
     recheck_look: bool = True
     recheck_hindsight_s: float = 1.0
+    # bggen-fix4 A: R10 also when the 'in' geometry is not at this event: the pair's last positive geometry, while
+    # neither object was grasped since and neither track moved more than this (3D m / fixed-camera px). 4 cm = half
+    # the LIBERO assoc_radius (a resting object's detected center jitters by 1-2 cm; a pushed one moves farther)
+    geo_memory_move_m: float = 0.04
+    geo_memory_move_px: float = 20.0
+    # bggen-fix4 B: geometry of a release at the first SETTLED frame after it (mode A; t08 d3: the cheese centre 13.3 cm
+    # above the basket at the release frame, still falling): frames every ``settle_step_s`` up to ``settle_max_s`` (and
+    # before the next gripper event); settled = the released object detected and the hand >= ``settle_eef_m`` from the
+    # release place, or detected at two consecutive checks after the fingers stopped opening, moved <= ``settle_still_m``
+    # (2D: ``settle_still_px``). None found -> the release frame, with height vetoing nothing (recorded either way)
+    settle_max_s: float = 2.0
+    settle_step_s: float = 0.2
+    settle_eef_m: float = 0.05
+    settle_still_m: float = 0.015
+    settle_still_px: float = 4.0
     cam_still_m: float = 0.01  # 2D path: the camera counts as unmoved since the close within 1 cm and 1 deg
     cam_still_deg: float = 1.0
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
@@ -178,6 +195,9 @@ class Generator:
         self.verifier = Verifier(self.graph, self.cfg.verifier)
         self.tracker = Tracker(self.cfg.tracks)
         self.geo = Geometry(self.tracker)
+        self.geo_mem = GeoMemory(self.cfg.geo_memory_move_m, self.cfg.geo_memory_move_px,
+                                 fixed_camera=not getattr(episode, "mobile", False))
+        self.grasped_at: dict[str, list[int]] = {}  # alias -> frames of every grasp / close that took it (A: validity)
         self.goal = GoalTracker()
         self.marks = MarkTable()
         self.categories: list[Category] = []
@@ -636,13 +656,165 @@ class Generator:
         return vals, info
 
     def _geometry_for(self, vals: dict[EdgeKey, str], cam: str, pairs: Sequence[tuple[str, str]] = (),
-                      release: dict[str, np.ndarray] | None = None) -> dict[EdgeKey, dict[str, Any]]:
+                      release: dict[str, np.ndarray] | None = None,
+                      settle: tuple[dict[str, Any], dict[str, Any]] | None = None) -> dict[EdgeKey, dict[str, Any]]:
+        """Geometry of the asked / requested on-in pairs. The released object's pairs (bggen-fix4 B): at the settled
+        frame (``settle`` = (track copies at its detections, info)) or, with none, at the release frame with height
+        vetoing nothing; ``frame`` / ``t_geo`` say which."""
         out = {}
         keys = [k for k in vals if k[0] in ("on", "in")] + [self._rel_key(a, b) for a, b in pairs]
         for k in dict.fromkeys(keys):
-            g = self.geo.pair(k, cam, (release or {}).get(k[1]))
+            rel = (release or {}).get(k[1])
+            if rel is not None and settle is not None and settle[0]:
+                with self._swapped(settle[0]):
+                    g = self.geo.pair(k, settle[1].get("camera", cam), rel)
+                if g is not None:
+                    g.update(frame="settle", t_geo=settle[1]["t"])
+            elif rel is not None:
+                g = self.geo.pair(k, cam, rel, use_height=False)
+                if g is not None:
+                    g["frame"] = "release"
+            else:
+                g = self.geo.pair(k, cam)
             if g is not None:
                 out[k] = g
+        return out
+
+    @contextmanager
+    def _swapped(self, tmp: dict[str, Any]) -> Iterator[None]:
+        """Geometry with some tracks replaced by copies placed at another frame's detections (the tracker's own state
+        stays that of the event's frame)."""
+        tracks = self.tracker.tracks
+        old = {a: tracks[a] for a in tmp if a in tracks}
+        tracks.update({a: tmp[a] for a in old})
+        try:
+            yield
+        finally:
+            tracks.update(old)
+
+    def _det_track(self, alias: str, d: Detection, cam: CameraFrame) -> Any:
+        tr = self.tracker.tracks[alias]
+        n = copy.copy(tr)
+        n.pixel, n.box, n.mask = dict(tr.pixel), dict(tr.box), dict(tr.mask)
+        base = self._img_base(cam)
+        w = Tracker._world(d, base)
+        if w is not None:
+            n.pos, n.size, n.zlim = w, Tracker._world_size(d, base), Tracker._world_zlim(d, base)
+        n.pixel[cam.name], n.box[cam.name] = d.pixel, d.box
+        if d.mask is not None:
+            n.mask[cam.name] = d.mask
+        n.seen_now, n.held_by = True, None
+        return n
+
+    def _near_det(self, alias: str, dets: Sequence[Detection], cam: CameraFrame, r_m: float, r_px: float,
+                  horizontal: bool = False) -> Detection | None:
+        """The detection of the track's category nearest to the track within the radius (3D, or pixels when either
+        has no 3D point)."""
+        tr = self.tracker.tracks[alias]
+        base = self._img_base(cam)
+        best, best_d = None, None
+        for d in dets:
+            if d.category != tr.category:
+                continue
+            w = Tracker._world(d, base)
+            if w is not None and tr.pos is not None:
+                x = float(np.linalg.norm((w - tr.pos)[:2] if horizontal else w - tr.pos)) / r_m
+            elif cam.name in tr.pixel:
+                x = float(np.hypot(d.pixel[0] - tr.pixel[cam.name][0], d.pixel[1] - tr.pixel[cam.name][1])) / r_px
+            else:
+                continue
+            if x <= 1.0 and (best_d is None or x < best_d):
+                best, best_d = d, x
+        return best
+
+    def _settle(self, e: Event, arm: str, obj: str, supports: Sequence[str], next_gripper_t: int,
+                ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """bggen-fix4 B: the first settled frame after a release (mode A only: a later frame). Returns (track copies at
+        that frame's detections -- the released object and the supports detected there --, info). No copies = no
+        settled frame: the release frame is used (``info["frame"] == "release"`` and why)."""
+        cfg = self.cfg
+        info: dict[str, Any] = {"frame": "release", "t": e.t, "release_t": e.t}
+        if not cfg.offline or cfg.settle_max_s <= 0:
+            info["why"] = "mode B: no frame after the event" if not cfg.offline else "off"
+            return {}, info
+        tmax = min(e.t + int(round(cfg.settle_max_s * self.ep.fps)), next_gripper_t - 1, self.ep.n_frames - 1)
+        step = max(int(round(cfg.settle_step_s * self.ep.fps)), 1)
+        eef0 = np.asarray(self.ep.robot(e.t).eef_world(arm), float)
+        want = {self._cat(obj)} | {self._cat(s) for s in supports}
+        cats = [c for c in self.categories if c.key in want]
+        tc = cfg.tracks
+        prev: tuple[np.ndarray, str] | None = None  # the object's last detected point after the fingers cleared
+        last_img = e.t
+        checks: list[dict[str, Any]] = []
+        for t in range(e.t + step, tmax + 1, step):
+            cam = self.ep.frame(t, [cfg.camera], causal=True).cams.get(cfg.camera)
+            if cam is None or cam.t <= last_img:
+                continue  # no new image since the last check
+            last_img = cam.t
+            dets = list(self.det.detect(cam, cats))
+            d = self._near_det(obj, dets, cam, tc.merge_radius, tc.merge_px, horizontal=True)
+            away = float(np.linalg.norm(np.asarray(self.ep.robot(cam.t).eef_world(arm), float) - eef0))
+            # the fingers stopped opening: the width rose by less than half the open threshold over the last step
+            rise = self.ep.robot(cam.t).arms[arm].gripper - self.ep.robot(max(cam.t - step, e.t)).arms[arm].gripper
+            clear = bool(rise < 0.5 * cfg.events.open_delta)
+            c: dict[str, Any] = {"t": cam.t, "detected": d is not None, "hand_away_m": round(away, 3), "fingers_clear": clear}
+            why = None
+            if d is not None:
+                w = Tracker._world(d, self._img_base(cam))
+                pt, unit = (w, "m") if w is not None else (np.asarray(d.pixel, float), "px")
+                if clear and prev is not None and prev[1] == unit:
+                    mv = float(np.linalg.norm(pt - prev[0]))
+                    c["moved"] = round(mv, 3)
+                    if mv <= (cfg.settle_still_m if unit == "m" else cfg.settle_still_px):
+                        why = "object still"
+                if why is None and away >= cfg.settle_eef_m:
+                    why = "hand left"
+                prev = (pt, unit) if clear else None
+            else:
+                prev = None
+            checks.append(c)
+            if why is not None:
+                tmp = {obj: self._det_track(obj, d, cam)}
+                for s in supports:
+                    sd = self._near_det(s, dets, cam, tc.assoc_radius, tc.assoc_px)
+                    if sd is not None:
+                        tmp[s] = self._det_track(s, sd, cam)
+                info.update(frame="settle", t=cam.t, why=why, camera=cam.name, checks=checks,
+                            supports_detected=sorted(a for a in tmp if a != obj))
+                return tmp, info
+        info.update(why=f"no settled frame within {cfg.settle_max_s} s / before the next gripper event (t <= {tmax})",
+                    checks=checks)
+        return {}, info
+
+    def _remember_geometry(self, geom: dict[EdgeKey, dict[str, Any]], t: int, src: str,
+                           settle: tuple[dict[str, Any], dict[str, Any]] | None = None) -> None:
+        cmap = self._categories_map()
+        for k, g in geom.items():
+            snaps = None
+            if g.get("frame") == "settle" and settle is not None:
+                snaps = {a: GeoMemory._snap(tr, t) for a, tr in settle[0].items()}
+            self.geo_mem.remember(k, g, t, self.tracker.tracks, src, self.verifier.geo_positive(k, g, cmap), snaps)
+
+    def _geometry_memory(self, vals: dict[EdgeKey, str], geom: dict[EdgeKey, dict[str, Any]], cam: str) -> dict[str, Any]:
+        """A: in(X, C) answered 0 without positive geometry now (and not measured apart in 3D now): the pair's last
+        positive geometry, while valid, goes into ``geom`` (marked ``remembered``). Returns the validity records."""
+        out: dict[str, Any] = {}
+        cmap = self._categories_map()
+        for k, v in vals.items():
+            if k[0] != "in" or v != "0" or k in self.verifier.geo_conflict:
+                continue
+            g = geom.get(k)
+            if g is not None and (self.verifier.geo_positive(k, g, cmap) or g.get("mode") == "depth"):
+                continue  # positive now (R10 as before) or measured apart in 3D now (the Observe 0 stands)
+            mg, rec = self.geo_mem.lookup(k, self.tracker.tracks, self.grasped_at, cam)
+            if g is not None:
+                rec["now"] = g
+            out[statement_text(k)] = rec
+            if mg is not None:
+                geom[k] = mg
+                # one conflict per remembered geometry: the R10 re-check decides it (or the next answer does), a later
+                # 0 is not re-held by the same old evidence
+                self.geo_mem.entries.pop(k, None)
         return out
 
     def _hindsight(self, e: Event, keys: Sequence[EdgeKey], after_s: float, next_gripper_t: int) -> dict[str, Any]:
@@ -750,6 +922,7 @@ class Generator:
         for a in self.tracker.tracks:
             self.marks.assign(a, self.tracker.tracks[a].category)
         self.geo.observe_sizes()
+        self.geo_mem.refresh(self.tracker.tracks, e.t)
         img, marks_text, shown = self._marked(main, fr)
         now_url = encode_png(img)
         kf = self._save_keyframe(e.t, main.name, img)
@@ -846,9 +1019,22 @@ class Generator:
             vals, tool["observe"] = self._observe(obs_cam, before, url, mt, ev_text, plan.observe, view)
             observed = [(k, vals.get(k, "?")) for k in plan.observe]
         release = {e.obj: np.asarray(fr.eef_world(arm_key))} if e.kind == "release" and e.obj and arm_key else None
-        geom = self._geometry_for(vals, main.name, list(plan.geometry) + auto_pairs, release)
+        settle = None
+        if release is not None and e.obj in self.tracker.tracks and arm_key is not None:
+            # B: the released object's on / in geometry at the first settled frame after the release (recorded which)
+            sup = {k[2] for k in [*vals, *(self._rel_key(a, b) for a, b in [*plan.geometry, *auto_pairs])]
+                   if k[0] in ("on", "in") and k[1] == e.obj and k[2] in self.tracker.tracks}
+            settle = self._settle(e, arm_key, e.obj, sorted(sup), next_gripper_t)
+            tool["settle"] = settle[1]
+        geom = self._geometry_for(vals, main.name, list(plan.geometry) + auto_pairs, release, settle)
         if plan.geometry or auto_pairs:
             tool["geometry"] = {statement_text(k): g for k, g in geom.items()}
+        # A: remember positive geometry; an 'in' answered 0 here without positive geometry of its own gets the pair's
+        # last positive one if still valid (R10 then holds it as a conflict and re-checks)
+        self._remember_geometry(geom, e.t, "release" if release else e.kind, settle)
+        mem = self._geometry_memory(vals, geom, main.name)
+        if mem:
+            tool["geometry_memory"] = mem
         hidden = self._hidden()
         touched = dict(self.touched_at)
         accepted = self._observe_apply(vals, e.t, touched, geom, hidden)
@@ -902,6 +1088,7 @@ class Generator:
         """The gripper holds ``target`` from this event on (``close``: provisionally, checked by co-motion)."""
         frm = self._support_of(target)
         self.tracker.hold(target, arm_key, fr.eef_world(arm_key))
+        self.grasped_at.setdefault(target, []).append(e.t)
         self.grasp_z[arm_key] = float(fr.eef_world(arm_key)[2])
         e.obj = target
         self.graph.events.append(f"robot -grasp-> {target} @{e.t}" + (f" (from {frm})" if frm else "")
@@ -954,6 +1141,10 @@ class Generator:
         adopted: dict[EdgeKey, tuple[str, str]] = {}
         cfg = self.cfg
         info: dict[str, Any] = {"keys": [statement_text(k) for k in keys]}
+        # the geometry at this frame (bggen-fix4 A: a conflict raised by a remembered geometry shows both)
+        now = {statement_text(k): g for k in keys if (g := self.geo.pair(k, cfg.camera)) is not None}
+        if now:
+            info["geometry_now"] = now
         decided_keys: set[EdgeKey] = set()
         left = list(keys)
         if cfg.recheck_look:
@@ -1275,7 +1466,7 @@ class Generator:
             cats[tr.category] = cats.get(tr.category, 0) + 1
         identity = {**self.tracker.counts, "tracks_per_category": cats, "expected_unbound": self.tracker.expected(),
                     "late_merges": len(self.tracker.merges), "caps": dict(self.tracker.caps),
-                    "capped": self.tracker.capped[:50]}
+                    "capped": self.tracker.capped[:50], "capped_dropped": self.tracker.capped_dropped[:50]}
         return {"init_failed": self.init_info.get("failed"), "track_identity": identity,
                 "events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
                 "agent_fallback_reasons": reasons, "grasp_checks": self.grasp_checks,

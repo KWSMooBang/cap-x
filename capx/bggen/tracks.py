@@ -19,7 +19,9 @@
   names included, so a frame cannot bind an expected name AND open a new track over the cap (B1K fridge_A /
   fridge_B). ``set_caps``: the generator adds a cap per category from the number of objects the init named
   (``cap_from_init``). A detection of a full category goes to the nearest existing track of the category (distance
-  and reason in ``log`` / ``capped``), or is dropped when every track of it was matched in this frame.
+  and reason in ``log`` / ``capped``), or is dropped when every track of it was matched in this frame, or (bggen-fix4
+  C) when that track is farther than ``cap_assign_radius`` (``capped_dropped``: B1K 040 gave detections 4.1 m away
+  to microwave_A and 1.08 / 2.55 m away to hotdog_B).
 * A held object follows its gripper (``follow``); a grasp of a track without a 3D position puts it at the EEF.
 * ``seen_ts``: the frames each track was detected at (mode A backward merge: never seen together).
 * Large tracks (``large_extent``; countertop / fridge on a moving head camera) associate by box gap.
@@ -68,6 +70,15 @@ class TrackConfig:
     # bggen-fix3 B3: a category the init named gets a cap = the number of tracks it has after init (detected at t=0 +
     # expected names); categories the init did not name keep no cap (the number is unknown)
     cap_from_init: bool = False
+    # bggen-fix4 C: a detection of a FULL category is given to an existing track only within this distance of it
+    # (3D m; a held or just-released track: also the hand / release place); farther -> dropped and counted
+    # ``capped_dropped`` (distance and time in ``capped_dropped``). 0 = no limit (the fix3 behaviour). The same on
+    # the 2D path in pixels (``cap_assign_px``).
+    cap_assign_radius: float = 0.0
+    cap_assign_px: float = 0.0
+    # categories without that limit: an extended surface made of several slabs (a kitchen counter) is one object whose
+    # far parts are still it (its track moves to the part seen now, where the objects on it are)
+    cap_assign_exempt: tuple[str, ...] = ()
 
 
 @dataclass
@@ -115,9 +126,10 @@ class Tracker:
         self.init_t: int | None = None
         # identity counters (report): new tracks after the first frame of a category already tracked (splits),
         # reacquired / event-merged / expected-bound / capped detections
-        self.counts: dict[str, int] = dict.fromkeys(("new_after_init", "new_category_after_init", "reacquired", "merged_on_detect", "merged_late", "bound_expected", "closed_assigned", "closed_dropped", "duplicates_dropped", "capped_assigned", "grasp_retarget"), 0)
+        self.counts: dict[str, int] = dict.fromkeys(("new_after_init", "new_category_after_init", "reacquired", "merged_on_detect", "merged_late", "bound_expected", "closed_assigned", "closed_dropped", "duplicates_dropped", "capped_assigned", "capped_dropped", "grasp_retarget"), 0)
         self.caps: dict[str, int] = dict(self.cfg.max_instances)  # category -> max tracks (config + init)
         self.capped: list[dict[str, Any]] = []  # detections of a full category given to an existing track
+        self.capped_dropped: list[dict[str, Any]] = []  # detections of a full category beyond cap_assign_radius
 
     # --- names -----------------------------------------------------------------------------------
     def _next_alias(self, cat: str) -> str:
@@ -425,6 +437,13 @@ class Tracker:
                 assigned = assigned[:max(len(idx) - room, 0)]
             full = cap is not None and len(named) >= cap
             for x, i, a in assigned:
+                if full:
+                    far = self._cap_far(self.tracks[a], dets[i], cam, base_pose, x, unit[(i, a)])
+                    if far is not None:
+                        self.counts["capped_dropped"] += 1
+                        self.capped_dropped.append({"t": t, "category": cat, "nearest": a, **far})
+                        out.append((i, None, "drop"))
+                        continue
                 used.add(a)
                 if full:
                     self.counts["capped_assigned"] += 1
@@ -434,6 +453,7 @@ class Tracker:
                     self.counts["closed_assigned"] += 1
                     out.append((i, a, "closed world: the nearest unmatched known track of the category (joint)"))
             idx = [i for i in idx if all(i != x[1] for x in assigned)]
+            # (the dropped far detections of a full category are in ``assigned`` too: room is 0, nothing new opens)
             for k, i in enumerate(idx):
                 if k < room:
                     out.append((i, None, "new"))
@@ -441,6 +461,33 @@ class Tracker:
                     self.counts["closed_dropped"] += 1
                     out.append((i, None, "drop"))
         return out
+
+    def _cap_far(self, tr: Track, d: Detection, cam: str, base_pose: np.ndarray | None, dist: float, unit: str
+                 ) -> dict[str, Any] | None:
+        """bggen-fix4 C: None if ``d`` may be given to ``tr`` (within ``cap_assign_radius`` / ``cap_assign_px``, or no
+        limit, or the distance is not known), else the record of the drop. A held track follows the hand already; a
+        just-released one (not re-seen since) is also measured from the release place."""
+        lim = self.cfg.cap_assign_radius if unit == "m" else self.cfg.cap_assign_px if unit == "px" else 0.0
+        if lim <= 0 or tr.category in self.cfg.cap_assign_exempt:
+            return None
+        ref = "track"
+        if tr.released_at is not None:
+            _, eef_w, px = tr.released_at
+            w = self._world(d, base_pose)
+            if unit == "m" and eef_w is not None and w is not None:
+                r = float(np.linalg.norm(w - eef_w))
+                if r < dist:
+                    dist, ref = r, "release place"
+            elif unit == "px" and px is not None:
+                r = float(np.hypot(d.pixel[0] - px[0], d.pixel[1] - px[1]))
+                if r < dist:
+                    dist, ref = r, "release place"
+        if tr.held_by is not None:
+            ref = "hand"
+        if dist <= lim:
+            return None
+        return {"distance": round(dist, 3), "unit": unit, "limit": lim, "from": ref,
+                "why": f"cap full: nearest track {tr.alias} {dist:.2f} {unit} away ({ref}) > {lim} {unit}"}
 
     def _released_near(self, d: Detection, cam: str, base_pose: np.ndarray | None, exclude: set[str]) -> str | None:
         """The released, not-yet-re-seen object of this category whose release place is near ``d``."""

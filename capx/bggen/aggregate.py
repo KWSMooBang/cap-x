@@ -57,7 +57,8 @@ def episode_record(d: Path, price: tuple[float, float] = PRICE) -> dict[str, Any
                   "per_pred_counts": {k: [v.get("right", 0), v.get("wrong", 0), v.get("undecided", 0)]
                                       for k, v in (r.get("per_pred") or {}).items()},
                   "boundary_intent": (b.get("intent") or {}).get("mean"), "boundary_contact": (b.get("contact") or {}).get("mean"),
-                  "reobs": o.get("rate"), "reobs_n": o.get("n")}
+                  # no re-observation in the episode -> no rate (never 0.0: "no case" is not "all disagree")
+                  "reobs": o.get("rate") if o.get("n") else None, "reobs_n": o.get("n")}
     nc, gc = ev.get("name_consistency") or {}, ev.get("goal_consistency") or {}
     goal = sm.get("goal") or {}
     best = goal.get("best")
@@ -93,6 +94,16 @@ def _stat(vals: Sequence[Any]) -> dict[str, Any] | None:
     if not v:
         return None
     return {"mean": round(statistics.mean(v), 4), "min": round(min(v), 4), "max": round(max(v), 4), "n": len(v)}
+
+
+def _reobs_cell(m: dict[str, Any]) -> str:
+    """Re-obs cell: mean over the episodes that HAVE re-observations, how many cases and episodes (bggen-fix4 D: a group
+    whose only case was one disagreeing answer read '0.00 (1)', like a rate over episodes)."""
+    n = m.get("reobs_n") or 0
+    s = m.get("reobs")
+    if not n or not s:
+        return "- (0 cases)"
+    return f"{_f(s, 2)} ({n} case{'s' if n != 1 else ''} in {s['n']} ep)"
 
 
 def summarize(recs: Sequence[dict[str, Any]]) -> dict[str, Any]:
@@ -175,15 +186,17 @@ def to_markdown(res: dict[str, Any]) -> str:
     rows = [("all", res["all"])] + [(f"**{b}**", s) for b, s in res["benchmarks"].items()] + list(res["groups"].items())
     L = [f"# bggen batch — {res['runs_dir']}", "",
          "Mean over episodes [min, max]. Relation accuracy = episode-level one-to-one map (eval.md). Boundary = mean |frames| "
-         "(intent: segment starts, contact: oracle inhand changes). Re-obs = a remembered value agrees when seen again.", "",
-         "| group | pass | episodes | rel. accuracy | undecided rate | decided | boundary intent | boundary contact | re-obs (n) |",
+         "(intent: segment starts, contact: oracle inhand changes). Re-obs = a remembered value agrees when seen again "
+         "(mean over the episodes that have a case; a consistency measure, not accuracy). Decided = graded statements "
+         "(the population behind rel. accuracy: compare it between runs).", "",
+         "| group | pass | episodes | rel. accuracy | decided | undecided rate | boundary intent | boundary contact | re-obs |",
          "|---|---|---|---|---|---|---|---|---|"]
     for name, s in rows:
         for p in PASSES:
             m = s.get(p) or {}
             L.append(f"| {name} | {'fwd' if p == 'forward' else 'fwd+bwd'} | {s['evaluated']}/{s['episodes']} | {_f(m.get('acc'))} | "
-                     f"{_f(m.get('undecided_rate'))} | {m.get('decided')} | {_f(m.get('boundary_intent'), 1)} | "
-                     f"{_f(m.get('boundary_contact'), 1)} | {_f(m.get('reobs'), 2)} ({m.get('reobs_n')}) |")
+                     f"{m.get('decided')} | {_f(m.get('undecided_rate'))} | {_f(m.get('boundary_intent'), 1)} | "
+                     f"{_f(m.get('boundary_contact'), 1)} | {_reobs_cell(m)} |")
     L += ["", "## Accuracy per relation kind (mean over episodes [min, max]; pooled right / wrong / undecided)", ""]
     for name, s in rows:
         for p in PASSES:
@@ -204,14 +217,17 @@ def to_markdown(res: dict[str, Any]) -> str:
                  f"{u.get('cut')} / {u.get('empty')} / {u.get('requeries')} / {u.get('incomplete')} | {_f(s['calls'], 1)} | "
                  f"{u.get('prompt_tokens')} / {u.get('completion_tokens')} | {s['cost_usd']} ({_f(s['cost_per_episode'], 3)}) |")
     L += ["", "## Episodes", "",
-          "| episode | rel. acc fwd / fwd+bwd | undecided fwd | names | goal (steps) | oracle success | init | calls | $ |",
-          "|---|---|---|---|---|---|---|---|---|"]
+          "| episode | rel. acc fwd / fwd+bwd | decided fwd | undecided fwd | re-obs fwd (cases) | names | goal (steps) | "
+          "oracle success | init | calls | $ |",
+          "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in res["episodes"]:
         fw, fb = r["forward"], r["forward+backward"]
         init = "FAILED" if r["init_failed"] else f"ok ({r['init_attempts']} attempt(s))" if r["init_attempts"] else "-"
         flags = (" REGION MISSING" if r["region_missing"] else "") + (f" missing {r['missing']}" if r["missing"] else "")
         unobs = f", {r['goal_unobservable']} unobservable" if r.get("goal_unobservable") else ""
-        L.append(f"| {r['id']}{flags} | {fw['acc']} / {fb['acc']} | {fw['undecided_rate']} | {r['name_consistency']} | "
+        reobs = f"{fw['reobs']} ({fw['reobs_n']})" if fw.get("reobs_n") else f"- ({fw.get('reobs_n') or 0})"
+        L.append(f"| {r['id']}{flags} | {fw['acc']} / {fb['acc']} | {fw['decided']} | {fw['undecided_rate']} | {reobs} | "
+                 f"{r['name_consistency']} | "
                  f"{r['goal_satisfied']} ({r['steps_done']}/{r['steps_total']}{unobs}) | {r['oracle_success']} | {init} | "
                  f"{r['usage']['calls']} | {r['cost_usd']} |")
     a = res["all"]
