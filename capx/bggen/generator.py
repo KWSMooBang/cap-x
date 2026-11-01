@@ -71,6 +71,8 @@ class GenConfig:
     verify_move: float = 0.03  # m of EEF motion before a provisional grasp is checked (LIBERO lifts: 0.03-0.07 m)
     verify_sep: float = 0.02  # m: the "moved with the hand" and "stayed" positions must be this far apart
     verify_sep_px: float = 20.0  # the same on the 2D path (pixels)
+    cam_still_m: float = 0.01  # 2D path: the camera counts as unmoved since the close within 1 cm and 1 deg
+    cam_still_deg: float = 1.0
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
     init_retry: int = 1
     cook_s: float | None = None  # process model: in(X, C) and toggled_on(C) this long -> cooked(X) 0.7 mem
@@ -595,6 +597,7 @@ class Generator:
                         "pos0": None if tr.pos is None else tr.pos.copy(),
                         # 2D path: the object's and the fingertip's pixels at the close
                         "px0": tr.pixel.get(cfg.camera), "eef_px0": px,
+                        "cam_pose0": None if main is None else self._cam_world(main),
                         # relations before the close, restored if the grasp is retracted
                         "loc0": {k: (ed.p, ed.source) for k, ed in self.graph.edges.items()
                                  if k[1] == target and k[0] in ("on", "in", "at")}}
@@ -623,8 +626,11 @@ class Generator:
             self.verifier.held_off_supports(a, e.t)  # every event while held, not only at the grasp
         # detection + tracking
         if main is None:
+            rec["error"] = f"no image of camera {cfg.camera}"
+            if release_pend is not None and arm_key is not None:  # cannot be checked: unverified, never dropped
+                rec["grasp_verify"] = [self._mark_unverified(arm_key, release_pend, e, "no release image", {})]
             row = self._row(e, [], touched_now, {}, None)
-            self._trace(e, row, {"error": f"no image of camera {cfg.camera}"})
+            self._trace(e, row, rec)
             return row
         dets = self._detect(main, self.categories, e.t)
         checks = self._verify_grasps(fr, main, dets, e.t)
@@ -754,7 +760,8 @@ class Generator:
         ``left`` (one at the old place and none at the hand), ``ambiguous`` (both), ``gone_lifted`` (the category
         is detected, nothing at either place, the hand rose and the old place is not under the hand),
         ``no_detection`` (the category is not detected at all: occlusion / detector miss), ``too_close`` (the two
-        places are not yet apart), ``no_reference`` (no 3D or 2D reference), ``unclear``. A detection that
+        places are not yet apart), ``no_reference`` (no 3D or 2D reference), ``camera_moved`` / ``camera_unknown``
+        (2D path: pixels are compared only when the camera pose is unchanged since the close), ``unclear``. A detection that
         another known track of the same category explains (e.g. the other bowl) is not evidence."""
         tr = self.tracker.tracks[pend["obj"]]
         base = self._img_base(cam)
@@ -771,7 +778,18 @@ class Generator:
             eef_px = self._eef_pixel(cam, fr, arm)
             if pend.get("px0") is None or pend.get("eef_px0") is None or eef_px is None:
                 return "no_reference", {"mode": "none"}
-            mode, r, sep = "2d", self.cfg.tracks.assoc_px, self.cfg.verify_sep_px
+            # pixels at the close and now are comparable only from the same camera pose (a head camera moves)
+            pose0, pose = pend.get("cam_pose0"), self._cam_world(cam)
+            if pose0 is None or pose is None:
+                if self.ep.mobile:
+                    return "camera_unknown", {"mode": "2d"}
+                mode = "2d_fixed_camera_assumed"
+            else:
+                moved = self._pose_change(pose0, pose)
+                if moved[0] > self.cfg.cam_still_m or moved[1] > self.cfg.cam_still_deg:
+                    return "camera_moved", {"mode": "2d", "cam_moved_m": round(moved[0], 3), "cam_moved_deg": round(moved[1], 2)}
+                mode = "2d"
+            r, sep = self.cfg.tracks.assoc_px, self.cfg.verify_sep_px
             old = np.asarray(pend["px0"], float)
             hand = old + (np.asarray(eef_px, float) - np.asarray(pend["eef_px0"], float))
             refs = [np.asarray(d.pixel, float) for d in cat]
@@ -800,6 +818,20 @@ class Generator:
         if lifted and not occluded:
             return "gone_lifted", info
         return "unclear", info
+
+    def _cam_world(self, cam: CameraFrame) -> np.ndarray | None:
+        """world <- camera at the image's frame (None if the camera pose is unknown)."""
+        if cam.T_base_cam is None:
+            return None
+        b = self._img_base(cam)
+        return np.asarray(cam.T_base_cam, float) if b is None else np.asarray(b, float) @ np.asarray(cam.T_base_cam, float)
+
+    @staticmethod
+    def _pose_change(a: np.ndarray, b: np.ndarray) -> tuple[float, float]:
+        """(translation m, rotation deg) between two 4x4 poses."""
+        dt = float(np.linalg.norm(a[:3, 3] - b[:3, 3]))
+        c = (np.trace(a[:3, :3].T @ b[:3, :3]) - 1.0) / 2.0
+        return dt, float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
 
     def _retract(self, arm: str, pend: dict[str, Any], t: int, why: str) -> None:
         """The close did not hold the object: back where it was, its relations as remembered before the close."""
@@ -868,10 +900,15 @@ class Generator:
             self._retract(arm, pend, e.t, "found where it was at the release")
             e.obj = None
             return self._check(arm, pend, e.t, "retracted", {"evidence": verdict, **info}, "release")
+        return self._mark_unverified(arm, pend, e, verdict, info)
+
+    def _mark_unverified(self, arm: str, pend: dict[str, Any], e: Event, evidence: str, info: dict[str, Any]) -> dict[str, Any]:
+        """The grasp could not be checked by the release: the close row and the release are flagged (backward:
+        maybe_* labels, no Effect) and the check is recorded."""
         if pend["row"] < len(self.rows):
             self.rows[pend["row"]].notes.append("grasp_unverified")
         e.info["place_unverified"] = True
-        return self._check(arm, pend, e.t, "unverified", {"evidence": verdict, **info}, "release")
+        return self._check(arm, pend, e.t, "unverified", {"evidence": evidence, **info}, "release")
 
     def _observe_apply(self, vals: dict[EdgeKey, str], t: int, touched: dict[str, int], geom: dict[EdgeKey, Any],
                        hidden: set[str]) -> set[EdgeKey]:

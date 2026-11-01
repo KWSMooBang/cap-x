@@ -154,6 +154,7 @@ def test_two_d_path_uses_image_co_motion(tmp_path):
     cam = fr.cams["agentview"]
     pend = _pend(gen, w.grasp_t[0])
     pend["pos0"] = None  # no 3D: the 2D path
+    pend["cam_pose0"] = gen._cam_world(cam)  # the camera has not moved since the close
     eef_px = gen._eef_pixel(cam, fr, "main")
     hand_px = np.asarray(pend["px0"]) + (np.asarray(eef_px) - np.asarray(pend["eef_px0"]))
 
@@ -164,6 +165,47 @@ def test_two_d_path_uses_image_co_motion(tmp_path):
     assert v == "with_hand" and info["mode"] == "2d"
     v, _ = gen._grasp_evidence(pend, "main", fr, cam, [det_px(pend["px0"])], None)
     assert v == "left"
+    # review of eb22b86 (2): pixels are not compared across a camera move (a head camera)
+    moved = pend["cam_pose0"].copy()
+    moved[0, 3] += 0.05
+    pend["cam_pose0"] = moved
+    v, info = gen._grasp_evidence(pend, "main", fr, cam, [det_px(hand_px)], None)
+    assert v == "camera_moved" and info["cam_moved_m"] == 0.05
+    pend["cam_pose0"] = None  # pose unknown: a fixed camera is assumed only for a fixed robot ...
+    v, info = gen._grasp_evidence(pend, "main", fr, cam, [det_px(hand_px)], None)
+    assert v == "with_hand" and info["mode"] == "2d_fixed_camera_assumed"
+    gen.ep._p["base_pose"] = np.tile(np.eye(4), (gen.ep.n_frames, 1, 1))  # ... a mobile one cannot tell
+    v, _ = gen._grasp_evidence(pend, "main", fr, cam, [det_px(hand_px)], None)
+    assert v == "camera_unknown"
     pend["px0"] = None  # no reference at all: never decided during the hold
     v, _ = gen._grasp_evidence(pend, "main", fr, cam, [det_px(hand_px)], None)
     assert v == "no_reference"
+
+
+def test_release_without_an_image_keeps_the_grasp_unverified(tmp_path, monkeypatch):
+    """review of eb22b86 (1): no image at the release used to drop the pending grasp silently (no flag), and the
+    backward pass then wrote a confirmed place and its Effect."""
+    w = _first_move(carried=True)
+    g, r = w.grasp_t[0], w.release_t[0]
+    write_swap_episode(tmp_path, w)
+    ep = load_episode(tmp_path)
+    real_frame = ep.frame
+
+    def frame(t, cams=(), causal=True):  # the camera stream stops just before the release
+        return real_frame(t, cams if t < r - 3 else (), causal)
+
+    monkeypatch.setattr(ep, "frame", frame)
+    hide = lambda t, n: g - 8 <= t  # noqa: E731 -- never seen after the close: the grasp stays pending
+    with FakeServer(TruthBrain(w)) as srv:
+        gen = Generator(ep, FakeDetector(w, hide=hide), Models.from_env(env=srv.env()), lm_cfg("A"))
+        rows = gen.run()
+    assert [(c["result"], c["at"], c["evidence"]) for c in gen.grasp_checks] == [("unverified", "release", "no release image")]
+    close_row = next(x for x in rows if x.kind == "close")
+    assert "grasp_unverified" in close_row.notes and not gen.pending_grasp
+    rel = next(tl for tl in gen.trace if tl["event"]["kind"] == "release")
+    assert rel["event"]["info"]["place_unverified"] and rel["error"].startswith("no image")
+    from capx.bggen.backward import backward
+
+    res = backward(rows, gen.tracker.merges, {a: t.category for a, t in gen.tracker.tracks.items()})
+    assert res.segments[0].uncertain and res.segments[0].effect == []
+    assert res.segments[0].label_place.startswith("maybe_place(bowl_A")

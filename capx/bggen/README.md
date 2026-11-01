@@ -172,6 +172,7 @@ Models:
   - **Moved with the hand:** the expected position = the EEF + the offset at the close.
   - **Stayed:** where the object was at the close.
   - **Where:** in 3D, or in pixels for tracks without depth (2D path). The two places must be ≥ 2 cm / 20 px apart.
+  - **2D path and camera pose:** pixels are compared only when the camera pose is unchanged since the close (≤ 1 cm, ≤ 1°). Otherwise the verdict is `camera_moved`; with an unknown pose on a mobile robot, `camera_unknown`. Both defer.
   - **Rules:**
     - Detected at the hand and not at the old place → confirmed.
     - At the old place and not at the hand → retracted. The object's relations from before the close are restored.
