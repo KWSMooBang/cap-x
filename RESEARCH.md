@@ -38,7 +38,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 1a. [완료·bg 병합 b51b346] libero-init-fix: reset 직후 sim state = init_states[(seed-1)%N] (차이 0.0). LIBERO-Mem 우회 제거
 1b. [완료·bg 병합 b98b4ac] baseline-configs: env_configs/capbg_baseline/ (LIBERO-PRO swap 0, LIBERO-Mem task_00..09),
     앙상블 끔·VDM 켬·multi-turn 켬, 생성기 scripts/gen_capbg_baseline_configs.py, docs/capbg-baseline.md
-1c. RoboMME control API (지금 apis: [] 라 cap-x 로 못 돌림)
+1c. [진행 2026-11-01] RoboMME control API (지금 apis: [] 라 cap-x 로 못 돌림) — 사람 지시: 기본 CaP-X 성능 측정용. L2 exp_cap-bg_robomme-api,
+    CaP-Agent0 API 와 같은 함수 이름·시그니처, Video* 조건 영상은 첫 프롬프트에 프레임 K장, 특권 info 차단. 실제 smoke 는 kubectl (Vulkan GPU).
 1d. LIBERO 설정 경로를 레포별로 분리 (이 서버의 ~/.libero/config.yaml 이 다른 프로젝트 RACA 를 가리킴)
 1e. [완료] kubectl 파일럿 3회 (EXPERIMENTS.md, 모두 discard — 하네스 문제)
 1f. [완료·bg 병합 f9b3e13] 하네스 수정 4건 (2026-10-30 사람 승인, baccus_cap-bg 가 순서대로 쌓아 구현):
