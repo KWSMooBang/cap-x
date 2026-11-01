@@ -1,6 +1,7 @@
 """bg-est2-rim: geometric veto of an Observe 1 for an object resting on a support's rim, marks only for
 the tracks detected now (none on the arm), the "on means flat" Observe rule, the veto logs and the
-shadow's veto accuracy. Numbers from the 20261101_bgest2_vocab_smoke task_06 diagnosis."""
+shadow's veto accuracy. Rim numbers from the 20261101_bgest2_vocab_smoke task_06 diagnosis; flat dz from the
+20261101_mem10x5_bgest2 belief traces (bg-est2-flatdz)."""
 
 from __future__ import annotations
 
@@ -31,31 +32,56 @@ def veto(d_xy_cm: float, r_cm: float, dz_cm: float | None) -> list[str]:
 
 def test_defaults_match_the_spec():
     assert CFG.veto and CFG.veto_xy_margin == pytest.approx(0.005) and CFG.veto_dz_margin == pytest.approx(0.010)
-    assert FLAT == pytest.approx(0.018)
+    assert FLAT == pytest.approx(0.028)  # bowl/plate measured median (n=48)
+    assert CFG.flat_dz["bottle/plate"] == pytest.approx(0.063)  # bottle/plate measured median (n=21)
 
 
-@pytest.mark.parametrize("d_xy,r,dz", list(itertools.product((6.4, 6.85, 7.3), (5.4, 5.85, 6.3), (3.0, 3.3, 3.6))))
-def test_rim_cases_of_task06_are_vetoed(d_xy, r, dz):
-    """vocab smoke t06: the 9 'VDM 1, truth 0' on-statements had d_xy 6.4-7.3 cm, r 5.4-6.3 cm, dz 3.0-3.6 cm
-    (every combination of the ranges, so each of the 9 is covered)."""
-    why = veto(d_xy, r, dz)
-    assert "dz" in why  # dz alone separates them (> 1.8 + 1.0 cm)
+@pytest.mark.parametrize("dz", (2.5, 2.8, 3.0, 3.2))
+@pytest.mark.parametrize("d_xy,r", ((0.0, 5.4), (2.0, 5.4), (4.5, 5.4), (5.3, 5.4), (6.2, 6.3), (3.0, 6.3)))
+def test_measured_flat_bowls_are_not_vetoed(d_xy, r, dz):
+    """mem10x5 bg_est2: bowls on plates with truth On and d_xy < r had dz p10 2.5, median 2.8, p90 3.0,
+    max 3.2 cm. With flat 1.8 cm, 27 of the 32 wrong vetoes were these (why=dz). Now none are vetoed."""
+    assert veto(d_xy, r, dz) == []
+
+
+@pytest.mark.parametrize("dz", (2.9, 3.3, 3.6))
+@pytest.mark.parametrize("d_xy,r", ((6.4, 5.4), (6.85, 5.85), (7.3, 6.3), (7.3, 5.4), (6.4, 5.85)))
+def test_rim_cases_of_task06_are_vetoed_by_d_xy(d_xy, r, dz):
+    """vocab smoke t06: rim-resting bowls had d_xy 6.4-7.3 cm, r 5.4-6.3 cm, dz 2.9-3.6 cm. Their dz overlaps
+    the flat bowls' (2.5-3.2), so d_xy > r + 0.5 cm is what catches them; dz stays below 2.8 + 1.0 cm."""
+    assert veto(d_xy, r, dz) == ["d_xy"]
+
+
+def test_rim_not_caught_when_d_xy_within_margin():
+    """Known limit: a rim bowl whose d_xy is within r + 0.5 cm (e.g. d_xy 6.4 on a 6.3 cm plate) is not vetoed;
+    dz no longer separates it. (The per-case pairing of the t06 ranges is not in the repo.)"""
+    assert veto(6.4, 6.3, 3.6) == []
+
+
+def test_bottle_on_plate_measured_flat_not_vetoed():
+    """bottle/plate flat dz 6.3 cm (median, max 6.7): accepted up to 7.3 cm; a raised bottle is vetoed by dz."""
+    f = CFG.flat_dz["bottle/plate"]
+    for dz in (0.060, 0.063, 0.066, 0.067):
+        assert flat_veto(0.01, 0.06, dz, f, CFG.veto_xy_margin, CFG.veto_dz_margin) == []
+    assert flat_veto(0.01, 0.06, 0.080, f, CFG.veto_xy_margin, CFG.veto_dz_margin) == ["dz"]
+    # t01 tr2 (known limit, out of scope): d_xy 7.5 cm > xy_limit 6.3 cm while truth On -> vetoed by d_xy.
+    assert flat_veto(0.075, 0.058, 0.063, f, CFG.veto_xy_margin, CFG.veto_dz_margin) == ["d_xy"]
 
 
 def test_plate_prompt_run_rim_case_is_vetoed():
     """The plate-prompt run's one wrong 1: d_xy 7.2 > r 5.1 (+ 0.5), whatever dz was."""
-    assert "d_xy" in veto(7.2, 5.1, None) and "d_xy" in veto(7.2, 5.1, 1.8)
+    assert "d_xy" in veto(7.2, 5.1, None) and "d_xy" in veto(7.2, 5.1, 2.8)
 
 
 @pytest.mark.parametrize("d_xy,r,dz", list(itertools.product((0.0, 1.5, 3.0, 4.5), (5.1, 5.4, 6.3), (1.2, 1.8, 2.4, 2.75))))
 def test_flat_placements_are_not_vetoed(d_xy, r, dz):
-    """Bowls resting flat (plate run, truth-1 23/23): centered within the plate, dz about 1.8 cm."""
+    """Bowls resting flat (plate run, truth-1 23/23): centered within the plate, low dz."""
     assert veto(d_xy, r, dz) == []
 
 
 def test_boundaries():
-    assert veto(5.9, 5.4, 1.8) == [] and veto(6.0, 5.4, 1.8) == ["d_xy"]  # r + 0.5 cm
-    assert veto(0.0, 6.0, 2.7) == [] and veto(0.0, 6.0, 2.9) == ["dz"]  # 1.8 + 1.0 cm
+    assert veto(5.9, 5.4, 2.8) == [] and veto(6.0, 5.4, 2.8) == ["d_xy"]  # r + 0.5 cm
+    assert veto(0.0, 6.0, 3.7) == [] and veto(0.0, 6.0, 3.9) == ["dz"]  # 2.8 + 1.0 cm
     assert flat_veto(0.0, 0.06, 0.20, None) == []  # no flat dz known for the pair: d_xy only
 
 
@@ -86,16 +112,16 @@ def test_rim_place_vetoed_uncertain_then_cleared():
     est, rec, vdm, _, first = setup(world, SWAP2_GOAL, SWAP, detector=RealSizeDetector(world))
     assert first.vetoes == []  # bowls flat on their plates at turn 0
     world.pick_place(A, "plate_3")
-    put(world, A, "plate_3", dx=0.068, dz=0.033)  # on the rim: d_xy 6.8 > 6.0 + 0.5, dz 3.3 > 1.8 + 1.0
+    put(world, A, "plate_3", dx=0.068, dz=0.033)  # on the rim: d_xy 6.8 > 6.0 + 0.5 (dz 3.3 < 2.8 + 1.0)
     vdm.sticky = {"(on bowl_A plate_C)": "1"}
     r = turn(est, world, rec, 1, place_code("bowl_A", "plate_C"))
     key = ("on", "bowl_A", "plate_C")
     assert [v["key"] for v in r.vetoes] == ["(on bowl_A plate_C)"]
     v = r.vetoes[0]
-    assert v["observe"] == "1" and v["why"] == ["d_xy", "dz"] and v["kind"] == "rim"
+    assert v["observe"] == "1" and v["why"] == ["d_xy"] and v["kind"] == "rim"
     assert v["d_xy"] == pytest.approx(0.068, abs=1e-3) and v["r"] == pytest.approx(PLATE_R)
-    assert v["dz"] == pytest.approx(0.033, abs=1e-3) and v["flat_dz"] == pytest.approx(0.018)
-    assert v["xy_limit"] == pytest.approx(0.065) and v["dz_limit"] == pytest.approx(0.028)
+    assert v["dz"] == pytest.approx(0.033, abs=1e-3) and v["flat_dz"] == pytest.approx(0.028)
+    assert v["xy_limit"] == pytest.approx(0.065) and v["dz_limit"] == pytest.approx(0.038)
     e = est.graph.edges[key]
     assert e.p == 0.5 and e.source == "conflict" and est.origin[key] == "conflict"
     # Not confirmed: the place stays pending, completion is suppressed, S4 says why.
@@ -106,7 +132,7 @@ def test_rim_place_vetoed_uncertain_then_cleared():
     assert "S4" in fired and "S5b" not in fired
     # Logged in the key record (belief_trace) and the turn log (memory_est).
     rec_k = est.key_records()["(on bowl_A plate_C)"]
-    assert rec_k["source"] == "conflict" and rec_k["veto"]["why"] == ["d_xy", "dz"]
+    assert rec_k["source"] == "conflict" and rec_k["veto"]["why"] == ["d_xy"]
     assert est.trace()["vetoes"]["(on bowl_A plate_C)"]["kind"] == "rim"
     assert json.loads(json.dumps(r.to_log()))["vetoes"][0]["key"] == "(on bowl_A plate_C)"
     # ? next turn: still vetoed (uncertain), not back to an unqualified memory.
@@ -164,7 +190,7 @@ def test_shadow_veto_accuracy(tmp_path):
     mem, low, vdm = make_mem(tmp_path)
     world = low.world
     world.pick_place(SHORT_IDS["b1"], SHORT_IDS["p3"])
-    put(world, SHORT_IDS["b1"], SHORT_IDS["p3"], dx=0.085, dz=0.033)  # off the plate for the truth (> 8 cm)
+    put(world, SHORT_IDS["b1"], SHORT_IDS["p3"], dx=0.085, dz=0.045)  # off the plate for the truth (> 8 cm); dz > 3.8
     low.history.append(low.supports())
     vdm.sticky = {"(on bowl_A plate_C)": "1"}
     mem.after_turn(1, "vdm text", executed=True, code=place_code("bowl_A", "plate_C"))
@@ -178,7 +204,7 @@ def test_shadow_veto_accuracy(tmp_path):
     assert s4 and s4[0]["right"] is True  # the uncertainty was warranted
     line = json.loads((tmp_path / "belief_trace.jsonl").read_text().splitlines()[-1])
     k = line["keys"]["(on bowl_A plate_C)"]
-    assert k["veto"]["dz"] == pytest.approx(0.033, abs=1e-3) and k["source"] == "conflict" and k["shadow"] is False
+    assert k["veto"]["dz"] == pytest.approx(0.045, abs=1e-3) and k["source"] == "conflict" and k["shadow"] is False
     assert line["est"]["vetoes"][0]["why"] == ["dz"]
 
 
