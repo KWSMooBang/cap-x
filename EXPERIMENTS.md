@@ -1,5 +1,24 @@
 # cap-bg EXPERIMENTS
 
+## bggen_validation_qwen (2026-11-01) — keep: Agent as BG Generator 첫 정상 실행 (에피소드 1개씩)
+- 실행: kubectl baccus_cap-bg, exp/agent-bg-gen b8e8fe4 (생성·평가), 11:01–11:31 UTC, pod 1 (A100), 모델 init·agent·VDM 모두 Qwen/Qwen3.8-27B (사람 지시), SAM3 검출. 방식 A (앞으로 + 뒤로 패스).
+  데이터: LIBERO-Mem task 06 swap 시연 demo_1 (418 프레임, 20 Hz), B1K task 45 cook hot dogs episode_00450010 (6805 프레임, 30 Hz).
+- 결과 (baccus 보고 원문, eval b8e8fe4):
+  | run | 관계 정확도 fwd / f+b | decided | 경계 의도 fwd → f+b (mean/med) | 재관측 | 이름 일관성 | 목표 만족 |
+  | LIBERO qwen | 0.9305 / 0.9305 | 187 | 7.7/7 → 7.7/7 step | 1.0 (n2) | 1.0 (n67) | True (단계 확정 230·301·414) |
+  | B1K qwen | 0.8776 | 719 | 260.6/167.5 → 191.2/111.5 프레임 | 0.88 → 0.94 (n17) | 0.9897 | False (목표 8단계 중 open fridge 1단계만 확정) |
+  | LIBERO real (Kimi-K3, f6eb61e 생성, 재채점) | 0.4869 | 267 | 7.7/7 → 27.9/35 | 0.5 | 0.9518 | False (목표 없음) |
+  | B1K real (재채점) | 0.7611 | 745 | 268.6 → 170.5 | 0.67 → 0.78 | 0.5837 | False (목표 없음) |
+  관계별 (qwen fwd): LIBERO on 0.93, handempty 0.94, inhand 0.95. B1K on 0.88, in 0.82, open 0.50, toggled_on 0.91, inhand 0.99, handempty 0.98.
+  init: LIBERO 1회로 올바른 교환 두 갈래. B1K 2회 (1차 JSON 없음) 로 8단계 (open fridge → hotdog 2개 countertop → microwave 안 → toggled_on → cooked ×2) + 순서 바꾼 갈래, 예상 물체 4개 바인딩.
+  track_identity: LIBERO 새 이름 0, 재대응 1. B1K 새 이름 1, 예상 물체 바인딩 4, 중복 버림 9. grasp_checks LIBERO 3/3 with_hand (B1K 는 폭 기준이라 검증 안 거침).
+  재질의·잘림: LIBERO 0, B1K VDM 빈 응답 1 (재질의로 복구), init 1차 JSON 없음, agent fallback 1.
+- 비용: Qwen 만 $1.13 (LIBERO $0.28 33 calls, B1K $0.86 110 calls). Kimi-K3 첫 실행 $1.92.
+- 판단: keep. 출력 상한·트랙 재대응·예상 물체 수정 후 LIBERO-Mem 은 목표·이름·경계가 모두 맞음 (에피소드 1개). B1K 는 관계 정확도는 높으나 진행 추적이 약함 — open 정확도 0.50 이 냉장고·전자레인지 단계 확정을 막는 것으로 보임, 이동 구간 경계 오차 큼, grasp 검증 없음.
+  real 대 qwen 비교는 모델과 생성 코드가 함께 바뀌어 모델 효과만 분리되지 않음.
+- next: 에피소드 수 늘리기 (LIBERO-Mem 다른 시연·과제, B1K 여러 에피소드), B1K open 판정·진행 추적·이동 구간 개선.
+- 산출물(kubectl PVC): outputs/agent-bg-gen/runs/qwen_{libero,b1k}_A/, runs/real_*_A/ (eval_f6eb61e.* 보관), 로그 logs/qwen_step_{3,4}.log
+
 ## 20261101_mem10x5_bgest2_r2 (2026-11-01) — keep (추정 BG v2 정식 비교): 메모리 없음보다 높은 쪽이나 유의하지 않음, 정답 BG 보다 낮음
 - 실행: kubectl baccus_cap-bg, bg f9508fb (= 7dccdad: 원시 코드 파서 수정 + flat_dz bowl 0.028·bottle 0.063), 11/01 03:03–09:04 UTC, pod 2 (A100, worker 1, 30Gi), 크래시·OOM 0. 약 12 GPU-h.
 - 설정: run 1 과 같음 (memory_mode bg_est2, 같은 seed, step 8000 / wall 3600 / retries 1, max_tokens 32768, Kimi-K3 + Qwen3.8-27B, 영상 on).
