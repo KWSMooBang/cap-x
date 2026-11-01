@@ -83,6 +83,9 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     2026-11-01 사람 지시: 별도 브랜치(exp/agent-bg-gen, bg 미병합)에 구현 → LIBERO-Mem task 06 시연 1개, B1K task 45 episode_00450010 에서 테스트.
     L2 exp_cap-bg_agent-bg-gen (구현·CPU 검증·데이터 준비) → 실제 모델 테스트는 kubectl. 데이터: HF libero-mem/LIBERO-Mem-Raw, behavior-1k/2025-challenge-demos.
 1n. [백로그 2026-11-01] 판단 파서 구멍 2: 펜스 없는 원시 코드 뒤에 짝 없는 빈 펜스('```\n\n```')가 붙으면 raw_code 규칙을 건너뛰고 fallback FINISH (r2 t02 tr1). 수정안: 펜스 블록이 모두 비어 있으면 펜스를 무시하고 raw_code 규칙 적용.
+1o. [진행 2026-11-01] 앙상블 기본 CaP-X (사람 지시): 후보 gpt-oss-120b·Qwen3-235B-2507·Kimi-K2.7-Code × temp 0.1/0.5/0.9, 합성 DeepSeek-V4-Pro, VDM Qwen3.8-27B.
+    pilot: LIBERO-Mem t00·t04·t06·t07·t08 × 5, RoboMME PickXtimes·StopCube·VideoUnmaskSwap·ButtonUnmask·PickHighlight·VideoPlaceOrder·MoveCube·PatternLock × 5 (memory none).
+    텍스트 전용 모델이라 RoboMME 조건 영상은 VDM 서술(vdm_text)로. L2 exp_cap-bg_ensemble-nebius. 예상 API 약 $40–60, 4–6 h (GPU 3장). Kimi-K3 단일 RoboMME pilot 은 중단 상태(1/80).
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
