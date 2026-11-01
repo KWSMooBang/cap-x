@@ -111,8 +111,8 @@ def remove_noise(rows: list[Any], log: list[dict[str, Any]]) -> None:
             if prev is not None:
                 for j in range(i, len(rows)):
                     cur = rows[j].belief.get(k)
-                    if cur is None or j > inx:
-                        break
+                    if cur is None or j > inx or (j != i and dict(rows[j].observed).get(k) == "?"):
+                        break  # a row where the key was unknown keeps its value (never filled from later)
                     if decided(cur[0]) == decided(prev[0]) and j != i:
                         break
                     rows[j].belief[k] = (prev[0], cur[1] if cur[1] != "obs" or j != i else "obs")
@@ -209,8 +209,10 @@ def subtasks(rows: list[Any], segs: list[Segment], categories: dict[str, str], b
                 break
         prev_end = er
         log.append({"rule": "B4", "segment": [s.start_t, s.end_t, s.obj], "pick": s.label_pick, "place": s.label_place})
-    for i in range(prev_end + 1, len(rows)):
-        rows[i].subtask = "done" if done else rows[i].subtask
+    for i in range(prev_end + 1, len(rows)):  # "done" only from the row where the goal was confirmed
+        r = rows[i]
+        if done and r.goal_total and r.goal_done >= r.goal_total:
+            r.subtask = "done"
 
 
 def check_forbidden(fwd: Sequence[Any], bwd: Sequence[Any], hidden_keys: Sequence[tuple[int, EdgeKey]] = ()) -> list[str]:

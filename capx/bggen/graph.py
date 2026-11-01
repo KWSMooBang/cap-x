@@ -156,7 +156,7 @@ class GoalTracker:
         b = self.best()
         assert b is not None
         n, k = len(self.branches[b]), self.done[b]
-        tied = [i for i in range(len(self.branches)) if self.done[i] == k]
+        tied = [i for i in range(len(self.branches)) if self.done[i] == k and k < len(self.branches[i])]
         parts = [f"{k}/{n}"]
         if k >= n:
             parts.append("done")

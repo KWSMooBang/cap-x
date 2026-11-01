@@ -112,12 +112,18 @@ class Tracker:
         self.tracks[tr.alias] = tr
         return tr
 
+    @staticmethod
+    def _world_size(d: Detection, base_pose: np.ndarray | None) -> np.ndarray:
+        """Base-axis extent -> world-axis extent (the axis-aligned bound of the rotated box)."""
+        size = np.asarray(d.size, dtype=np.float64)
+        return size if base_pose is None else np.abs(np.asarray(base_pose)[:3, :3]) @ size
+
     def _fill(self, tr: Track, t: int, cam: str, d: Detection, base_pose: np.ndarray | None) -> None:
         w = self._world(d, base_pose)
         if w is not None and tr.held_by is None:
-            tr.pos, tr.size = w, np.asarray(d.size, dtype=np.float64)
+            tr.pos, tr.size = w, self._world_size(d, base_pose)
         elif w is not None and tr.size is None:
-            tr.size = np.asarray(d.size, dtype=np.float64)
+            tr.size = self._world_size(d, base_pose)
         tr.pixel[cam], tr.box[cam] = d.pixel, d.box
         if d.mask is not None:
             tr.mask[cam] = d.mask

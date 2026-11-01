@@ -5,8 +5,8 @@ Rules (each decision is logged with its rule id):
 
 * R1 Observe 1 / 0 -> P 0.9 / 0.1, source obs.
 * R2 Observe ? -> previous value kept (source becomes mem).
-* R3 robot state -> 0.97 / 0.03, source robot (inhand, handempty); robot wins over Observe (logged
-  as a conflict). A held object is on / in nothing: its location edges -> 0.03 robot.
+* R3 robot state -> 0.97 / 0.03, source robot (inhand, handempty, lifted); robot wins over Observe (logged
+  as a conflict). A held object is on / in nothing: its location edges -> 0.03 robot for as long as it is held.
 * R4 declared expectation (agent ``expect``) -> 0.7 / 0.3, source exp, only for a key not observed at
   this event and not robot-owned.
 * R5 geometric veto: Observe 1 for on / in whose geometry (depth path, both objects detected now)
@@ -34,6 +34,7 @@ from .vocab import ROBOT, STATE_PREDS, TABLE, EdgeKey, statement_text
 
 P_OBS = (0.9, 0.1)
 P_ROBOT = (0.97, 0.03)
+ROBOT_OWNED = (*ROBOT, "lifted")  # predicates only the robot state decides
 P_EXP = (0.7, 0.3)
 
 
@@ -98,7 +99,7 @@ class Verifier:
     # --- R4 expectation -----------------------------------------------------------------------
     def expect(self, key: EdgeKey, value: bool, t: int, observed_now: set[EdgeKey]) -> None:
         e = self.g.get(key)
-        if key in observed_now or key[0] in ROBOT or (e is not None and e.source == "robot"):
+        if key in observed_now or key[0] in ROBOT_OWNED or (e is not None and e.source == "robot"):
             self._log(key, "R4-skip", "exp", None if e is None else e.p, "observed now or robot-owned")
             return
         before = None if e is None else e.p
@@ -107,15 +108,22 @@ class Verifier:
 
     # --- R1 / R2 / R5 / R6 / R7 observe ---------------------------------------------------------
     def observe(self, values: dict[EdgeKey, str], t: int, touched: Iterable[str] = (), geometry: dict[EdgeKey, dict] | None = None,
-                hidden: Iterable[str] = (), categories: dict[str, str] | None = None) -> set[EdgeKey]:
-        """Apply Observe answers; returns the keys whose answer was accepted as an observation."""
-        touched, hidden = set(touched), set(hidden)
+                hidden: Iterable[str] = (), categories: dict[str, str] | None = None,
+                held: Iterable[str] = ()) -> set[EdgeKey]:
+        """Apply Observe answers; returns the keys whose answer was accepted as an observation. ``held``:
+        objects in a gripper now -- their on / in / at relations stay robot-owned (0.03) while held."""
+        touched, hidden, held = set(touched), set(hidden), set(held)
         geometry = geometry or {}
         accepted: set[EdgeKey] = set()
         for key, v in values.items():
             e = self.g.get(key)
             before = None if e is None else e.p
-            if key[0] in ROBOT or (e is not None and e.source == "robot" and key[0] in ("on", "in")):
+            if key[0] in ("on", "in", "at") and key[1] in held:
+                if v == "1":
+                    self._log(key, "R3-conflict", v, before, "held object: robot state wins over Observe")
+                self.robot(key, False, t, "held objects rest on nothing")
+                continue
+            if key[0] in ROBOT_OWNED or (e is not None and e.source == "robot" and key[0] in ("on", "in")):
                 want = None if v == "?" else (v == "1")
                 if want is not None and e is not None and decided(e.p) is not None and decided(e.p) != want:
                     self._log(key, "R3-conflict", v, before, "robot state wins over Observe")

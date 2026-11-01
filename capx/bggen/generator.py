@@ -150,7 +150,7 @@ class Generator:
         self.redetects: list[dict[str, Any]] = []
         self.touched_at: dict[str, int] = {}
         self.grasp_z: dict[str, float] = {}
-        self.cook_since: dict[EdgeKey, int] = {}
+        self.cook_since: dict[EdgeKey, tuple[str, int]] = {}  # cooked key -> (container, start)
         self.prev_image: dict[str, str] = {}  # cam -> last marked image (data URL)
         self.events: list[Event] = []
         self.agent_failures = 0
@@ -206,18 +206,25 @@ class Generator:
     def _set_query(self, key: str, text: str) -> None:
         self.categories = [c.with_query(text) if c.key == key else c for c in self.categories]
 
+    def _img_base(self, cam: CameraFrame) -> np.ndarray | None:
+        """world <- base at the frame the image comes from (an image may be older than the event)."""
+        return self.ep.robot(cam.t).base_pose
+
+    def _to_img_base(self, cam: CameraFrame, p_world: np.ndarray) -> np.ndarray:
+        b = self._img_base(cam)
+        return np.asarray(p_world, float) if b is None else (np.linalg.inv(b) @ np.array([*p_world, 1.0]))[:3]
+
     def _eef_pixel(self, cam: CameraFrame, fr: FrameRecord, arm_key: str) -> tuple[float, float] | None:
         if cam.K is None or cam.T_base_cam is None:
             return None
-        return project_to_pixel(fr.arms[arm_key].eef_pos, cam.K, cam.T_base_cam)
+        return project_to_pixel(self._to_img_base(cam, fr.eef_world(arm_key)), cam.K, cam.T_base_cam)
 
     def _track_pixel(self, cam: CameraFrame, alias: str, fr: FrameRecord) -> tuple[float, float] | None:
         tr = self.tracker.tracks[alias]
         if tr.seen_now and cam.name in tr.pixel:
             return tr.pixel[cam.name]
         if tr.pos is not None and cam.K is not None and cam.T_base_cam is not None:
-            p = tr.pos if fr.base_pose is None else (np.linalg.inv(fr.base_pose) @ np.array([*tr.pos, 1.0]))[:3]
-            return project_to_pixel(p, cam.K, cam.T_base_cam)
+            return project_to_pixel(self._to_img_base(cam, tr.pos), cam.K, cam.T_base_cam)
         return None
 
     def _marked(self, cam: CameraFrame, fr: FrameRecord, seen_only: bool = True) -> tuple[np.ndarray, str, list[str]]:
@@ -426,7 +433,7 @@ class Generator:
         for c in self.categories:
             self.tried[c.key] = {c.sam3_text}
         dets = self._detect(cam, self.categories, 0)
-        self.tracker.initialize(0, cam.name, dets, fr.base_pose)
+        self.tracker.initialize(0, cam.name, dets, self._img_base(cam))
         self.geo.observe_sizes()
         for alias in sorted(self.tracker.tracks):
             self.marks.assign(alias, self.tracker.tracks[alias].category)
@@ -524,10 +531,10 @@ class Generator:
         t2 = min(e.t + max(int(round(after_s * self.ep.fps)), 1), next_gripper_t - 1, self.ep.n_frames - 1)
         if t2 <= e.t:
             return {"t": None, "values": {}, "why": "no quiet frame before the next gripper event"}
-        fr = self.ep.frame(t2, [self.cfg.camera], causal=False)
+        fr = self.ep.frame(t2, [self.cfg.camera], causal=True)  # the latest image at or before t2 (< next event)
         cam = fr.cams.get(self.cfg.camera)
-        if cam is None:
-            return {"t": None, "values": {}}
+        if cam is None or cam.t <= e.t:
+            return {"t": None, "values": {}, "why": "no stored image after the event and before the next gripper event"}
         dets = self.det.detect(cam, self.categories)
         shown = []
         for mark, alias in self.marks.ordered():
@@ -543,7 +550,8 @@ class Generator:
         img = draw_marks(cam.rgb, shown)
         marks_text = " | ".join(f"{m} = {self.marks.alias(m)} ({u:.0f}, {v:.0f})" for m, (u, v) in shown) or "none"
         vals, info = self._observe(cam, None, encode_png(img), marks_text, "a moment later, nothing touched", keys)
-        return {"t": t2, "values": {statement_text(k): v for k, v in vals.items()}, "raw": vals, "observe": info}
+        return {"t": cam.t, "requested_t": t2, "values": {statement_text(k): v for k, v in vals.items()}, "raw": vals,
+                "observe": info}
 
     # --- one event --------------------------------------------------------------------------------
     def step(self, e: Event, next_gripper_t: int) -> Row:
@@ -588,15 +596,15 @@ class Generator:
         for a in touched_now:
             self.touched_at[a] = e.t
         robot_keys = self._robot_state(fr, e.t)
-        if e.kind == "grasp" and e.obj:
-            self.verifier.held_off_supports(e.obj, e.t)
+        for a in {self.tracker.held(k) for k in self.arm_keys} - {None}:
+            self.verifier.held_off_supports(a, e.t)  # every event while held, not only at the grasp
         # detection + tracking
         if main is None:
             row = self._row(e, [], touched_now, {}, None)
             self._trace(e, row, {"error": f"no image of camera {cfg.camera}"})
             return row
         dets = self._detect(main, self.categories, e.t)
-        rec["track"] = self.tracker.update(e.t, main.name, dets, fr.base_pose, [c.key for c in self.categories])
+        rec["track"] = self.tracker.update(e.t, main.name, dets, self._img_base(main), [c.key for c in self.categories])
         for a in self.tracker.tracks:
             self.marks.assign(a, self.tracker.tracks[a].category)
         self.geo.observe_sizes()
@@ -657,7 +665,7 @@ class Generator:
                     self._set_query(key, nxt)
                     extra += got
             if extra:
-                tool["detect"] = self.tracker.update(e.t, main.name, dets + extra, fr.base_pose, plan.detect)
+                tool["detect"] = self.tracker.update(e.t, main.name, dets + extra, self._img_base(main), plan.detect)
                 for a in self.tracker.tracks:
                     self.marks.assign(a, self.tracker.tracks[a].category)
                 img, marks_text, shown = self._marked(main, fr)
@@ -689,7 +697,7 @@ class Generator:
         accepted = self._observe_apply(vals, e.t, touched, geom, hidden)
         observed = [(k, ("?" if (k[0] in STATE_PREDS and k[1] in hidden) else v)) for k, v in observed]
         for k, v in plan.expect:
-            self.verifier.expect(k, v, e.t, accepted)
+            self.verifier.expect(k, v, e.t, accepted | set(plan.observe))  # asked now, even if '?'
         self._process_model(e.t)
         hind: dict[EdgeKey, str] = {}
         if plan.hindsight and cfg.offline:
@@ -715,7 +723,8 @@ class Generator:
             e = self.graph.get(k)
             since = -1 if e is None or e.obs_t is None else e.obs_t
             tset = {a for a in (k[1], k[2]) if a is not None and touched.get(a, -10) > since}
-            out |= self.verifier.observe({k: v}, t, tset, geom, hidden, self._categories_map())
+            out |= self.verifier.observe({k: v}, t, tset, geom, hidden, self._categories_map(),
+                                         held={self.tracker.held(a) for a in self.arm_keys} - {None})
         return out
 
     def _process_model(self, t: int) -> None:
@@ -723,15 +732,16 @@ class Generator:
         camera cannot see through a closed door)."""
         if not self.cfg.cook_s:
             return
-        for k, e in list(self.graph.edges.items()):
-            if k[0] != "in" or e.p < 0.7 or k[2] is None:
-                continue
-            on = (self.graph.p(("toggled_on", k[2], None)) or 0.0) >= 0.7
-            ck = ("cooked", k[1], None)
-            if not on:
-                self.cook_since.pop(ck, None)
-                continue
-            t0 = self.cook_since.setdefault(ck, t)
+        active: dict[EdgeKey, str] = {}
+        for k, e in self.graph.edges.items():
+            if k[0] == "in" and e.p >= 0.7 and k[2] is not None and (self.graph.p(("toggled_on", k[2], None)) or 0.0) >= 0.7:
+                active[("cooked", k[1], None)] = k[2]
+        for ck in list(self.cook_since):  # out of the container, or the appliance off: the timer restarts
+            if active.get(ck) != self.cook_since[ck][0]:
+                self.cook_since.pop(ck)
+        for ck, c in active.items():
+            t0 = self.cook_since.setdefault(ck, (c, t))[1]
+            k = ("in", ck[1], c)
             if (t - t0) / self.ep.fps >= self.cfg.cook_s and (self.graph.p(ck) or 0.0) < 0.7:
                 before = self.graph.p(ck)
                 self.graph.set(ck, 0.7, "mem", t)

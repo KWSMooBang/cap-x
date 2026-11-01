@@ -53,9 +53,9 @@ Marks are drawn only for tracks detected in the current image. A non-held object
 | | rule |
 |---|---|
 | allowed | B1 track-ID unification (tracker merges) |
-| allowed | B2 single-shot noise: a 0 / 1 that disagrees with both neighbouring 0 / 1 answers (which agree each other), with no robot contact in between. Hindsight answers count as neighbours. |
+| allowed | B2 single-shot noise: a 0 / 1 that disagrees with both neighbouring 0 / 1 answers (which agree each other), with no robot contact in between. Hindsight answers count as neighbours. Rows in between where the key was answered ? keep their value. |
 | allowed | B3 Effect = state difference from segment start to the row where the end state is confirmed; attached to that row only |
-| allowed | B4 Subtask = the segment's intent from the approach on: pick / place / put_in / open / close / toggle_on / move_to |
+| allowed | B4 Subtask = the segment's intent from the approach on: pick / place / put_in / open / close / toggle_on / move_to; "done" only from the row where the goal was confirmed |
 | forbidden (checked by `check_forbidden`, logged in `backward_log.json`) | filling ? from later frames |
 | forbidden | changing Delta / progress |
 | forbidden | writing a hidden process state as obs |
