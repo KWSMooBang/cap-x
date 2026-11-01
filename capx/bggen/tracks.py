@@ -436,24 +436,10 @@ class Tracker:
         cats = list(dict.fromkeys(dets[i].category for i in left))
         for cat in cats:
             idx = [i for i in left if dets[i].category == cat]
-            # 2. reacquire: joint assignment within the reacquire radius
-            # (with the fix5 held rule on, a held track is re-acquired only by 2b, measured from its hand)
-            free = [a for a in self._known(cat) if a not in used
-                    and not (cfg.held_reacquire_radius > 0 and self.tracks[a].held_by is not None)]
-            cost = np.full((len(idx), len(free)), np.inf)
-            for r, i in enumerate(idx):
-                for c, a in enumerate(free):
-                    x = self._reacq_dist(self.tracks[a], dets[i], cam, base_pose)
-                    if x is not None and x <= 1.0:
-                        cost[r, c] = x
-            for r, c in self._joint(cost):
-                self.counts["reacquired"] += 1
-                used.add(free[c])
-                out.append((idx[r], free[c], f"reacquired: unmatched track within the reacquire radius ({cost[r, c]:.2f})"))
-            idx = [i for i in idx if all(i != o[0] for o in out)]
-            # 2b. (bggen-fix5 A4) a held track of the category: a detection at its hand (within held_reacquire_radius of
-            # the EEF) is it, not an expected name -- unless another, not held track of the category is nearer to the
-            # detection than the hand (a second hot dog lying next to the held one is that one)
+            # 2a. (bggen-fix5 A4) a held track of the category: a detection at its hand (within held_reacquire_radius of
+            # the EEF) is it, before the reacquire of not-held tracks and before an expected name -- unless another, not
+            # held track of the category is nearer to the detection than the hand (a second hot dog lying next to the
+            # held one is that one)
             if cfg.held_reacquire_radius > 0 and idx:
                 held = [a for a in self._known(cat) if a not in used and self.tracks[a].held_by is not None
                         and self.tracks[a].pos is not None]
@@ -475,6 +461,21 @@ class Tracker:
                     out.append((idx[r], held[c], f"reacquired at the hand: held track within the held reacquire radius "
                                                  f"({cost[r, c]:.2f})"))
                 idx = [i for i in idx if all(i != o[0] for o in out)]
+            # 2. reacquire: joint assignment within the reacquire radius
+            # (with the fix5 held rule on, a held track is re-acquired only by 2a, measured from its hand)
+            free = [a for a in self._known(cat) if a not in used
+                    and not (cfg.held_reacquire_radius > 0 and self.tracks[a].held_by is not None)]
+            cost = np.full((len(idx), len(free)), np.inf)
+            for r, i in enumerate(idx):
+                for c, a in enumerate(free):
+                    x = self._reacq_dist(self.tracks[a], dets[i], cam, base_pose)
+                    if x is not None and x <= 1.0:
+                        cost[r, c] = x
+            for r, c in self._joint(cost):
+                self.counts["reacquired"] += 1
+                used.add(free[c])
+                out.append((idx[r], free[c], f"reacquired: unmatched track within the reacquire radius ({cost[r, c]:.2f})"))
+            idx = [i for i in idx if all(i != o[0] for o in out)]
             # 3. expected names (alphabetical), highest-score detections first
             exp = sorted(a for a in self.expected() if self.tracks[a].category == cat and a not in used)
             confirm = self._confirms(cat)

@@ -258,6 +258,21 @@ def _held_a(cfg=None, offset=np.zeros(3), b_at=None):
     return tr
 
 
+def test_held_matching_comes_before_the_reacquire_of_not_held_tracks():
+    """Lead review of a3c6215: the held track's own detection (0.02 m from the EEF) is not taken by a not-held track
+    0.20 m away (within its 0.25 m reacquire radius); a detection 0.12 m from the EEF and 0.05 m from a not-held track is
+    that track. The held track's position is 0.25 m off the fingers so the frame's first association pass misses it."""
+    off = np.array([-0.25, 0.0, 0.0])
+    tr = _held_a(offset=off, b_at=L1 + [0.02, 0.20, 0.0])
+    rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + [0.02, 0.0, 0.0]), HOT)])
+    ident = rep.get("identified", [])
+    assert [r["into"] for r in ident] == ["hotdog_A"] and "at the hand" in ident[0]["why"]
+    tr = _held_a(offset=off, b_at=L1 + [0.0, 0.17, 0.0])
+    rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + [0.0, 0.12, 0.0]), HOT)])
+    into = [r["into"] for r in rep.get("identified", [])] + [a for a in rep["matched"] if a.startswith("hotdog")]
+    assert into == ["hotdog_B"] and tr.counts.get("reacquired_held", 0) == 0
+
+
 def test_a_second_hot_dog_beside_the_held_one_is_not_taken_by_the_hand():
     """Lead review P1: a second hot dog 15-20 cm beside the held one goes to its own track (known or expected)."""
     side = np.array([0.0, 0.17, 0.0])
