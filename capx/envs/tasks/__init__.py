@@ -123,7 +123,7 @@ register_config(
     "robomme_code_env",
     CodeExecEnvConfig(
         low_level="robomme_PickXtimes_low_level",
-        apis=[],  # no RoboMME control API yet
+        apis=["FrankaRoboMMEApiReducedSkillLibrary"],
     ),
 )
 

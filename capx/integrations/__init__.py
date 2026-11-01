@@ -116,6 +116,13 @@ register_api(
 register_api("FrankaRealReducedSkillLibraryControlApi", lambda env: FrankaControlApiReducedSkillLibrary(env, tcp_offset=[0.0, 0.0, -0.157], real = True))
 register_api("FrankaRealControlApi", lambda env: FrankaControlApi(env, tcp_offset=[0.0, 0.0, -0.157], real = True))
 
+# RoboMME: same functions as FrankaLiberoApiReducedSkillLibrary (needs no LIBERO install).
+try:
+    from .robomme.api import FrankaRoboMMEApiReducedSkillLibrary
+    register_api("FrankaRoboMMEApiReducedSkillLibrary", FrankaRoboMMEApiReducedSkillLibrary)
+except ImportError as _robomme_api_exc:
+    print(f"RoboMME API unavailable, skipping ({_robomme_api_exc})")
+
 try:
     from .r1pro.control import R1ProControlApi
     register_api("R1ProControlApi", lambda env: R1ProControlApi(env, use_sam3=True))

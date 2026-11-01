@@ -8,7 +8,7 @@ from capx.integrations.robomme import RoboMMEHandle, load_robomme_task
 class RoboMMEWrapper:
     """Thin wrapper around one RoboMME episode (mirrors ``LiberoWrapper``).
 
-    ``memory_state()`` returns RoboMME's task goal, oracle subgoals, status and reset frames.
+    ``memory_state()`` returns RoboMME's task goal, oracle subgoals and status (logs only; no frames).
     """
 
     def __init__(

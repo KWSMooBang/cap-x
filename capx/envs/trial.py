@@ -64,6 +64,45 @@ TRUNCATED_REPLY_FEEDBACK = (
     "Your previous reply was cut off by the output token limit and was not executed. Reply more concisely."
 )
 
+# Token usage of the VDM calls made since the last _take_vdm_usage() (one trial runs at a time per process).
+_VDM_USAGE: list[Any] = []
+
+
+def _query_vdm(visual_differencing_args: ModelQueryArgs, prompt: list[dict[str, Any]]) -> str:
+    """Query the VDM and record its token usage for the trial log."""
+    out = _query_model(visual_differencing_args, prompt)
+    _VDM_USAGE.append(out.get("usage"))
+    return out["content"]
+
+
+def _take_vdm_usage() -> list[Any]:
+    usage = list(_VDM_USAGE)
+    _VDM_USAGE.clear()
+    return usage
+
+
+def _write_trial_end(code_path: str | None, record: dict[str, Any]) -> None:
+    """Write ``trial_end.json`` (how the trial ended) next to the trial's code.py.
+
+    It is written once, after the final artifacts, so its presence marks a finished trial (used to resume
+    runs). ``reason``: finish | turn_limit | step_cap | wall_timeout, or the env's own episode end
+    (RoboMME: success | fail | timeout | error).
+    """
+    if not code_path:
+        return
+    try:
+        with open(os.path.join(os.path.dirname(str(code_path)), "trial_end.json"), "w") as f:
+            json.dump(record, f, indent=2, default=str)
+    except OSError as exc:
+        print(f"could not write trial_end.json: {exc}")
+
+
+def _episode_end_reason(env: Any) -> str | None:
+    """Why the low-level env ended the episode (RoboMMEEnv.episode_end_reason), or None."""
+    reason = getattr(getattr(env, "low_level_env", None), "episode_end_reason", None)
+    return reason if isinstance(reason, str) else None
+
+
 # ---------------------------------------------------------------------------
 # Shared formatting helpers
 # ---------------------------------------------------------------------------
@@ -338,7 +377,7 @@ def _describe_initial_scene(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    return _query_vdm(visual_differencing_args, prompt)
 
 
 def _get_visual_differencing_feedback(
@@ -395,7 +434,7 @@ def _get_visual_differencing_feedback(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    return _query_vdm(visual_differencing_args, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +510,7 @@ def _get_video_differencing_feedback(
         },
         {"role": "user", "content": user_content},
     ]
-    return _query_model(visual_differencing_args, prompt)["content"]
+    return _query_vdm(visual_differencing_args, prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +763,7 @@ def _handle_multi_turn_step(
                 "s5_rejection_prompt_tail": rejection_prompt[-2:], "s5_first_reply": first,
             }
 
+    parse_meta["vdm_usage"] = _take_vdm_usage()
     reasoning = content["reasoning"]
     return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
@@ -750,6 +790,9 @@ def _run_single_trial(
         5. Save artifacts (code, logs, per-turn videos, combined video) and return a TrialSummary.
     """
     trial_start_time = time.time()
+    _take_vdm_usage()  # drop anything left from an earlier (e.g. timed-out) trial in this process
+    if partial_artifacts is not None:
+        partial_artifacts["trial_start_time"] = trial_start_time
 
     use_video_diff = config.get("use_video_differencing", False)
     use_wrist = config.get("use_wrist_camera", False)
@@ -894,6 +937,7 @@ def _run_single_trial(
         **response_meta,
         "init_source": reset_info.get("init_source"),
         "reset_memory": reset_info.get("memory"),
+        "vdm_usage": _take_vdm_usage(),
         "memory_mode": memory.mode,
         "memory_initial_text": initial_memory_text,
         "memory_state": memory.state(),
@@ -912,6 +956,7 @@ def _run_single_trial(
     reward = 0.0
     terminated = truncated = False
     code_block_idx = 0
+    end_reason = "turn_limit"  # unless the model finishes or the episode is truncated
 
     # Track whether we're recording frames (for video diff or record_video)
     recording_frames = (
@@ -956,9 +1001,10 @@ def _run_single_trial(
         # a fallback for envs without one).
         if truncated or "terminated episode" in info_step["stderr"]:
             truncated = True
+            end_reason = _episode_end_reason(env) or "step_cap"
             all_responses.append({
                 "decision": "truncated",
-                "reason": "step_cap",
+                "reason": end_reason,
                 "block_idx": [code_block_idx],
                 "exec_s": round(exec_s, 2),
                 "sim_steps": sim_steps,
@@ -966,7 +1012,7 @@ def _run_single_trial(
                 # The block that hit the cap may still have completed the task (summary keeps it).
                 "task_completed": info_step.get("task_completed"),
             })
-            print(f"Episode truncated at {sim_steps} sim steps (step cap)")
+            print(f"Episode truncated at {sim_steps} sim steps ({end_reason})")
             break
 
         # Multi-turn decision
@@ -1061,6 +1107,7 @@ def _run_single_trial(
                     **parse_meta,
                 })
                 print("Model chose to finish")
+                end_reason = "finish"
                 num_finishes += 1
                 if partial_artifacts is not None:
                     partial_artifacts["num_finishes"] = num_finishes
@@ -1144,7 +1191,21 @@ def _run_single_trial(
         except Exception as exc:
             print(f"[SkillLibrary] Skill extraction failed: {exc}")
 
-    print(f"Trial {trial} took {time.time() - trial_start_time:.2f} seconds")
+    trial_time_s = time.time() - trial_start_time
+    _write_trial_end(code_path, {
+        "trial": trial,
+        "reason": end_reason,
+        "task_completed": bool(info_step.get("task_completed", False)),
+        "reward": reward,
+        "turns": code_block_idx,
+        "num_code_blocks": num_code_blocks,
+        "num_regenerations": num_regenerations,
+        "num_finishes": num_finishes,
+        "sim_steps": getattr(getattr(env, "low_level_env", None), "_sim_step_count", None),
+        "time_s": round(trial_time_s, 2),
+        "episode_end_reason": _episode_end_reason(env),
+    })
+    print(f"Trial {trial} took {trial_time_s:.2f} seconds")
 
     gc.collect()
 

@@ -199,7 +199,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "use_oracle_code": args.use_oracle_code
         if args.use_oracle_code is not None
         else configs_dict.get("use_oracle_code", False),
-        "resume_idx": configs_dict.get("resume_idx", None),
+        "resume_idx": getattr(args, "resume_idx", None)
+        if getattr(args, "resume_idx", None) is not None
+        else configs_dict.get("resume_idx", None),
         "use_visual_feedback": args.use_visual_feedback
         if args.use_visual_feedback is not None
         else configs_dict.get("use_visual_feedback", False),

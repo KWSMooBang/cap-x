@@ -95,6 +95,9 @@ class LaunchArgs:
     total_trials: int | None = None
     """Total number of trials to run. Overrides the value in the YAML config."""
 
+    resume_idx: int | None = None
+    """Run trials resume_idx..total_trials only (resume an interrupted run). Overrides the YAML config."""
+
     num_workers: int | None = None
     """Number of parallel worker processes to use. Overrides the value in the YAML config."""
 

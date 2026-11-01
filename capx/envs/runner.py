@@ -24,8 +24,10 @@ from capx.envs.trial import (
     TRIAL_TIMEOUT_SECONDS,
     _annotate_code_blocks,
     _build_log_lines,
+    _episode_end_reason,
     _run_single_trial,
     _save_turn_and_combined_videos,
+    _write_trial_end,
 )
 from capx.utils.launch_utils import (
     TrialSummary,
@@ -420,6 +422,23 @@ def _build_timeout_summary(
     )
     if env is not None:
         _save_timeout_videos(env, config, trial, pa, {**info_step, "sandbox_rc": 1}, reward)
+    start = pa.get("trial_start_time")
+    low = getattr(env, "low_level_env", None)
+    _write_trial_end(code_path, {
+        "trial": trial,
+        "reason": "wall_timeout",
+        "task_completed": bool(info_step.get("task_completed", False)),
+        "reward": reward,
+        # Turns whose code finished running (the turn cut off by the timeout is not counted).
+        "turns": sum(1 for r in pa.get("all_responses", []) if "exec_s" in r),
+        "num_code_blocks": num_code_blocks,
+        "num_regenerations": num_regenerations,
+        "num_finishes": num_finishes,
+        "sim_steps": getattr(low, "_sim_step_count", None) if low is not None else None,
+        "time_s": round(time.time() - start, 2) if start else None,
+        "episode_end_reason": _episode_end_reason(env),
+        "error": repr(exc),
+    })
 
     return TrialSummary(
         trial=trial,

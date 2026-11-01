@@ -23,8 +23,37 @@ ROBOMME_TASKS = [
     "InsertPeg", "MoveCube", "PatternLock", "RouteStick",
 ]  # BenchmarkEnvBuilder.get_task_list() order
 
-# info keys that carry task progress (exposed as memory state)
+# info keys that carry task progress. Oracle / evaluation-only: they go to the trial logs (info["memory"]),
+# never into a prompt or the generated-code sandbox (task_goal reaches the prompt only as the goal line).
 MEMORY_INFO_KEYS = ("task_goal", "simple_subgoal_online", "grounded_subgoal_online", "status")
+
+# Suites (README of RoboMME) in benchmark task order.
+ROBOMME_SUITES = {
+    "Counting": ("BinFill", "PickXtimes", "SwingXtimes", "StopCube"),
+    "Permanence": ("VideoUnmask", "VideoUnmaskSwap", "ButtonUnmask", "ButtonUnmaskSwap"),
+    "Reference": ("PickHighlight", "VideoRepick", "VideoPlaceButton", "VideoPlaceOrder"),
+    "Imitation": ("MoveCube", "InsertPeg", "PatternLock", "RouteStick"),
+}
+TASK_SUITE = {task: suite for suite, tasks in ROBOMME_SUITES.items() for task in tasks}
+# These two hold a stick instead of the gripper: 7-D actions (the wrapper drops the 8th value).
+STICK_TASKS = ("PatternLock", "RouteStick")
+# Step budget used for the MME-VLA results in the RoboMME paper (scripts/evaluation.py); the CVPR 2026
+# challenge uses 1500. One step = one ManiSkill control step (pd_joint_pos, 20 Hz).
+DEFAULT_MAX_STEPS = 1300
+CONTROL_FREQ_HZ = 20
+
+
+def _json_safe(x: Any) -> Any:
+    x = to_numpy(x)
+    if isinstance(x, np.ndarray):
+        return x.tolist() if x.size <= 16 else f"<array {x.shape}>"
+    if isinstance(x, (np.generic,)):
+        return x.item()
+    if isinstance(x, (list, tuple)):
+        return [_json_safe(v) for v in x]
+    if isinstance(x, dict):
+        return {str(k): _json_safe(v) for k, v in x.items()}
+    return x
 
 
 def to_numpy(x: Any) -> Any:
@@ -67,10 +96,22 @@ class RoboMMEHandle:
         # Read by capx.envs.trial._patch_libero_goal to fill {libero_environment_goal} in prompts.
         return self.task_goal()
 
+    def num_conditioning_frames(self) -> int:
+        """Frames returned at reset before the current one (the conditioning video; 0 for most tasks).
+
+        RoboMME's own evaluation marks every reset frame but the last as demonstration
+        (``scripts/evaluation.py``: ``is_video_demo = i < len(rgb_list) - 1``).
+        """
+        return max(0, len(self.reset_obs.get("front_rgb_list", [])) - 1)
+
+    def conditioning_frames(self, camera: str = "front") -> list[np.ndarray]:
+        frames = self.reset_obs.get(f"{camera}_rgb_list", [])
+        return [np.asarray(f) for f in frames[:-1]]
+
     def memory_state(self) -> dict[str, Any]:
-        """Task-progress info from RoboMME plus the conditioning frames returned at reset."""
-        state = {k: self.last_info.get(k) for k in MEMORY_INFO_KEYS}
-        state["reset_obs_lists"] = self.reset_obs
+        """RoboMME task-progress info (oracle subgoals, status) for evaluation logs; JSON-safe, no frames."""
+        state = {k: _json_safe(self.last_info.get(k)) for k in MEMORY_INFO_KEYS}
+        state["num_conditioning_frames"] = self.num_conditioning_frames()
         return state
 
 
@@ -79,7 +120,7 @@ def load_robomme_task(
     episode_idx: int = 0,
     dataset: str = "test",
     action_space: str = "joint_angle",
-    max_steps: int = 1000,
+    max_steps: int = DEFAULT_MAX_STEPS,
     **include_flags: bool,
 ) -> RoboMMEHandle:
     """Build one RoboMME episode env. ``include_flags`` are the builder's ``include_*`` switches."""

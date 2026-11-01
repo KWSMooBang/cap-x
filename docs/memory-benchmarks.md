@@ -78,12 +78,123 @@ uv sync --active --extra robomme
   ManiSkill's `"cpu"` fallback device cannot render. `BenchmarkEnvBuilder` hard-codes
   `obs_mode="rgb+depth+segmentation"`, so `RoboMMEEnv` needs the NVIDIA ICD until ManiSkill parses `pci:` device
   ids (e.g. `split(":", 1)`).
-- Envs: `capx.envs.simulators.robomme.RoboMMEEnv(task_id="PickXtimes", episode_idx=0, dataset="test")`, registered
-  as `robomme_<TaskID>_low_level`. Actions use RoboMME's `joint_angle` space: absolute 7 joints plus a gripper value
-  (+1 open, -1 closed). `reset(seed=k)` picks episode `(k-1) % n` of the split.
-- Memory state: `obs["memory"]` holds `task_goal`, `simple_subgoal_online`, `grounded_subgoal_online` and `status`,
-  plus `reset_obs_lists`: all frames returned at reset, including the conditioning video for Video* tasks.
-  `obs["obs_lists"]` holds every frame from the latest step.
-- No cap-x control API is registered for RoboMME yet (`apis: []` in `env_configs/robomme/*.yaml`).
+- Envs: `capx.envs.simulators.robomme.RoboMMEEnv(task_id="PickXtimes", dataset="test", max_steps=1300,
+  condition_frames=8)`, registered as `robomme_<TaskID>_low_level`; code env `RoboMMECodeEnv`.
+- The GPU pod also needs `--extra contactgraspnet` in the same venv for the Contact-GraspNet server
+  (`uv sync --active --extra robomme --extra contactgraspnet`); Molmo2-8B runs from `.venv-molmo` as for LIBERO.
 
-Smoke test (needs Vulkan): `uv run --no-sync python scripts/bench_smoke.py --config-path env_configs/robomme/robomme_pickxtimes.yaml`
+### RoboMME conventions (checked in the RoboMME and ManiSkill source)
+
+| What | Convention |
+|---|---|
+| Action (`joint_angle`) | Absolute `[7 joint angles (rad), gripper]`, gripper `+1` open / `-1` closed. PatternLock and RouteStick hold a stick: 7-D, and the wrapper drops an 8th value. One `env.step` = one ManiSkill control step (`pd_joint_pos`, 20 Hz). |
+| Frames | World: +x forward, +y left, +z up, table top `z = 0`. Panda base (`panda_link0`) at world `(-0.615, 0, 0)`, identity rotation. cap-x reports everything in the **base frame** (world + 0.615 m in x), as on LIBERO. |
+| Cameras | `front` (256×256, fov 90°) and `wrist`. `*_camera_extrinsic_list` is ManiSkill `extrinsic_cv`: 3×4 **world → camera**, OpenCV axes. `*_camera_intrinsic` is `intrinsic_cv`. Depth is `int16` **millimetres**. |
+| Robot state | `joint_state_list` has the 7 joints. `gripper_state_list` has the two finger positions (0.04 m = open). `eef_state_list` is the TCP (`panda_hand_tcp`, 0.1034 m in front of `panda_hand`) as world xyz + extrinsic-XYZ rpy (unwrapped). |
+| Success | `info["status"]`: `success` (the task's `evaluate()` succeeds), `fail` (terminated without success, e.g. the wrong object was picked), `timeout` (step budget), `ongoing` or `error`. RoboMME's own evaluation stops at `terminated or truncated` and scores `status == "success"`. |
+| Step budget | Not per task: the paper's MME-VLA runs use `max_steps=1300` for every task (`scripts/evaluation.py`), and the CVPR 2026 challenge uses 1500. We use 1300. |
+| Episodes | `test` split: 50 episodes per task, each with a fixed seed and difficulty from `env_metadata`. |
+| Goal | `info["task_goal"]` is a list of paraphrases. `[0]` is the main goal, which is what RoboMME's evaluation uses. |
+
+### CaP-X control API (`FrankaRoboMMEApiReducedSkillLibrary`)
+
+`capx.integrations.robomme.api.FrankaRoboMMEApiReducedSkillLibrary` subclasses the LIBERO CaP-Agent0 API
+(`FrankaLiberoApiReducedSkillLibrary`). `functions()` has the same names and signatures, so the prompt's API section
+is the same text except for the docstrings listed below. `tests/test_robomme_api.py` checks the names and signatures.
+Perception (SAM3, Contact-GraspNet, Molmo) and IK (pyroki, `panda_description`, `panda_hand`) use the same servers.
+ManiSkill's Panda has the same kinematics: pyroki's IK agrees with the Panda DH model in
+`capx/integrations/robomme/geometry.py` (tested). The IK result is sent to RoboMME as a `joint_angle` action.
+
+Differences from LIBERO (each one is in the docstring the model sees):
+
+- `get_observation`: same keys. `agentview` is RoboMME's **front** camera and `robot0_eye_in_hand` its wrist camera.
+  `pose_mat` is camera → base (OpenCV axes), and depth is in metres, shape `(H, W)`. `robot_cartesian_pos` is the
+  **tool centre point** (between the fingertips, or the stick tip) with the `panda_hand` orientation, so
+  `goto_pose(p[:3], p[3:7])` keeps the robot where it is. There is no segmentation image, because it would leak
+  object identities.
+- `solve_ik` / `goto_pose`: the target position is the TCP. The TCP offset from `panda_hand` is measured from the
+  simulator at reset (`RoboMMEEnv.tcp_offset_hand`), instead of LIBERO's fixed 0.1 m. It is about `[0, 0, 0.103]` m
+  for the gripper and the stick tip for the stick tasks. Positions are clamped to `x ∈ [-0.1, 0.95]`, `|y| ≤ 0.6`,
+  `z ∈ [0, 0.9]`.
+- `move_to_joints`: interpolates in joint space by at most 0.06 rad per control step, then waits for the joints
+  to settle within 0.01 rad, up to 120 steps in total. Every control step counts toward the 1300-step budget.
+- `open_gripper` / `close_gripper`: 15 control steps (LIBERO: 30 sim steps). For PatternLock and RouteStick they
+  print that the robot holds a stick and do nothing.
+- `goto_home_joint_position`: goes to the pose at the start of the episode. That is RoboMME's reset pose
+  `[0, 0, 0, -π/2, 0, π/2, π/4]` (the swing pose for the stick tasks), not LIBERO's home pose.
+
+### Episodes, budget and logs
+
+- `reset(seed=k)` plays test episode `(k-1) % 50`, so trial k is the same episode in every run (trials 1–5 =
+  episodes 0–4).
+- The episode ends at the first control step whose status is terminal (`success`, `fail`, `timeout`, `error`), or
+  at the step that would exceed `max_steps` (`step_cap`). The env records `episode_end_reason` and raises
+  `EpisodeTruncated`, so the generated code stops there. `RoboMMECodeEnv.step` then reports `truncated`, and the
+  trial ends with `{"decision": "truncated", "reason": <episode_end_reason>}` in `all_responses.json`. Success is
+  the recorded `status == "success"` (`task_completed`), so later motion cannot undo it.
+- Configs set `trial_timeout_s: 3600` and `max_trial_retries: 1`. A trial that runs out of time ends as
+  `wall_timeout`.
+- **Privileged information**: `get_observation()` (and the sandbox's `obs` / `INPUTS`) holds only cameras and robot
+  state. RoboMME's `simple_subgoal_online`, `grounded_subgoal_online`, `status`, the goal list and the frame lists
+  never reach a prompt or the sandbox. `env.memory_state()` / `info["memory"]` keep them (JSON-safe, without frames)
+  for the trial logs only (`reset_memory` and the per-turn `memory` in `all_responses.json`). The goal line is
+  `info["task_goal"][0]`, filled into `{libero_environment_goal}` as on LIBERO.
+- Configs: `env_configs/robomme/robomme_<task>.yaml` (16 files). They are generated by
+  `scripts/gen_robomme_configs.py`, so do not edit them by hand. They use the LIBERO-Mem baseline settings:
+  CaP-Agent0 prompts, the same API servers, ensemble off, VDM on, video on, `max_tokens: 32768` and
+  `memory_mode: none`. Pass the models on the CLI as for LIBERO-Mem
+  (`--model moonshotai/Kimi-K3 --visual-differencing-model Qwen/Qwen3.8-27B`, see `docs/capbg-baseline.md`).
+
+### Conditioning video (Video* and Imitation tasks)
+
+Nine tasks show a demonstration before the robot gets control: VideoUnmask, VideoUnmaskSwap, VideoRepick,
+VideoPlaceButton, VideoPlaceOrder, MoveCube, InsertPeg, PatternLock and RouteStick. For these, `reset()` returns all
+of the video's frames, and RoboMME treats every reset frame except the last as the video. For CaP-X:
+
+- The **first** prompt gets `condition_frames` front-camera frames (default 8; set it in the low-level config).
+  They are sampled uniformly over the video, including the first and last frame. Each one is a PNG image with a
+  caption `Video frame n/K (t = … s, frame i of N)`, after one line that says how long the video was. Wrist frames
+  are not included (MME-VLA also uses one view).
+- `get_observation()` returns only the current frame. Decision prompts are rebuilt from the env's own prompt and
+  never hold the video, so the memory-less baseline sees it once. The VDM's initial scene description uses only the
+  current frame.
+- `all_responses.json` keeps the first prompt with the images, and `reset_memory.condition_frame_indices` lists the
+  sampled frame indices. The trial video starts with the conditioning video (every 2nd frame, with a red border, as
+  RoboMME's own recorder marks demonstration frames).
+- How much video the RoboMME baselines get: the best MME-VLA policy (`perceptual-framesamp-modul`) keeps a
+  512-token memory at 16 tokens per front frame, i.e. 32 sampled frames of history. The Embodied-Astra VLM
+  baseline gets every 3rd frame, up to 750 images. 8 full-resolution frames are fewer frames than MME-VLA gets,
+  with more pixels per frame. Raise `condition_frames` for tasks whose video has many short events (e.g.
+  VideoPlaceOrder).
+- Tasks without a video (e.g. StopCube, PickHighlight, ButtonUnmask*) can still show brief events while the robot
+  moves. Generated code only sees what it asks `get_observation()` for, and the VDM sees one image per turn.
+
+### Harness additions used here (all benchmarks)
+
+- `trial_end.json` in every finished trial directory: `reason` (`finish`, `turn_limit`, `step_cap`,
+  `wall_timeout`, or the env's own episode end, e.g. RoboMME `success` / `fail` / `timeout`), `task_completed`,
+  `turns`, `sim_steps` and `time_s`. It is written last, so it also marks a finished trial for resuming.
+- `vdm_usage` (a list of token usages) on the initial entry and every decision entry of `all_responses.json`.
+- `--resume-idx k` on the CLI (it was YAML only) runs trials `k..total_trials`.
+
+### Smoke tests and pilot (GPU pod with NVIDIA Vulkan)
+
+```bash
+source .venv-robomme/bin/activate
+# (1) API smoke: scripted segment -> plan_grasp -> goto_pose -> close -> lift -> place on PickXtimes, no LLM
+python scripts/robomme_api_smoke.py --config-path env_configs/robomme/robomme_pickxtimes.yaml \
+    --out-dir outputs/robomme_smoke/api_pickxtimes --seed 1
+# (2) CaP-X, one task per suite x 1 trial, real models
+python scripts/run_robomme_pilot.py --run-name robomme_smoke_suites --trials 1 --workers 2 \
+    --tasks PickXtimes VideoUnmaskSwap VideoRepick MoveCube
+# Pilot: 16 tasks x 5 trials (episodes 0-4), resumable (rerun the same command)
+python scripts/run_robomme_pilot.py --run-name 20261101_robomme_pilot --trials 5 --workers 2
+python scripts/analyze_robomme_pilot.py outputs/robomme_pilot/20261101_robomme_pilot
+```
+
+`run_robomme_pilot.py` reads the endpoint from `$NEBIUS_SERVER_URL` and the key from `$NEBIUS_API_KEY`. It starts the
+SAM3, Contact-GraspNet and pyroki servers once and runs `--workers` tasks at a time. The aggregator writes
+`results.tsv` (`cond task trial reason success turns sim_steps time_s`, plus coding and VDM tokens) and `SUMMARY.md`
+(success by task and suite, end reasons, mean turns / steps / time, tokens).
+
+Raw env smoke (no API): `uv run --no-sync python scripts/bench_smoke.py --config-path env_configs/robomme/robomme_pickxtimes.yaml`
