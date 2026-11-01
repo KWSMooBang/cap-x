@@ -71,6 +71,9 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     handempty·near·above·lifted predicate, 하위 작업 단위 S1·S2, 새 S3), belief_trace.jsonl 구조화 저장, 목표 파싱을 시점 명시 공간 서술로,
     보임 모델(시야·팔 가림), 교란 ×0.8. 근거: bg_oracle S2 다음 턴 진전 20/121(17%), 실패의 2/3 가 조작 실패, B1K 설계와의 차이.
 2f. [진행] v2 병합 후 kubectl: eval_observe(VDM Observe 오프라인 정확도) → bg_est2 smoke → bg_est2 10×5 (같은 seed 로 none_v2·bg_oracle 과 짝 비교).
+    2026-11-01 (KST) 10×5 중간 28 trial 에서 버그 2건 확인: (a) 판단 응답이 펜스 없는 원시 코드('# Subtask' 로 시작)면 fallback FINISH → misparsed_finish 3건,
+    (b) bowl/plate flat_dz 0.018 이 실측(중앙값 0.028)보다 낮아 거부권 오답 27/32 · S4 오발동. 수정 L2: exp/decision-rawcode, exp/bg-est2-flatdz.
+    진행 중 run 은 끝까지 두고(원래 설정 기준 자료), 수정 후 bg_est2 10×5 전체 재실행 여부는 사람 결정 대기 (계획 규모 초과: 약 10 GPU-h, coding 약 50달러).
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
