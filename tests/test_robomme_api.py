@@ -69,8 +69,10 @@ class FakeBenchmarkEnv:
     """Stand-in for ``BenchmarkEnvBuilder.make_env_for_episode(...)`` in joint_angle action space."""
 
     def __init__(self, task_id: str = "PickXtimes", n_demo: int = 0, success_at: int | None = None,
-                 fail_at: int | None = None) -> None:
+                 fail_at: int | None = None, reset_status: str = "ongoing") -> None:
         self.task_id = task_id
+        self.reset_status = reset_status
+        self.reset_calls = 0
         self.stick = task_id in ("PatternLock", "RouteStick")
         self.n_demo = n_demo
         self.success_at, self.fail_at = success_at, fail_at
@@ -109,10 +111,13 @@ class FakeBenchmarkEnv:
         }
 
     def reset(self):
+        self.reset_calls += 1
         self.q, self.g, self.n = HOME.copy(), 0.04, 0
         frames = [self._obs(i + 1) for i in range(self.n_demo)] + [self._obs(200)]
         obs = {k: [f[k] for f in frames] for k in frames[0]}
-        return obs, self._info("ongoing")
+        # Like RoboMME's DemonstrationWrapper: a second reset of the same env keeps the success state.
+        status = "success" if self.reset_calls > 1 else self.reset_status
+        return obs, self._info(status)
 
     def step(self, action):
         a = np.asarray(action, dtype=float)
@@ -398,6 +403,46 @@ def test_seed_selects_test_episode(monkeypatch, patched_models):
     for seed, episode in ((1, 0), (2, 1), (5, 4), (51, 0)):
         _, info = env.reset(seed=seed)
         assert info["episode_idx"] == episode == env.handle.episode_idx
+
+
+def test_reset_same_episode_reloads_env(monkeypatch, patched_models):
+    """Constructed on episode 0, then reset(seed=1) (episode 0 again): a fresh env, reset exactly once."""
+    env = make_env(monkeypatch)
+    first = env.handle
+    assert first.episode_idx == 0 and first.env.reset_calls == 1
+    _, info = env.reset(seed=1)
+    assert env.handle is not first and first.env.closed
+    assert env.handle.env.reset_calls == 1 and env.handle.reset_count == 1
+    assert info["memory"]["status"] == "ongoing"
+    for seed in (1, None, 2, 2):
+        prev = env.handle
+        _, info = env.reset(seed=seed)
+        assert env.handle is not prev and prev.env.closed and env.handle.env.reset_calls == 1
+        assert info["memory"]["status"] == "ongoing"
+
+
+def test_trial_one_does_not_start_successful(monkeypatch, patched_models):
+    code_env = make_code_env(monkeypatch, task_id="VideoPlaceOrder", n_demo=10)
+    code_env.reset(seed=1)
+    _, _, _, truncated, info = code_env.step("open_gripper()")
+    assert not truncated and not code_env.low_level_env.task_completed()
+    assert code_env.low_level_env.handle.env.reset_calls == 1
+
+
+@pytest.mark.parametrize("reset_status", ["success", "fail"])
+def test_reset_rejects_finished_status(monkeypatch, patched_models, reset_status, caplog):
+    with pytest.raises(sim_mod.RoboMMEResetError), caplog.at_level("ERROR"):
+        make_env(monkeypatch, reset_status=reset_status)
+    assert "reset returned status" in caplog.text
+
+
+def test_reset_check_catches_stale_second_reset(monkeypatch, patched_models):
+    """The pre-fix path (RoboMME env.reset() twice on one env) is caught by the reset check."""
+    env = make_env(monkeypatch)
+    _, info = env.handle.reset()
+    assert info["status"] == "success" and info["success"]
+    with pytest.raises(sim_mod.RoboMMEResetError):
+        env._check_reset_info(info)
 
 
 # --------------------------------------------------------------------------------------------------

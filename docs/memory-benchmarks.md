@@ -127,6 +127,11 @@ Differences from LIBERO (each one is in the docstring the model sees):
 
 - `reset(seed=k)` plays test episode `(k-1) % 50`, so trial k is the same episode in every run (trials 1–5 =
   episodes 0–4).
+- Every `reset` loads the episode env again if it was already reset (including the reset at construction), so
+  RoboMME `env.reset()` runs exactly once per trial. A second `reset()` of the same RoboMME env keeps the previous
+  success state (`status == "success"` right after reset); before this fix trial 1 (episode 0, already loaded and
+  reset at construction) started "successful" and ended after one control step. `reset` raises
+  `RoboMMEResetError` (and logs it) if the reset info is not `status == "ongoing"` with `success` false.
 - The episode ends at the first control step whose status is terminal (`success`, `fail`, `timeout`, `error`), or
   at the step that would exceed `max_steps` (`step_cap`). The env records `episode_end_reason` and raises
   `EpisodeTruncated`, so the generated code stops there. `RoboMMECodeEnv.step` then reports `truncated`, and the
