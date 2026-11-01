@@ -152,6 +152,14 @@ def _condition_video_mode(args: Any, config: dict[str, Any]) -> str:
     return mode
 
 
+def _condition_video_segment_settings(config: dict[str, Any]) -> dict[str, int]:
+    """stride / segment_frames / overlap / max_segments for vdm_text (segment_frames 0: one call, sampled frames)."""
+    from capx.envs.tasks.robomme.robomme_env import CONDITION_VIDEO_SEGMENT_DEFAULTS
+
+    return {k: int(config.get(f"condition_video_{k}") if config.get(f"condition_video_{k}") is not None else v)
+            for k, v in CONDITION_VIDEO_SEGMENT_DEFAULTS.items()}
+
+
 def _apply_condition_video_mode(
     env: Any, obs: dict[str, Any], args: Any, config: dict[str, Any], vdm_args: ModelQueryArgs
 ) -> dict[str, Any] | None:
@@ -169,7 +177,25 @@ def _apply_condition_video_mode(
         return log
     handle = getattr(env.low_level_env, "handle", None)
     goal = getattr(handle, "task_language", None) if handle is not None else None
-    prompt = env.condition_video_vdm_prompt(goal if isinstance(goal, str) else None)
+    goal = goal if isinstance(goal, str) else None
+    seg = _condition_video_segment_settings(config)
+    if seg["segment_frames"] > 0:
+        # Every stride-th frame in overlapping parts, one VDM call per part, state carried between parts.
+        from capx.envs.tasks.robomme.robomme_env import describe_condition_video_segmented
+
+        def query(a: ModelQueryArgs, prompt: list[dict[str, Any]]) -> dict[str, Any]:
+            out = _query_model(a, prompt)
+            _VDM_USAGE.append(out.get("usage"))
+            return out
+
+        description, seg_log = describe_condition_video_segmented(
+            query, vdm_args, goal, env.condition_video_all_frames(), **seg)
+        env.use_condition_video_text(obs, description, how=seg_log["how"])
+        log.update({"vdm_model": vdm_args.model, "description": description, "n_frames": seg_log["n_frames"],
+                    "frame_indices": seg_log["frame_indices"], "segmentation": seg_log["segmentation"],
+                    "vdm_calls": seg_log["vdm_calls"], "parts": seg_log["parts"]})
+        return log
+    prompt = env.condition_video_vdm_prompt(goal)
     calls = []
     out: dict[str, Any] = {}
     for _ in range(2):  # one more try for an empty or cut-off description

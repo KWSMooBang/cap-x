@@ -94,6 +94,11 @@ TEXT_ONLY_MODELS = [
     "Qwen/Qwen3-235B-A22B-Instruct-2507",
     "moonshotai/Kimi-K2.7-Code",
     "deepseek-ai/DeepSeek-V4-Pro",
+    # Candidate replacements (IDs as in env_configs/pricing/nebius.yaml; check them in the catalogue).
+    # Qwen/Qwen3.5-397B-A17B is not listed: it takes images (add it here if the Nebius endpoint is text-only).
+    "zai-org/GLM-5.3",
+    "nvidia/Nemotron-3-Ultra-550b",
+    "deepseek-ai/DeepSeek-V4-Flash-0731",
 ]
 
 # Upstream synthesis model of query_model_ensemble (used when no synthesis model is configured).

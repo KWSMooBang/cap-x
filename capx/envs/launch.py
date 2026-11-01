@@ -132,6 +132,18 @@ class LaunchArgs:
     ensemble_synthesis_model: str | None = None
     """Multimodel ensemble synthesis model (overrides YAML ensemble.synthesis_model). Unset: upstream openai/gpt-5.4."""
 
+    condition_video_stride: int | None = None
+    """vdm_text: describe every n-th conditioning frame (default 1; grows if there would be > max_segments parts)."""
+
+    condition_video_segment_frames: int | None = None
+    """vdm_text: frames per VDM call (default 20; 0 = one call with the condition_frames sampled frames)."""
+
+    condition_video_overlap: int | None = None
+    """vdm_text: frames each part shares with the previous one (default 4)."""
+
+    condition_video_max_segments: int | None = None
+    """vdm_text: at most this many VDM calls per video (default 12)."""
+
     condition_video_mode: str | None = None
     """RoboMME conditioning video in the first prompt: images (default; the sampled frames), vdm_text (the VDM
     describes the frames once and the text goes in their place) or auto (vdm_text if any coding-side model

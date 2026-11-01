@@ -42,7 +42,7 @@ from test_robomme_api import make_code_env, patched_models  # noqa: E402, F401
 
 ENS_DIR = REPO_ROOT / "env_configs" / "capbg_ensemble"
 NEBIUS = [("openai/gpt-oss-120b", [0.1, 0.5, 0.9]), ("Qwen/Qwen3-235B-A22B-Instruct-2507", [0.1, 0.5, 0.9]),
-          ("moonshotai/Kimi-K2.7-Code", [0.1, 0.5, 0.9])]
+          ("deepseek-ai/DeepSeek-V4-Flash-0731", [0.1, 0.5, 0.9])]
 SYNTH = "deepseek-ai/DeepSeek-V4-Pro"
 CODE = "```python\nopen_gripper()\n```"
 IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
@@ -144,7 +144,7 @@ def test_default_ensemble_requests_unchanged(server):
 
 
 def test_configured_candidates_and_synthesis(server):
-    server.fail = {"moonshotai/Kimi-K2.7-Code"}
+    server.fail = {"deepseek-ai/DeepSeek-V4-Flash-0731"}
     out = query_model_ensemble(_args(server.url), PROMPT, synthesis_model=SYNTH, candidates=NEBIUS)
     cands = server.candidates()
     assert sorted((b["model"], b["temperature"]) for b in cands) == sorted((m, t) for m, ts in NEBIUS for t in ts)
@@ -154,7 +154,7 @@ def test_configured_candidates_and_synthesis(server):
     assert synth["temperature"] == 0.2
     assert synth["messages"][0]["content"].startswith("You are synthesizing 6 candidate Python solutions")
     text = synth["messages"][1]["content"][0]["text"]
-    assert "Kimi-K2.7-Code" not in text and text.count("--- Candidate (") == 6  # failed ones left out
+    assert "DeepSeek-V4-Flash-0731" not in text and text.count("--- Candidate (") == 6  # failed ones left out
     log = out["ensemble_log"]
     assert (log["n_candidates"], log["n_failed"]) == (9, 3)
     ok = [c for c in log["candidates"] if c["ok"]]
@@ -240,7 +240,9 @@ def test_ensemble_config_matches_baseline_except_ensemble(path):
     else:
         base = REPO_ROOT / "env_configs" / "robomme" / path.name
     ens, ref = yaml.safe_load(path.read_text()), yaml.safe_load(base.read_text())
-    changed = {"use_parallel_ensemble", "use_multimodel", "ensemble", "condition_video_mode", "output_dir"}
+    changed = {"use_parallel_ensemble", "use_multimodel", "ensemble", "condition_video_mode", "output_dir",
+               "condition_video_stride", "condition_video_segment_frames", "condition_video_overlap",
+               "condition_video_max_segments"}
     assert {k: v for k, v in ens.items() if k not in changed} == {k: v for k, v in ref.items() if k not in changed}
     assert ens["output_dir"].startswith("./outputs/capbg_ensemble/")
 
@@ -303,7 +305,7 @@ def _usage(p=100, c=20, r=5):
     return {"prompt_tokens": p, "completion_tokens": c, "completion_tokens_details": {"reasoning_tokens": r}}
 
 
-def _run_trial(monkeypatch, tmp_path, config):
+def _run_trial(monkeypatch, tmp_path, config, n_demo=12):
     calls: list[tuple[str, Any]] = []
 
     def fake(args, prompt):
@@ -325,7 +327,7 @@ def _run_trial(monkeypatch, tmp_path, config):
     monkeypatch.setattr(trial_mod, "_query_model", fake)
     monkeypatch.setattr(client, "query_model", fake)
     monkeypatch.setattr(trial_mod, "_write_video", lambda frames, base_dir, suffix="": None)
-    code_env = make_code_env(monkeypatch, task_id="VideoUnmaskSwap", n_demo=12)
+    code_env = make_code_env(monkeypatch, task_id="VideoUnmaskSwap", n_demo=n_demo)
     trial_mod._run_single_trial(code_env, 1, TRIAL_ARGS, config,
                                 "Executed:\n{executed_code}\n{console_stdout}\n{console_stderr}")
     trial_dir = next(tmp_path.glob("trial_01_*"))
@@ -336,8 +338,9 @@ def _has_images(prompt) -> bool:
     return client.count_prompt_images(prompt) > 0
 
 
-def test_trial_vdm_text_replaces_conditioning_video(monkeypatch, patched_models, tmp_path):  # noqa: F811
-    calls, responses = _run_trial(monkeypatch, tmp_path, _trial_config(tmp_path))
+def test_trial_vdm_text_single_call(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    """condition_video_segment_frames 0: the first version, one VDM call with the sampled frames."""
+    calls, responses = _run_trial(monkeypatch, tmp_path, _trial_config(tmp_path, condition_video_segment_frames=0))
     cv_calls = [p for m, p in calls if "demonstration video" in str(p[0]["content"])]
     assert len(cv_calls) == 1 and client.count_prompt_images(cv_calls[0]) == 12  # one VDM call with all frames
     coding = [(m, p) for m, p in calls if m != "Qwen/Qwen3.8-27B"]
@@ -417,12 +420,12 @@ def _ensemble_responses() -> list[dict[str, Any]]:
 
 def test_trial_usage_and_cost():
     prices = model_costs.load_prices()
-    assert prices["deepseek-ai/DeepSeek-V4-Pro"] == (1.75, 3.5) and prices["moonshotai/Kimi-K2.7-Code"] == (0.95, 4.0)
+    assert prices["deepseek-ai/DeepSeek-V4-Pro"] == (1.75, 3.5) and prices["deepseek-ai/DeepSeek-V4-Flash-0731"] == (0.14, 0.28)
     u = model_costs.trial_usage(_ensemble_responses(), "unused", "Qwen/Qwen3.8-27B")
     bm = u["by_model"]
     assert bm["openai/gpt-oss-120b"]["calls"] == 9 and bm["openai/gpt-oss-120b"]["prompt"] == 9_000_000
-    assert bm["moonshotai/Kimi-K2.7-Code"]["calls"] == 9 and bm["moonshotai/Kimi-K2.7-Code"]["failed"] == 3
-    assert bm["moonshotai/Kimi-K2.7-Code"]["prompt"] == 6_000_000
+    assert bm["deepseek-ai/DeepSeek-V4-Flash-0731"]["calls"] == 9 and bm["deepseek-ai/DeepSeek-V4-Flash-0731"]["failed"] == 3
+    assert bm["deepseek-ai/DeepSeek-V4-Flash-0731"]["prompt"] == 6_000_000
     assert bm[SYNTH]["calls"] == 3 and bm[SYNTH]["prompt"] == 6_000_000  # entry "usage" not counted twice
     assert bm["Qwen/Qwen3.8-27B"]["calls"] == 2 and "unused" not in bm
     assert bm["openai/gpt-oss-120b"]["reasoning"] == 9 * 50_000
@@ -432,7 +435,7 @@ def test_trial_usage_and_cost():
     cost = model_costs.cost_by_model(bm, prices)
     assert cost["openai/gpt-oss-120b"] == pytest.approx(9 * (0.15 + 0.1 * 0.6))
     assert cost["Qwen/Qwen3-235B-A22B-Instruct-2507"] == pytest.approx(9 * (0.2 + 0.1 * 0.6))
-    assert cost["moonshotai/Kimi-K2.7-Code"] == pytest.approx(6 * (0.95 + 0.1 * 4))
+    assert cost["deepseek-ai/DeepSeek-V4-Flash-0731"] == pytest.approx(6 * (0.14 + 0.1 * 0.28))
     assert cost[SYNTH] == pytest.approx(3 * (2 * 1.75 + 0.2 * 3.5))
     assert cost["Qwen/Qwen3.8-27B"] == pytest.approx(2 * (0.45 + 0.1 * 3))
     assert cost["total"] == pytest.approx(sum(v for k, v in cost.items() if k not in ("total", "unpriced")))
@@ -483,7 +486,7 @@ def test_robomme_analyzer_cost_and_ensemble(tmp_path):
     assert (row["ens_queries"], row["ens_failed_candidates"], row["synth_format_errors"]) == ("3", "3", "1")
     assert int(row["code_prompt_tok"]) == 24_000_000 + 6_000_000  # 24 ok candidates + 3 synthesis calls
     summary = (run / "SUMMARY.md").read_text()
-    assert "## Cost by model" in summary and "moonshotai/Kimi-K2.7-Code" in summary
+    assert "## Cost by model" in summary and "deepseek-ai/DeepSeek-V4-Flash-0731" in summary
     assert "failed candidates: 3 / 27" in summary and "synthesis format errors: 1 / 3" in summary
 
 
@@ -598,3 +601,145 @@ def test_condition_video_latency_in_costs():
     assert (q["calls"], q["prompt"], q["latency_s"], q["timed_calls"]) == (2, 20, 12.5, 1)  # tokens not doubled
     table = "\n".join(model_costs.cost_table(u["by_model"], model_costs.load_prices(), 1))
     assert "| Qwen/Qwen3.8-27B | 2 | 0 | 20 | 4 | 10 | 12.5 |" in table
+
+
+# --------------------------------------------------------------------------------------------------
+# Segmented conditioning-video description
+# --------------------------------------------------------------------------------------------------
+
+from capx.envs.tasks.robomme import robomme_env as rme  # noqa: E402
+
+
+def test_segment_planning():
+    assert rme.strided_frame_indices(10, 3) == [0, 3, 6, 9]
+    assert rme.strided_frame_indices(11, 3) == [0, 3, 6, 9, 10]  # last frame always included
+    segs = rme.split_into_segments(list(range(50)), 20, 4)
+    assert [(s[0], s[-1], len(s)) for s in segs] == [(0, 19, 20), (16, 35, 20), (32, 49, 18)]
+    assert rme.split_into_segments(list(range(12)), 20, 4) == [list(range(12))]
+    segs = rme.split_into_segments(list(range(102)), 20, 4)  # 2 frames left after part 6: merged into it
+    assert [(s[0], s[-1], len(s)) for s in segs][-2:] == [(64, 83, 20), (80, 101, 22)] and len(segs) == 6
+    stride, segs = rme.plan_condition_video_segments(400, 1, 20, 4, 12)
+    assert (stride, len(segs)) == (2, 12)  # 400 frames: stride 1 -> 25 parts, stride 2 -> 12
+    assert segs[-1][-1] == 399 and segs[0][0] == 0
+
+
+@pytest.mark.parametrize("reply, events, state", [
+    ("EVENTS:\n1. a\nSTATE:\n- cube under cup A", "1. a", "- cube under cup A"),
+    ("**EVENTS:**\n1. a\n\n**STATE:**\nx", "1. a", "x"),
+    ("## EVENTS\nnone\n## STATE\ny", "none", "y"),
+    ("just text", "just text", "just text"),
+])
+def test_split_segment_reply(reply, events, state):
+    assert rme.split_segment_reply(reply) == (events, state)
+
+
+def test_describe_segmented_passes_state_between_parts():
+    import numpy as np
+
+    frames = [np.full((8, 8, 3), i, dtype=np.uint8) for i in range(50)]
+    prompts = []
+
+    def query(args, prompt):
+        prompts.append(prompt)
+        k = len(prompts)
+        return {"content": f"EVENTS:\n{k}. event of part {k}\nSTATE:\nstate after part {k}",
+                "finish_reason": "stop", "usage": _usage()}
+
+    desc, log = rme.describe_condition_video_segmented(
+        query, SimpleNamespace(model="v"), "find the cube", frames, stride=1, segment_frames=20, overlap=4,
+        max_segments=12)
+    assert len(prompts) == 3 and [c["n_frames"] for c in log["vdm_calls"]] == [20, 20, 18]
+    assert [client.count_prompt_images(p) for p in prompts] == [20, 20, 18]
+    text = [str(p) for p in prompts]
+    assert "state_so_far" not in text[0]
+    assert "<state_so_far>\\nstate after part 1\\n</state_so_far>" in text[1]
+    assert "state after part 2" in text[2] and "Its first 4 frames are the last frames of part 2" in text[2]
+    assert "part 1 of 3" in text[0] and "frames 17-36" in text[1]
+    assert "find the cube" in text[0] and "EVENTS:" in text[0] and "STATE:" in text[0]
+    assert desc.index("1. event of part 1") < desc.index("2. event of part 2") < desc.index("3. event of part 3")
+    assert desc.endswith("Final state (end of the video):\nstate after part 3")
+    assert "state after part 1" not in desc  # only the last state goes into the prompt
+    assert log["segmentation"]["segments"] == [[0, 19, 20], [16, 35, 20], [32, 49, 18]]
+    assert log["n_frames"] == 50 and [p["reply"] for p in log["parts"]][0].startswith("EVENTS:")
+    assert "50 of its frames (every frame, in 3 overlapping parts" in log["how"]
+
+
+def test_describe_segmented_retries_empty_part():
+    import numpy as np
+
+    replies = iter(["", "EVENTS:\nnone\nSTATE:\ns"])
+    desc, log = rme.describe_condition_video_segmented(
+        lambda a, p: {"content": next(replies), "finish_reason": "stop", "usage": None},
+        SimpleNamespace(model="v"), None, [np.zeros((4, 4, 3), np.uint8)] * 5,
+        stride=1, segment_frames=20, overlap=4, max_segments=12)
+    assert [c["attempt"] for c in log["vdm_calls"]] == [1, 2] and desc.endswith("s")
+    with pytest.raises(RuntimeError):
+        rme.describe_condition_video_segmented(
+            lambda a, p: {"content": "", "finish_reason": "stop"}, SimpleNamespace(model="v"), None,
+            [np.zeros((4, 4, 3), np.uint8)] * 5, stride=1, segment_frames=20, overlap=4, max_segments=12)
+
+
+def test_trial_vdm_text_segmented(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    config = _trial_config(tmp_path, condition_video_segment_frames=20, condition_video_overlap=4)
+    calls, responses = _run_trial(monkeypatch, tmp_path, config, n_demo=50)
+    cv_calls = [p for m, p in calls if "demonstration video" in str(p[0]["content"])]
+    assert [client.count_prompt_images(p) for p in cv_calls] == [20, 20, 18]
+    assert "<state_so_far>" in str(cv_calls[1])
+    cv = responses[0]["condition_video"]
+    assert cv["mode"] == "vdm_text" and cv["segmentation"]["n_segments"] == 3 and len(cv["vdm_calls"]) == 3
+    assert cv["n_frames"] == 50 and len(cv["parts"]) == 3 and all(p["reply"] == VDM_TEXT for p in cv["parts"])
+    assert cv["description"].startswith("Part 1/3") and VDM_TEXT in cv["description"]
+    assert len(responses[0]["vdm_usage"]) == 4  # 3 parts + initial scene description
+    first = [p for m, p in calls if m == "openai/gpt-oss-120b"][0]
+    text = str(first)
+    assert "50 of its frames (every frame, in 3 overlapping parts" in text and not _has_images(first)
+    assert "<conditioning_video_description>\\nPart 1/3" in text
+
+
+def test_segment_settings_config():
+    path = ENS_DIR / "robomme" / "robomme_movecube.yaml"
+    _, config, _ = _load_config(LaunchArgs(config_path=str(path)))
+    assert trial_mod._condition_video_segment_settings(config) == {
+        "stride": 1, "segment_frames": 20, "overlap": 4, "max_segments": 12}
+    _, config, _ = _load_config(LaunchArgs(config_path=str(path), condition_video_stride=3,
+                                           condition_video_segment_frames=16))
+    assert trial_mod._condition_video_segment_settings(config)["stride"] == 3
+    with pytest.raises(ValueError, match="overlap"):
+        _load_config(LaunchArgs(config_path=str(path), condition_video_overlap=20))
+    base = REPO_ROOT / "env_configs" / "robomme" / "robomme_movecube.yaml"
+    _, config, _ = _load_config(LaunchArgs(config_path=str(base)))
+    assert trial_mod._condition_video_segment_settings(config) == rme.CONDITION_VIDEO_SEGMENT_DEFAULTS
+
+
+# --------------------------------------------------------------------------------------------------
+# Candidate replacement in the config generator
+# --------------------------------------------------------------------------------------------------
+
+import gen_capbg_ensemble_configs as gen_ens  # noqa: E402
+
+
+def test_generator_candidates_argument():
+    swapped = [(m if m != "deepseek-ai/DeepSeek-V4-Flash-0731" else "zai-org/GLM-5.3", t) for m, t in NEBIUS]
+    files = gen_ens.build(swapped, SYNTH)
+    text = files[Path("robomme") / "robomme_videounmaskswap.yaml"]
+    cfg = yaml.safe_load(text)
+    assert [c["model"] for c in cfg["ensemble"]["candidates"]] == [m for m, _ in swapped]
+    assert "GLM-5.3" in text.split("\n")[3] and "All coding-side models are text-only" in text
+    mixed = gen_ens.build([("Qwen/Qwen3.5-397B-A17B", [0.5])], SYNTH)[Path("libero_mem") / "task_06_swap_bowls.yaml"]
+    assert "Text-only: DeepSeek-V4-Pro." in mixed
+    assert gen_ens.load_models() == ([(m, t) for m, t in NEBIUS], SYNTH)
+    # --check with a different choice reports stale files and writes nothing.
+    r = subprocess.run([sys.executable, str(REPO_ROOT / "scripts" / "gen_capbg_ensemble_configs.py"), "--check",
+                        "--replace", "deepseek-ai/DeepSeek-V4-Flash-0731=zai-org/GLM-5.3"], capture_output=True, text=True)
+    assert r.returncode == 1 and "models.json" in r.stdout
+    r = subprocess.run([sys.executable, str(REPO_ROOT / "scripts" / "gen_capbg_ensemble_configs.py"), "--check",
+                        "--replace", "nope=x"], capture_output=True, text=True)
+    assert r.returncode == 2
+    assert gen_ens.load_models() == ([(m, t) for m, t in NEBIUS], SYNTH)
+
+
+def test_new_prices():
+    prices = model_costs.load_prices()
+    assert prices["zai-org/GLM-5.3"] == (1.4, 4.4) and prices["nvidia/Nemotron-3-Ultra-550b"] == (1.0, 3.0)
+    assert prices["Qwen/Qwen3.5-397B-A17B"] == (0.6, 3.6)
+    assert prices["deepseek-ai/DeepSeek-V4-Flash-0731"] == (0.14, 0.28)

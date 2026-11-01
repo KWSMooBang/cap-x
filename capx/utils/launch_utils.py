@@ -172,10 +172,25 @@ def _ensemble_config(
     mode = getattr(args, "condition_video_mode", None) or configs_dict.get("condition_video_mode", "images")
     if mode not in CONDITION_VIDEO_MODES:
         raise ValueError(f"condition_video_mode must be one of {CONDITION_VIDEO_MODES}, got {mode!r}")
+    seg: dict[str, Any] = {}
+    for key in ("stride", "segment_frames", "overlap", "max_segments"):
+        name = f"condition_video_{key}"
+        cli = getattr(args, name, None)
+        value = cli if cli is not None else configs_dict.get(name)
+        seg[name] = None if value is None else int(value)
+    if (seg["condition_video_stride"] is not None and seg["condition_video_stride"] < 1) or \
+            (seg["condition_video_max_segments"] is not None and seg["condition_video_max_segments"] < 1) or \
+            (seg["condition_video_segment_frames"] is not None and seg["condition_video_segment_frames"] < 0) or \
+            (seg["condition_video_overlap"] is not None and seg["condition_video_overlap"] < 0):
+        raise ValueError(f"condition_video segmentation: invalid values {seg}")
+    sf, ov = seg["condition_video_segment_frames"], seg["condition_video_overlap"]
+    if sf and ov is not None and ov >= sf:
+        raise ValueError(f"condition_video_overlap ({ov}) must be smaller than condition_video_segment_frames ({sf})")
     return {
         "ensemble_candidates": [[m, list(t)] for m, t in candidates] if candidates is not None else None,
         "ensemble_synthesis_model": synth,
         "condition_video_mode": mode,
+        **seg,
     }
 
 

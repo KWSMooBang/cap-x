@@ -4,11 +4,15 @@ The baseline CaP-X loop with the CaP-Agent0 **multimodel parallel ensemble** on,
 
 | Role | Model | Temperatures |
 | --- | --- | --- |
-| Candidates (9 replies per query) | `openai/gpt-oss-120b`, `Qwen/Qwen3-235B-A22B-Instruct-2507`, `moonshotai/Kimi-K2.7-Code` | 0.1, 0.5, 0.9 each |
+| Candidates (9 replies per query) | `openai/gpt-oss-120b`, `Qwen/Qwen3-235B-A22B-Instruct-2507`, `deepseek-ai/DeepSeek-V4-Flash-0731` | 0.1, 0.5, 0.9 each |
 | Synthesis | `deepseek-ai/DeepSeek-V4-Pro` | 0.2 (upstream) |
 | VDM | `Qwen/Qwen3.8-27B` | as the baseline |
 
-All four coding-side models are **text-only**. RoboMME's conditioning video therefore goes into the first prompt as
+The third candidate was `moonshotai/Kimi-K2.7-Code` in the first smoke run. The lead replaced it with
+DeepSeek-V4-Flash-0731 after measuring latency on kubectl: Flash replied in 14–56 s with 4/4 well-formed replies;
+Kimi-K2.7-Code took 194–812 s. The other options failed: GLM-5.3 spent the whole 32768-token budget on reasoning and
+returned empty replies (4/4); Nemotron-3-Ultra dropped the REGENERATE keyword (2/2); Qwen3.5-397B would have made two
+of the three candidates Qwen models. All four coding-side models are **text-only**. RoboMME's conditioning video therefore goes into the first prompt as
 a VDM description (`condition_video_mode: auto` → `vdm_text`, below).
 
 ## Configuration
@@ -45,16 +49,28 @@ prompt. Unknown models are assumed to take images (as before). Images reach the 
 ### Conditioning video (`condition_video_mode`)
 
 - `images`: as before, `condition_frames` (32) PNG frames with captions at the end of the first prompt.
-- `vdm_text`: after reset, the VDM gets the 32 frames once (one request) and describes them in time order: what moved
-  where, which container covers what and every swap, counts and order, path shapes, what appears or disappears, the
-  last frame, and what is unclear. It is told not to state the answer, the target or a plan. The description replaces
-  the images in the first prompt. An empty or cut-off description is asked once more; empty twice fails the trial.
+- `vdm_text`: after reset, the VDM describes the conditioning video **part by part** (default): every
+  `condition_video_stride`-th frame (default 1 = every frame), `condition_video_segment_frames` frames per VDM call
+  (default 20), each part starting with the last `condition_video_overlap` frames of the previous one (default 4), at
+  most `condition_video_max_segments` calls (default 12; the stride grows until the video fits). A last part with fewer
+  than half a step of new frames is merged into the previous part. Each call gets the frames with their times, the
+  task goal (for context only) and the object state the VDM reported at the end of the previous part. It replies with
+  `EVENTS:` (new events in this part, with times) and `STATE:` (each object's identity and position, which container
+  covers what, placements so far and their order, highlights and buttons). The VDM is told to track every object
+  individually, frame by frame. Containers can trade places without the robot touching them, and the first smoke
+  missed a swap because the VDM described the set as a whole drifting left. It is told not to state the answer, the
+  target or a plan. The first prompt gets every part's events in order, followed by the last part's state as
+  "Final state (end of the video)". An empty or cut-off part is asked once more; an empty reply twice fails the trial.
+  `condition_video_segment_frames: 0` gives the first version: one call with the 32 sampled frames.
+  The CLI flags are `--condition-video-stride`, `--condition-video-segment-frames`, `--condition-video-overlap` and
+  `--condition-video-max-segments`. The RoboMME ensemble configs set the four keys explicitly.
 - `auto`: `vdm_text` if any coding-side model (every candidate and the synthesis model, or the single coding model
   without the ensemble) is text-only, else `images`.
 
 Logged in the initial entry of `all_responses.json` as `condition_video`: `mode`, `config_mode`, `n_frames`,
-`total_frames`, `frame_indices`, and for `vdm_text` the verbatim `description`, `vdm_model`, `vdm_calls`
-(latency, finish_reason, usage) and `vdm_reasoning`. Its usage is also in `vdm_usage`. `initial_prompt` in the same
+`total_frames`, `frame_indices`, and for `vdm_text` the inserted `description`, `vdm_model`, `segmentation`
+(stride used, settings, `n_segments`, `[first, last, count]` per part), `vdm_calls` (part, attempt, frame range,
+latency, finish_reason, usage) and `parts` (each part's verbatim `reply`, parsed `events` / `state`, `reasoning`). Its usage is also in `vdm_usage`. `initial_prompt` in the same
 entry is the prompt as sent (no images with `vdm_text`). Decision prompts never carry the video in either mode.
 
 #### First prompt, `images` (VideoUnmaskSwap, stub env; API docs shortened)
@@ -78,22 +94,35 @@ Video frame 32/32 (t = 4.95 s, frame 100 of 100):
 [image: PNG, data URL]
 ```
 
-#### VDM request, `vdm_text`
+#### VDM requests, `vdm_text` (part 2 of a 102-frame video; images and middle frames shortened)
 
 ```text
 === role: system ===
-You describe a robot task's demonstration video for another model that cannot see it. That model will control the robot afterwards and will only have your text, so it must learn from you everything the video shows that could matter for the task. Report only what is visible. Do not say what the answer is, which object is the target, what the robot should do next or what the subgoals are. Do *NOT* write any code.
+You describe a robot task's demonstration video for another model that cannot see it. The video is shown to you in consecutive parts. That model will control the robot afterwards and will only have your text, so it must learn from you everything the video shows that could matter for the task. Report only what is visible. Do not say what the answer is, which object is the target, what the robot should do next or what the subgoals are. Do *NOT* write any code.
 === role: user ===
 The robot's task (for context only; do not solve it): <task goal>
-Describe the video in time order, as a numbered list of events with their times (t = ... s). For each event say which object moved (color, shape, size, any marking, and which of several similar objects it is), from where to where (relative to the other objects, and left / right / front / back as seen from this camera), and what touched or moved it. Track hidden objects: say which container or cover is over which object, every time one is lifted, put down or swapped, and where each container is at the end. Count repeated actions and give their order. For movements that trace a path (a stick, a button press sequence, a route), describe the path's shape and its waypoints in order. Mention highlights, lights or anything that appears or disappears, and when. Then describe the last frame: where every object is. If something is unclear (occluded, between sampled frames, too small), say so instead of guessing. Do not infer the goal's answer, the target object or a plan; describe only what happened.
-The video is from the front camera (the 'agentview' camera) and has 100 frames (5.0 s at 20 frames per second). Below are 32 frames sampled uniformly from it in time order, including the first and last frame.
-Video frame 1/32 (t = 0.00 s, frame 1 of 100):
+Track every object individually through the frames: its identity (color and kind, e.g. 'red cube', 'blue cup', 'left button') and its position (relative to the other objects, and left / right / front / back as seen from this camera) in each frame. Objects may move without the robot touching them (containers can slide past each other and trade places), so compare each object's position frame by frame instead of describing the scene as a whole. Report events with their times (t = ... s): an object covered or uncovered, containers swapped (say which container went from where to where), an object lifted, carried, placed (where, and in which order relative to earlier placements), a highlight or light appearing or disappearing, a button pressed, a path traced by the gripper or a stick (its shape and waypoints in order). Count repeated actions. If something cannot be seen (occluded, too fast, between frames), say so instead of guessing. Do not infer the goal's answer, the target object or a plan.
+The video is from the front camera (the 'agentview' camera) and has 102 frames (5.1 s at 20 frames per second). This is part 2 of 6: frames 17-36 (t = 0.80-1.75 s), every frame, in time order. Its first 4 frames are the last frames of part 1; events in them are already described.
+State at the end of the previous part, as you described it. Continue from it and keep each object's identity consistent:
+<state_so_far>
+<STATE section of the part-1 reply>
+</state_so_far>
+Frame 17 of 102 (t = 0.80 s):
 [image: PNG, data URL]
-[... frames 2-31 ...]
-Video frame 32/32 (t = 4.95 s, frame 100 of 100):
+[... frames 18-35 ...]
+Frame 36 of 102 (t = 1.75 s):
 [image: PNG, data URL]
-<the same instructions again, after the frames>
+<the tracking instructions again>
+Reply in exactly two sections:
+EVENTS:
+a numbered list of the events in this part, in time order, each with its time (t = ... s); write 'none' if nothing happens. Do not repeat events from the frames this part shares with the previous part.
+STATE:
+the state at the last frame of this part: each object with its identity and position; which container is over which object (or 'unknown'); objects placed so far and their order; highlights or buttons so far.
 ```
+
+Part 1 has no `<state_so_far>` and no overlap sentence. With `condition_video_segment_frames: 0` the single request
+is the first version: the 32 sampled frames with the instructions "Describe the video in time order, as a numbered
+list of events ..." before and after them.
 
 #### First prompt, `vdm_text`
 
@@ -106,9 +135,19 @@ Goal: pick up the red cube twice, then press the button
 
 APIs:
 [... API documentation omitted ...]
-Before you take control, this task showed a video from the front camera (the 'agentview' camera) of 100 frames (5.0 s at 20 frames per second). You cannot see it. A vision model watched 32 frames sampled uniformly from it in time order (including the first and last frame) and described it as below. The video is described only here, once; the current scene is what get_observation() returns.
+Before you take control, this task showed a video from the front camera (the 'agentview' camera) of 102 frames (5.1 s at 20 frames per second). You cannot see it. A vision model watched 102 of its frames (every frame, in 6 overlapping parts, in time order) and described it as below. The video is described only here, once; the current scene is what get_observation() returns.
 <conditioning_video_description>
-<VDM description, verbatim>
+Part 1/6 (t = 0.00-0.95 s):
+<EVENTS of part 1, verbatim>
+
+Part 2/6 (t = 0.80-1.75 s):
+<EVENTS of part 2>
+[... parts 3-5 ...]
+Part 6/6 (t = 4.00-5.05 s):
+<EVENTS of part 6>
+
+Final state (end of the video):
+<STATE of part 6, verbatim>
 </conditioning_video_description>
 ```
 
@@ -123,7 +162,7 @@ decision) has `ensemble_calls`, one record per ensemble query, including cut-off
 {"kind": "multimodel", "is_multiturn": true, "n_candidates": 9, "n_failed": 1,
  "candidates": [{"model": "openai/gpt-oss-120b", "temp": 0.1, "ok": true, "latency_s": 21.4, "finish_reason": "stop",
                  "usage": {...}, "tokens": {"prompt": 11234, "completion": 2101, "reasoning": 1650}},
-                {"model": "moonshotai/Kimi-K2.7-Code", "temp": 0.9, "ok": false, "latency_s": 600.0, "usage": null,
+                {"model": "deepseek-ai/DeepSeek-V4-Flash-0731", "temp": 0.9, "ok": false, "latency_s": 600.0, "usage": null,
                  "tokens": {...}, "error": "..."}, ...],
  "synthesis": {"model": "deepseek-ai/DeepSeek-V4-Pro", "temp": 0.2, "ok": true, "latency_s": 35.0,
                "finish_reason": "stop", "usage": {...}, "tokens": {...}, "format_issue": null},
@@ -146,8 +185,9 @@ off there is no `ensemble_calls` key.
 ## Cost
 
 Prices are in `env_configs/pricing/nebius.yaml` (USD per 1M input / output tokens, Nebius catalogue 2026-11-01):
-gpt-oss-120b 0.15/0.6, Qwen3-235B-2507 0.2/0.6, Kimi-K2.7-Code 0.95/4, DeepSeek-V4-Pro 1.75/3.5,
-Qwen3.8-27B 0.45/3, Kimi-K3 3/15. `scripts/model_costs.py` sums each trial's calls per model (ensemble: every
+gpt-oss-120b 0.15/0.6, Qwen3-235B-2507 0.2/0.6, DeepSeek-V4-Flash-0731 0.14/0.28, DeepSeek-V4-Pro 1.75/3.5,
+Qwen3.8-27B 0.45/3, Kimi-K3 3/15, and the alternatives Kimi-K2.7-Code 0.95/4, GLM-5.3 1.4/4.4,
+Nemotron-3-Ultra-550b 1/3, Qwen3.5-397B-A17B 0.6/3.6 (check the GLM / Nemotron / Qwen3.5 / Flash IDs in the catalogue). `scripts/model_costs.py` sums each trial's calls per model (ensemble: every
 candidate and synthesis call in `ensemble_calls`; no ensemble: `usage`, `truncated_first_usage`, `s5_first_reply`
 under the coding model; `vdm_usage` under the VDM model) and prices them as prompt × input + completion × output
 (reasoning tokens are completion tokens). Molmo (local) and cached-input discounts are not included; the Nebius
@@ -172,6 +212,17 @@ PickXtimes, StopCube, VideoUnmaskSwap, ButtonUnmask, PickHighlight, VideoPlaceOr
 `condition_video_mode: auto` (RoboMME) and `output_dir` differ (`tests/test_ensemble_nebius.py` checks this);
 `memory_mode` stays `none`. `--check` exits 1 when a file is stale.
 
+Candidates and the synthesis model are arguments; the choice is kept in `env_configs/capbg_ensemble/models.json`, so
+later runs and `--check` reuse it:
+
+```bash
+python scripts/gen_capbg_ensemble_configs.py --replace deepseek-ai/DeepSeek-V4-Flash-0731=<new/model>  # keeps its temperatures
+python scripts/gen_capbg_ensemble_configs.py --candidates "a/m1@0.1,0.5,0.9;b/m2@0.1,0.5,0.9" --synthesis-model c/m3
+```
+
+The configs' headers say which coding-side models are text-only (`TEXT_ONLY_MODELS`); add a new text-only model
+there before using it. A pilot started on older configs keeps their settings in its `pilot_manifest.jsonl`.
+
 `scripts/run_ensemble_pilot.py --bench libero_mem|robomme` runs one `launch.py` per task (one sequential worker,
 `--workers` tasks at a time), resumes at the first trial without `trial_end.json` when rerun, starts the SAM3 /
 GraspNet / pyroki servers once, and passes `--trial-timeout-s 3600 --max-trial-retries 1` (as the baseline pilots).
@@ -191,6 +242,21 @@ kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg && git fetch origin
   nohup .venv-molmo/bin/python capx/serving/vllm_server.py --model allenai/Molmo2-8B --port 8122 \
     --max-model-len 16384 --max-num-batched-tokens 16384 > logs/molmo_8122.log 2>&1 &'
 ```
+
+(0) Conditioning-video descriptions only (VDM, no simulation steps, no coding model; episode 0 of the four video
+tasks, also the old single-call description for comparison):
+
+```bash
+kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg && git fetch origin && git checkout exp/ensemble-nebius &&
+  git pull --ff-only origin exp/ensemble-nebius &&
+  .venv-robomme/bin/python scripts/describe_condition_video.py --run-name 20261102_cvdesc_seg \
+    --tasks VideoUnmaskSwap VideoPlaceOrder MoveCube PatternLock --episode 0 --also-single'
+```
+
+Read `outputs/condition_video_desc/20261102_cvdesc_seg/<Task>_ep0.md` (description, every part's raw reply, the old
+single-call description) and `SUMMARY.txt` (calls, seconds, tokens, $ per task). The PNGs in `<Task>_ep0_frames/` are
+the frames the VDM saw. Settings come from the configs; override them with `--stride`, `--segment-frames`,
+`--overlap`, `--max-segments`.
 
 (1) Smoke — LIBERO-Mem task_00 × 1 and RoboMME VideoUnmaskSwap × 1 (ensemble and `vdm_text` paths):
 
@@ -230,28 +296,31 @@ kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg &&
 
 One ensemble query = 9 candidate calls + 1 synthesis call. A trial makes one query for the first code and one per
 decision turn (at most `MULTITURN_LIMIT + 1` = 11 turns), plus one more per cut-off / empty retry. The VDM makes one
-initial-scene call, one call per turn, and for the RoboMME video tasks (VideoUnmaskSwap, VideoPlaceOrder, MoveCube,
-PatternLock) one conditioning-video call. The LIBERO-Mem baseline averaged about 6 coding replies per trial.
+initial-scene call and one call per turn. For the RoboMME video tasks (VideoUnmaskSwap, VideoPlaceOrder, MoveCube,
+PatternLock) it also makes the conditioning-video calls: one per part, at most 12 per trial, e.g. 6 for a 102-frame
+video. The LIBERO-Mem baseline averaged about 6 coding replies per trial.
 
 | Stage | Trials | Coding calls (≈6 queries/trial; max 12) | VDM calls |
 | --- | --- | --- | --- |
-| (1) smoke | 2 | ≈120 (20–240) | ≈13 |
+| (0) descriptions only | – | 0 | ≤ 4 × 12 (+4 with `--also-single`) |
+| (1) smoke | 2 | ≈120 (20–240) | ≈18 |
 | (2) pilot LIBERO-Mem | 25 | ≈1,500 (250–3,000) | ≈150 |
-| (2) pilot RoboMME | 40 | ≈2,400 (400–4,800) | ≈260 (20 conditioning) |
+| (2) pilot RoboMME | 40 | ≈2,400 (400–4,800) | ≈240 + ≤ 240 conditioning (20 trials × ≤ 12) |
 | (3) aggregate | – | 0 | 0 |
 
-Rough cost from the baseline's per-reply sizes (≈11k prompt tokens): ≈$0.15 per ensemble query (Kimi-K2.7-Code
-candidates and the DeepSeek synthesis are most of it), ≈$1 per trial, ≈$60 for the pilot (up to ≈$120 at the turn
-limit). The aggregators report the measured numbers.
+Rough cost from the baseline's per-reply sizes (≈11k prompt tokens): ≈$0.09 per ensemble query (the DeepSeek-V4-Pro
+synthesis is about two thirds of it), ≈$0.55 per trial, ≈$35 for the pilot (up to ≈$70 at the turn limit), plus a
+few dollars of VDM (each conditioning-video part sends 20 images). The aggregators report the measured numbers.
 
 ## Known limits
 
 - `TEXT_ONLY_MODELS` is a fixed list; a new text-only model must be added there (unknown models are assumed to take
   images).
-- The VDM description replaces the 32 frames; what the VDM misses (or gets wrong) the coding models cannot recover.
-  Its quality is not measured yet (no API on the dev server); check the descriptions in the smoke run.
-- 32 images in one VDM request: if Qwen3.8-27B rejects that many, use `CAPX_ROBOMME_CONDITION_FRAMES=16` (and report
-  it as a different condition).
+- The VDM description replaces the frames. The coding models cannot recover anything the VDM misses or gets wrong.
+  The part-by-part version is untested against the real VDM; check it with (0) before the pilot. Each part sees only
+  its own frames plus the previous state, so an event that spans a boundary relies on the overlap frames.
+- 20 images per VDM request (the old single call sent 32). Lower `condition_video_segment_frames` if the endpoint limits
+  images, and report different settings as different conditions.
 - Candidates cut off at `max_tokens` (or with empty content) still count as successful and go into the synthesis
   (upstream semantics); they are counted in the summary. A cut-off synthesis re-runs the whole ensemble once.
 - 9 parallel requests per query × `--workers` tasks hit one Nebius endpoint; rate limits are untested. Failed

@@ -1,0 +1,8 @@
+{
+  "candidates": [
+    ["openai/gpt-oss-120b", [0.1, 0.5, 0.9]],
+    ["Qwen/Qwen3-235B-A22B-Instruct-2507", [0.1, 0.5, 0.9]],
+    ["deepseek-ai/DeepSeek-V4-Flash-0731", [0.1, 0.5, 0.9]]
+  ],
+  "synthesis_model": "deepseek-ai/DeepSeek-V4-Pro"
+}

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import base64
 import io
+import re
+import time
+from collections.abc import Callable
 from typing import Any, SupportsFloat
 
 import numpy as np
@@ -93,23 +96,241 @@ def condition_video_vdm_prompt(
 
 
 def condition_video_text_content(
-    description: str, n_frames: int, total: int, control_freq: float = CONTROL_FREQ_HZ
+    description: str, n_frames: int, total: int, control_freq: float = CONTROL_FREQ_HZ, how: str | None = None
 ) -> list[dict[str, Any]]:
-    """First-prompt content for the conditioning video as VDM text (replaces conditioning_video_content)."""
+    """First-prompt content for the conditioning video as VDM text (replaces conditioning_video_content).
+
+    ``how``: how the frames were watched (default: the single-call wording, ``n_frames`` sampled uniformly).
+    """
     duration = total / control_freq
+    if how is None:
+        how = (f"{n_frames} frames sampled uniformly from it in time order (including the first and last frame)")
     return [
         {
             "type": "text",
             "text": (
                 f"Before you take control, this task showed a video from the front camera (the 'agentview' camera) "
                 f"of {total} frames ({duration:.1f} s at {control_freq:g} frames per second). You cannot see it. "
-                f"A vision model watched {n_frames} frames sampled uniformly from it in time order (including the "
-                "first and last frame) and described it as below. The video is described only here, once; the "
-                "current scene is what get_observation() returns.\n"
+                f"A vision model watched {how} and described it as below. The video is described only here, once; "
+                "the current scene is what get_observation() returns.\n"
                 f"<conditioning_video_description>\n{description.strip()}\n</conditioning_video_description>"
             ),
         }
     ]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Segmented description (condition_video_segment_frames > 0): every ``stride``-th frame, in overlapping parts, one VDM
+# call per part; each part gets the object state at the end of the previous part and continues from it.
+# ---------------------------------------------------------------------------------------------------------------
+
+CONDITION_VIDEO_SEGMENT_DEFAULTS = {"stride": 1, "segment_frames": 20, "overlap": 4, "max_segments": 12}
+
+CONDITION_VIDEO_SEGMENT_SYSTEM = (
+    "You describe a robot task's demonstration video for another model that cannot see it. The video is shown "
+    "to you in consecutive parts. That model will control the robot afterwards and will only have your text, so "
+    "it must learn from you everything the video shows that could matter for the task. Report only what is "
+    "visible. Do not say what the answer is, which object is the target, what the robot should do next or what "
+    "the subgoals are. Do *NOT* write any code."
+)
+
+CONDITION_VIDEO_SEGMENT_INSTRUCTIONS = (
+    "Track every object individually through the frames: its identity (color and kind, e.g. 'red cube', 'blue "
+    "cup', 'left button') and its position (relative to the other objects, and left / right / front / back as "
+    "seen from this camera) in each frame. Objects may move without the robot touching them (containers can "
+    "slide past each other and trade places), so compare each object's position frame by frame instead of "
+    "describing the scene as a whole. Report events with their times (t = ... s): an object covered or "
+    "uncovered, containers swapped (say which container went from where to where), an object lifted, carried, "
+    "placed (where, and in which order relative to earlier placements), a highlight or light appearing or "
+    "disappearing, a button pressed, a path traced by the gripper or a stick (its shape and waypoints in order). "
+    "Count repeated actions. If something cannot be seen (occluded, too fast, between frames), say so instead "
+    "of guessing. Do not infer the goal's answer, the target object or a plan."
+)
+
+CONDITION_VIDEO_SEGMENT_FORMAT = (
+    "Reply in exactly two sections:\n"
+    "EVENTS:\n"
+    "a numbered list of the events in this part, in time order, each with its time (t = ... s); write 'none' if "
+    "nothing happens. Do not repeat events from the frames this part shares with the previous part.\n"
+    "STATE:\n"
+    "the state at the last frame of this part: each object with its identity and position; which container is "
+    "over which object (or 'unknown'); objects placed so far and their order; highlights or buttons so far."
+)
+
+_STATE_HEADER = re.compile(r"^\s*[*#]*\s*STATE\s*[*#]*\s*:?\s*[*#]*\s*$", re.MULTILINE)
+_EVENTS_HEADER = re.compile(r"^\s*[*#]*\s*EVENTS\s*[*#]*\s*:?\s*[*#]*\s*$", re.MULTILINE)
+
+
+def strided_frame_indices(total: int, stride: int) -> list[int]:
+    """Every ``stride``-th frame index of ``range(total)``, with the last frame always included."""
+    if total <= 0:
+        return []
+    idx = list(range(0, total, max(1, int(stride))))
+    if idx[-1] != total - 1:
+        idx.append(total - 1)
+    return idx
+
+
+def split_into_segments(indices: list[int], segment_frames: int, overlap: int) -> list[list[int]]:
+    """Consecutive parts of ``segment_frames`` indices; each part starts with the last ``overlap`` of the previous.
+
+    If fewer than half a step of new frames would be left for a last part, the current part takes them instead.
+    """
+    if not indices:
+        return []
+    size = max(1, int(segment_frames))
+    overlap = min(max(0, int(overlap)), size - 1)
+    segments, start = [], 0
+    step = size - overlap
+    while True:
+        end = start + size
+        # A last part with only a few new frames is merged into this one instead of costing its own call.
+        if len(indices) - end < max(1, step // 2):
+            end = len(indices)
+        segments.append(indices[start:end])
+        if end >= len(indices):
+            return segments
+        start += step
+
+
+def plan_condition_video_segments(
+    total: int, stride: int, segment_frames: int, overlap: int, max_segments: int
+) -> tuple[int, list[list[int]]]:
+    """(stride used, parts as frame-index lists). The stride grows until there are at most ``max_segments`` parts."""
+    stride = max(1, int(stride))
+    while True:
+        segments = split_into_segments(strided_frame_indices(total, stride), segment_frames, overlap)
+        if len(segments) <= max(1, int(max_segments)) or stride >= total:
+            return stride, segments
+        stride += 1
+
+
+def split_segment_reply(text: str) -> tuple[str, str]:
+    """(events, state) of a segment reply; without a STATE section both are the whole reply."""
+    text = (text or "").strip()
+    m = _STATE_HEADER.search(text)
+    if m is None:
+        return text, text
+    events, state = text[: m.start()].strip(), text[m.end():].strip()
+    events = _EVENTS_HEADER.sub("", events, count=1).strip()
+    return events, state
+
+
+def condition_video_segment_prompt(
+    goal: str | None,
+    frames: list[tuple[int, np.ndarray]],
+    part: int,
+    n_parts: int,
+    total: int,
+    stride: int,
+    shared_with_previous: int,
+    state_so_far: str | None,
+    control_freq: float = CONTROL_FREQ_HZ,
+) -> list[dict[str, Any]]:
+    """VDM prompt for part ``part`` (1-based) of the conditioning video."""
+    first, last = frames[0][0], frames[-1][0]
+    every = "every frame" if stride == 1 else f"every {stride}th frame"
+    content: list[dict[str, Any]] = []
+    if goal:
+        content.append({"type": "text", "text": f"The robot's task (for context only; do not solve it): {goal}"})
+    content.append({"type": "text", "text": CONDITION_VIDEO_SEGMENT_INSTRUCTIONS})
+    intro = (
+        f"The video is from the front camera (the 'agentview' camera) and has {total} frames "
+        f"({total / control_freq:.1f} s at {control_freq:g} frames per second). This is part {part} of {n_parts}: "
+        f"frames {first + 1}-{last + 1} (t = {first / control_freq:.2f}-{last / control_freq:.2f} s), {every}, "
+        "in time order."
+    )
+    if part > 1 and shared_with_previous:
+        intro += (f" Its first {shared_with_previous} frames are the last frames of part {part - 1}; events in them "
+                  "are already described.")
+    content.append({"type": "text", "text": intro})
+    if state_so_far:
+        content.append({
+            "type": "text",
+            "text": ("State at the end of the previous part, as you described it. Continue from it and keep each "
+                     f"object's identity consistent:\n<state_so_far>\n{state_so_far}\n</state_so_far>"),
+        })
+    for idx, frame in frames:
+        content.append({"type": "text", "text": f"Frame {idx + 1} of {total} (t = {idx / control_freq:.2f} s):"})
+        content.append({"type": "image_url", "image_url": {"url": _png_data_url(frame)}})
+    content.append({"type": "text", "text": CONDITION_VIDEO_SEGMENT_INSTRUCTIONS})
+    content.append({"type": "text", "text": CONDITION_VIDEO_SEGMENT_FORMAT})
+    return [
+        {"role": "system", "content": CONDITION_VIDEO_SEGMENT_SYSTEM},
+        {"role": "user", "content": content},
+    ]
+
+
+def assemble_condition_video_description(parts: list[dict[str, Any]], control_freq: float = CONTROL_FREQ_HZ) -> str:
+    """The text that goes into the first prompt: each part's events in order, then the last part's state."""
+    lines = []
+    for p in parts:
+        lines.append(f"Part {p['part']}/{len(parts)} (t = {p['first'] / control_freq:.2f}-"
+                     f"{p['last'] / control_freq:.2f} s):")
+        lines.append(p["events"] or "none")
+        lines.append("")
+    lines.append("Final state (end of the video):")
+    lines.append(parts[-1]["state"] if parts else "unknown")
+    return "\n".join(lines).strip()
+
+
+def describe_condition_video_segmented(
+    query: Callable[[Any, list[dict[str, Any]]], dict[str, Any]],
+    vdm_args: Any,
+    goal: str | None,
+    all_frames: list[np.ndarray],
+    *,
+    stride: int,
+    segment_frames: int,
+    overlap: int,
+    max_segments: int,
+    control_freq: float = CONTROL_FREQ_HZ,
+) -> tuple[str, dict[str, Any]]:
+    """Describe the whole conditioning video part by part. Returns (description, log).
+
+    ``query(vdm_args, prompt)`` returns a query_model-style dict. An empty or cut-off reply for a part is asked once
+    more; empty twice raises RuntimeError.
+    """
+    total = len(all_frames)
+    stride_used, segments = plan_condition_video_segments(total, stride, segment_frames, overlap, max_segments)
+    parts: list[dict[str, Any]] = []
+    calls: list[dict[str, Any]] = []
+    state: str | None = None
+    prev: list[int] = []
+    for k, seg in enumerate(segments, start=1):
+        shared = len(set(seg) & set(prev))
+        prompt = condition_video_segment_prompt(
+            goal, [(i, all_frames[i]) for i in seg], k, len(segments), total, stride_used, shared, state, control_freq)
+        out: dict[str, Any] = {}
+        for attempt in range(2):
+            start = time.time()
+            out = query(vdm_args, prompt)
+            calls.append({"part": k, "attempt": attempt + 1, "frames": [seg[0], seg[-1]], "n_frames": len(seg),
+                          "latency_s": round(time.time() - start, 2), "finish_reason": out.get("finish_reason"),
+                          "usage": out.get("usage")})
+            if (out.get("content") or "").strip() and out.get("finish_reason") != "length":
+                break
+        reply = (out.get("content") or "").strip()
+        if not reply:
+            raise RuntimeError(f"VDM gave no description for conditioning-video part {k}/{len(segments)} (twice)")
+        events, state = split_segment_reply(reply)
+        parts.append({"part": k, "first": seg[0], "last": seg[-1], "n_frames": len(seg), "shared": shared,
+                      "events": events, "state": state, "reply": reply, "reasoning": out.get("reasoning")})
+        prev = seg
+    description = assemble_condition_video_description(parts, control_freq)
+    used = sorted({i for seg in segments for i in seg})
+    log = {
+        "segmentation": {"stride": stride_used, "requested_stride": int(stride), "segment_frames": int(segment_frames),
+                         "overlap": int(overlap), "max_segments": int(max_segments), "n_segments": len(segments),
+                         "segments": [[seg[0], seg[-1], len(seg)] for seg in segments]},
+        "n_frames": len(used),
+        "frame_indices": used,
+        "vdm_calls": calls,
+        "parts": parts,
+        "how": (f"{len(used)} of its frames ({'every frame' if stride_used == 1 else f'every {stride_used}th frame'}, "
+                f"in {len(segments)} overlapping parts, in time order)"),
+    }
+    return description, log
 
 
 class RoboMMECodeEnv(CodeExecutionEnvBase):
@@ -143,6 +364,7 @@ class RoboMMECodeEnv(CodeExecutionEnvBase):
             prompt[-1] = {**prompt[-1], "content": list(prompt[-1]["content"]) + content}
             obs["full_prompt"] = prompt
             self.condition_video = {"frames": frames, "total": total, "n_items": len(content)}
+            self._condition_low = low
         info["condition_frame_indices"] = [i for i, _ in frames]
         info.setdefault("memory", {})
         if isinstance(info["memory"], dict):
@@ -154,7 +376,13 @@ class RoboMMECodeEnv(CodeExecutionEnvBase):
         cv = getattr(self, "condition_video", None)
         return condition_video_vdm_prompt(goal, cv["frames"], cv["total"]) if cv else None
 
-    def use_condition_video_text(self, obs: dict[str, Any], description: str) -> None:
+    def condition_video_all_frames(self) -> list[np.ndarray]:
+        """Every front-camera frame of this episode's conditioning video (empty if there is none)."""
+        if not getattr(self, "condition_video", None):
+            return []
+        return list(self._condition_low.handle.conditioning_frames("front"))
+
+    def use_condition_video_text(self, obs: dict[str, Any], description: str, how: str | None = None) -> None:
         """Replace the conditioning-video images at the end of ``obs``'s first prompt with ``description``."""
         cv = self.condition_video
         prompt = [dict(m) for m in obs["full_prompt"]]
@@ -162,7 +390,7 @@ class RoboMMECodeEnv(CodeExecutionEnvBase):
         video = content[len(content) - cv["n_items"]:]
         if len(video) != cv["n_items"] or not any(c.get("type") == "image_url" for c in video):
             raise RuntimeError("conditioning video is no longer at the end of the first prompt")
-        text = condition_video_text_content(description, len(cv["frames"]), cv["total"])
+        text = condition_video_text_content(description, len(cv["frames"]), cv["total"], how=how)
         prompt[-1] = {**prompt[-1], "content": content[: len(content) - cv["n_items"]] + text}
         obs["full_prompt"] = prompt
 
@@ -176,7 +404,11 @@ class RoboMMECodeEnv(CodeExecutionEnvBase):
 
 
 __all__ = [
+    "CONDITION_VIDEO_SEGMENT_DEFAULTS",
     "RoboMMECodeEnv",
+    "describe_condition_video_segmented",
+    "plan_condition_video_segments",
+    "split_segment_reply",
     "condition_video_text_content",
     "condition_video_vdm_prompt",
     "conditioning_video_content",
