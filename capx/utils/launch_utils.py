@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import copy
 import io
@@ -397,9 +398,10 @@ _TOOL_CALL_CODE = re.compile(r'<\|open\|>argument key="code"[^<]*<\|sep\|>(.*?)<
 class MultiTurnDecision:
     """Parsed multi-turn reply.
 
-    source: keyword | code_block | tool_call | finish_keyword | empty | fallback
+    source: keyword | code_block | tool_call | finish_keyword | empty | raw_code | fallback
     flags: finish_with_code (FINISH before the code: regenerate), finish_after_code (FINISH after
-        the last code: finish, e.g. quoting code that already ran), unclosed_fence (reply cut off).
+        the last code: finish, e.g. quoting code that already ran), unclosed_fence (reply cut off),
+        prose_before_code (raw_code with explanatory text before the code).
     legacy_decision: what the original parser returned (REGENERATE keyword or else finish),
         so runs can count replies whose decision changed.
     """
@@ -437,6 +439,55 @@ def _as_python_block(blocks: list[str]) -> str:
     return "```python\n" + "\n\n".join(blocks) + "\n```"
 
 
+# Lines a raw (unfenced) program can start with: a comment, import, def/class/decorator, a
+# compound statement, an assignment or a call. Only candidates: the rest must also parse.
+_RAW_CODE_START = re.compile(
+    r"(?:#|import\s|from\s+[\w.]+\s+import\s|(?:async\s+)?def\s|class\s|@\w"
+    r"|(?:for|while|if|with|try)\b"
+    r"|[A-Za-z_][\w.]*(?:\[[^\]\n]*\])?(?:\s*,\s*[A-Za-z_][\w.]*)*"
+    r"\s*(?:[-+*/%&|^@]|//|\*\*|<<|>>)?=(?!=)"
+    r"|[A-Za-z_][\w.]*\s*\()"
+)
+_PROGRAM_STMTS = (ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _is_executable(stmt: ast.stmt) -> bool:
+    """Bare expressions run nothing unless they are calls ("Done", a docstring); pass neither."""
+    if isinstance(stmt, ast.Expr):
+        return isinstance(stmt.value, (ast.Call, ast.Await))
+    return not isinstance(stmt, ast.Pass)
+
+
+def _find_raw_code(text: str) -> tuple[str, bool] | None:
+    """Unfenced Python that runs to the end of a reply: (code, has prose before it), or None.
+
+    The code starts at the first unindented line that looks like code (``_RAW_CODE_START``) such
+    that everything from that line to the end of the reply parses with ``ast.parse`` and contains at
+    least one executable statement (not only comments, strings or bare names). Trailing prose makes
+    it fail (the reply finishes as before). If text precedes the code, the code must also contain an
+    import, def or class at top level (a whole program, as the coding prompt asks for), so prose
+    that merely quotes a call is not run.
+    """
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        start = offset
+        offset += len(line)
+        if not _RAW_CODE_START.match(line):
+            continue
+        code = text[start:].strip()
+        try:
+            tree = ast.parse(code)
+        except (SyntaxError, ValueError):
+            continue
+        if not any(_is_executable(stmt) for stmt in tree.body):
+            continue
+        prose = bool(text[:start].strip())
+        if prose and not any(isinstance(stmt, _PROGRAM_STMTS) for stmt in tree.body):
+            continue
+        return code, prose
+    return None
+
+
 def parse_multi_turn_decision(content: str | None) -> MultiTurnDecision:
     """Classify a multi-turn decision reply.
 
@@ -444,8 +495,10 @@ def parse_multi_turn_decision(content: str | None) -> MultiTurnDecision:
     same way when found); otherwise new code in a fenced block (closed, or unclosed when the reply
     was cut off) or a raw tool-call ``code`` argument means regenerate, unless FINISH comes after the
     last code, which finishes; FINISH with no code finishes; an empty reply is reported as ``empty``
-    (the caller may query again); anything else finishes. ``new_code`` for regenerate is always text
-    that ``_extract_code`` can parse.
+    (the caller may query again); a reply with neither keyword nor fenced/tool-call code that ends
+    in an unfenced Python program (``_find_raw_code``, e.g. ``# Subtask: ...`` comments, then
+    imports and calls) means regenerate with source ``raw_code``; anything else finishes
+    (``fallback``). ``new_code`` for regenerate is always text that ``_extract_code`` can parse.
     """
     text = content or ""
     legacy = "regenerate" if "REGENERATE" in text else "finish"
@@ -467,6 +520,11 @@ def parse_multi_turn_decision(content: str | None) -> MultiTurnDecision:
         return MultiTurnDecision("regenerate", _as_python_block(blocks), kind, flags, legacy)
     if "FINISH" in text:
         return MultiTurnDecision("finish", content, "finish_keyword", flags, legacy)
+    raw = _find_raw_code(text)
+    if raw is not None:
+        code, prose = raw
+        flags = ["prose_before_code"] if prose else []
+        return MultiTurnDecision("regenerate", _as_python_block([code]), "raw_code", flags, legacy)
     return MultiTurnDecision("finish", content, "fallback", flags, legacy)
 
 
