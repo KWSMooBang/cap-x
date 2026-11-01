@@ -75,6 +75,10 @@ def episode_record(d: Path, price: tuple[float, float] = PRICE) -> dict[str, Any
         "steps_done": done[best] if best is not None and best < len(done) else None,
         "steps_total": len(br[best]) if best is not None and best < len(br) else None,
         "region_missing": bool(goal.get("region_missing") or gc.get("region_goal_missing")),
+        # goal steps that could not be asked until the end (object still in the hand / never detected); the goal
+        # decision is unchanged, this separates "not observable" from "observed wrong"
+        "goal_unobservable": len(goal.get("unobservable") or []),
+        "merges_backward": (sm.get("track_identity") or {}).get("merges_backward"),
         "init_failed": sm.get("init_failed"), "init_attempts": len(init.get("attempts") or []) or None,
         "agent_fallbacks": sm.get("agent_fallbacks"), "frames": sm.get("n_frames"), "rows": sm.get("rows"),
         "usage": usage, "calls_per_role": {k: u.get("calls") for k, u in models.items()},
@@ -116,6 +120,10 @@ def summarize(recs: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "oracle_success": sum(bool(r["oracle_success"]) for r in ok),
         "steps_done": sum(r["steps_done"] or 0 for r in ok), "steps_total": sum(r["steps_total"] or 0 for r in ok),
         "region_missing": [r["id"] for r in recs if r["region_missing"]],
+        "goal_unobservable_steps": sum(r.get("goal_unobservable") or 0 for r in ok),
+        "goal_unobservable": [r["id"] for r in ok if r.get("goal_unobservable")],
+        # goal not satisfied while a remaining step was not observable: "could not see", not "saw wrong"
+        "goal_unsatisfied_unobservable": sum(1 for r in ok if not r["goal_satisfied"] and r.get("goal_unobservable")),
         "init_failed": [r["id"] for r in recs if r["init_failed"]],
         "init_requeried": sum(max((r["init_attempts"] or 1) - 1, 0) for r in recs),
         "agent_fallbacks": sum(r["agent_fallbacks"] or 0 for r in recs),
@@ -202,11 +210,15 @@ def to_markdown(res: dict[str, Any]) -> str:
         fw, fb = r["forward"], r["forward+backward"]
         init = "FAILED" if r["init_failed"] else f"ok ({r['init_attempts']} attempt(s))" if r["init_attempts"] else "-"
         flags = (" REGION MISSING" if r["region_missing"] else "") + (f" missing {r['missing']}" if r["missing"] else "")
+        unobs = f", {r['goal_unobservable']} unobservable" if r.get("goal_unobservable") else ""
         L.append(f"| {r['id']}{flags} | {fw['acc']} / {fb['acc']} | {fw['undecided_rate']} | {r['name_consistency']} | "
-                 f"{r['goal_satisfied']} ({r['steps_done']}/{r['steps_total']}) | {r['oracle_success']} | {init} | "
+                 f"{r['goal_satisfied']} ({r['steps_done']}/{r['steps_total']}{unobs}) | {r['oracle_success']} | {init} | "
                  f"{r['usage']['calls']} | {r['cost_usd']} |")
     a = res["all"]
     L += ["", f"Init failed: {a['init_failed'] or 'none'}", f"Region (at center) missing from the goal: {a['region_missing'] or 'none'}",
+          f"Goal steps unobservable until the end (object still held / never detected; goal decision unchanged): "
+          f"{a['goal_unobservable_steps']} steps in {a['goal_unobservable'] or 'none'}; goal not satisfied with an "
+          f"unobservable step: {a['goal_unsatisfied_unobservable']}",
           "Failed / excluded (batch_status.json, not averaged): " + (", ".join(f"{k} ({v.get('status')}: {v.get('step') or v.get('reason')})"
                                                                for k, v in res["failed"].items()) or "none"),
           f"Prices: {res['price_per_1m']} $ per 1M tokens; total ${a['cost_usd']} over {a['usage'].get('calls')} calls"]

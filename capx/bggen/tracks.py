@@ -15,6 +15,13 @@
   expected object (named by the task / init, not visible at t=0: ``expect``), and under ``closed_world`` /
   ``fixed_closed`` / ``max_instances`` a new instance needs evidence (more detections of the category in the
   frame than known tracks, under the cap). ``counts`` (report) records splits and every identification.
+* Caps (bggen-fix3 B2 / B3): a category's cap counts every name of the category, expected (not yet detected)
+  names included, so a frame cannot bind an expected name AND open a new track over the cap (B1K fridge_A /
+  fridge_B). ``set_caps``: the generator adds a cap per category from the number of objects the init named
+  (``cap_from_init``). A detection of a full category goes to the nearest existing track of the category (distance
+  and reason in ``log`` / ``capped``), or is dropped when every track of it was matched in this frame.
+* A held object follows its gripper (``follow``); a grasp of a track without a 3D position puts it at the EEF.
+* ``seen_ts``: the frames each track was detected at (mode A backward merge: never seen together).
 * Large tracks (``large_extent``; countertop / fridge on a moving head camera) associate by box gap.
 * Grasp target: the track nearest to the EEF by point-to-box distance (``grasp_radius``); movable
   objects win over supports / containers at the same distance (a door handle grasp -> the fridge).
@@ -58,6 +65,9 @@ class TrackConfig:
     # tracks this large (max extent, m) associate by box gap instead of center distance (a moving camera sees a
     # different part of a countertop each time, so the mask center moves); 0 = off
     large_extent: float = 0.0
+    # bggen-fix3 B3: a category the init named gets a cap = the number of tracks it has after init (detected at t=0 +
+    # expected names); categories the init did not name keep no cap (the number is unknown)
+    cap_from_init: bool = False
 
 
 @dataclass
@@ -78,6 +88,8 @@ class Track:
     # named by the task / init but not detected yet: no position; the first unexplained detection of the
     # category is bound to this name (``Tracker.update``)
     expected: bool = False
+    seen_ts: list[int] = field(default_factory=list, repr=False)  # frames with a detection (bggen-fix3 B4)
+    zlim: tuple[float, float] | None = None  # world z of the mask's lowest / highest depth points (5 / 95 %)
 
     def to_dict(self) -> dict[str, Any]:
         return {"alias": self.alias, "category": self.category,
@@ -103,7 +115,9 @@ class Tracker:
         self.init_t: int | None = None
         # identity counters (report): new tracks after the first frame of a category already tracked (splits),
         # reacquired / event-merged / expected-bound / capped detections
-        self.counts: dict[str, int] = dict.fromkeys(("new_after_init", "new_category_after_init", "reacquired", "merged_on_detect", "merged_late", "bound_expected", "closed_assigned", "closed_dropped", "duplicates_dropped"), 0)
+        self.counts: dict[str, int] = dict.fromkeys(("new_after_init", "new_category_after_init", "reacquired", "merged_on_detect", "merged_late", "bound_expected", "closed_assigned", "closed_dropped", "duplicates_dropped", "capped_assigned", "grasp_retarget"), 0)
+        self.caps: dict[str, int] = dict(self.cfg.max_instances)  # category -> max tracks (config + init)
+        self.capped: list[dict[str, Any]] = []  # detections of a full category given to an existing track
 
     # --- names -----------------------------------------------------------------------------------
     def _next_alias(self, cat: str) -> str:
@@ -137,7 +151,7 @@ class Tracker:
         self.init_t = t
         per_cat: dict[str, int] = {}
         for d in sorted(dets, key=lambda d: (d.category, d.pixel[0])):
-            cap = self.cfg.max_instances.get(d.category)
+            cap = self.caps.get(d.category)
             if cap is not None and per_cat.get(d.category, 0) >= cap:
                 self.counts["closed_dropped"] += 1  # e.g. a second countertop mask: the same countertop
                 continue
@@ -166,18 +180,47 @@ class Tracker:
         """Tracks of the category with a detection behind them (expected names not yet bound excluded)."""
         return [a for a, tr in self.tracks.items() if tr.category == cat and not tr.expected]
 
+    def named(self, cat: str) -> list[str]:
+        """Every name of the category, expected ones included (what a cap counts)."""
+        return [a for a, tr in self.tracks.items() if tr.category == cat]
+
+    def set_caps(self, caps: dict[str, int], why: str = "init") -> None:
+        """Add caps (the smaller one wins over a configured cap)."""
+        for cat, n in caps.items():
+            if n <= 0:
+                continue
+            self.caps[cat] = min(n, self.caps.get(cat, n))
+            self.log.append({"kind": "cap", "category": cat, "cap": self.caps[cat], "why": why})
+
     @staticmethod
     def _world_size(d: Detection, base_pose: np.ndarray | None) -> np.ndarray:
         """Base-axis extent -> world-axis extent (the axis-aligned bound of the rotated box)."""
         size = np.asarray(d.size, dtype=np.float64)
         return size if base_pose is None else np.abs(np.asarray(base_pose)[:3, :3]) @ size
 
+    @staticmethod
+    def _world_zlim(d: Detection, base_pose: np.ndarray | None) -> tuple[float, float] | None:
+        """World z range of the mask's depth points (5 / 95 % corners); falls back to center +- size / 2."""
+        lo, hi = d.lo, d.hi
+        if lo is None or hi is None:
+            if d.center is None or d.size is None:
+                return None
+            lo, hi = np.asarray(d.center) - 0.5 * np.asarray(d.size), np.asarray(d.center) + 0.5 * np.asarray(d.size)
+        lo, hi = np.asarray(lo, float), np.asarray(hi, float)
+        corners = np.array([[x, y, z] for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])])
+        if base_pose is not None:
+            corners = (np.asarray(base_pose)[:3, :3] @ corners.T).T + np.asarray(base_pose)[:3, 3]
+        return float(corners[:, 2].min()), float(corners[:, 2].max())
+
     def _fill(self, tr: Track, t: int, cam: str, d: Detection, base_pose: np.ndarray | None) -> None:
         w = self._world(d, base_pose)
         if w is not None and tr.held_by is None:
             tr.pos, tr.size = w, self._world_size(d, base_pose)
+            tr.zlim = self._world_zlim(d, base_pose)
         elif w is not None and tr.size is None:
             tr.size = self._world_size(d, base_pose)
+        if not tr.seen_ts or tr.seen_ts[-1] != t:
+            tr.seen_ts.append(t)
         tr.pixel[cam], tr.box[cam] = d.pixel, d.box
         if d.mask is not None:
             tr.mask[cam] = d.mask
@@ -214,23 +257,30 @@ class Tracker:
         return m[1] / r if r > 0 else None
 
     def update(self, t: int, cam: str, dets: Sequence[Detection], base_pose: np.ndarray | None = None,
-               detected_categories: Sequence[str] | None = None) -> dict[str, Any]:
-        """Associate this frame's detections; returns {"matched", "new", "merged", "dropped"}."""
+               detected_categories: Sequence[str] | None = None, keep_seen: bool = False) -> dict[str, Any]:
+        """Associate this frame's detections; returns {"matched", "new", "merged", "dropped"}.
+
+        ``keep_seen``: a second pass over the SAME frame (the agent's ``detect`` tool adds detections of another
+        prompt): tracks already detected in this frame keep that match and count as taken -- a detection of the same
+        object is a duplicate, never a second name for it (bggen-fix3 B2)."""
         cats = set(detected_categories) if detected_categories is not None else {d.category for d in dets}
-        for tr in self.tracks.values():
-            if tr.category in cats:
+        taken: set[str] = set()
+        for a, tr in self.tracks.items():
+            if keep_seen and tr.seen_now and tr.last_seen == t:
+                taken.add(a)
+            elif tr.category in cats:
                 tr.seen_now = False
         rep: dict[str, Any] = {"matched": {}, "new": [], "merged": [], "dropped": 0}
         pairs = []
         for i, d in enumerate(dets):
             for a, tr in self.tracks.items():
-                if tr.category != d.category:
+                if tr.category != d.category or a in taken:
                     continue
                 dist = self._dist(tr, d, cam, base_pose)
                 if dist is not None and dist <= 1.0:
                     pairs.append((dist, i, a))
         used_d: set[int] = set()
-        used_t: set[str] = set()
+        used_t: set[str] = set(taken)
         for dist, i, a in sorted(pairs):
             if i in used_d or a in used_t:
                 continue
@@ -263,6 +313,8 @@ class Tracker:
             if target is not None:
                 self._fill(self.tracks[target], t, cam, d, base_pose)
                 rec = {"t": t, "from": None, "into": target, "why": why}
+                if why.startswith("cap full"):
+                    self.capped.append({**rec, "category": d.category})
                 if why.startswith("detection at the release place"):
                     rep["merged"].append(rec)
                     self.log.append({"kind": "merge_on_detect", **rec})
@@ -344,32 +396,43 @@ class Tracker:
                 idx.remove(i)
             if not idx:
                 continue
-            # 4. closed world / caps
-            known = self._known(cat)
-            cap = cfg.max_instances.get(cat)
+            # 4. closed world / caps. A cap counts every name of the category (expected names, bound in this frame
+            # or not, included); the closed-world evidence counts names with a detection (bound now included)
+            named = self.named(cat)
+            known = [a for a in named if not self.tracks[a].expected or a in used]
+            cap = self.caps.get(cat)
             fixed = cat in cfg.fixed_categories
             room = len(idx)  # new tracks allowed
             if cap is not None:
-                room = min(room, max(cap - len(known), 0))
+                room = min(room, max(cap - len(named), 0))
             if fixed and cfg.fixed_closed and self.init_t is not None and t > self.init_t and known:
                 room = 0
             if cfg.closed_world and known:
                 room = min(room, max(n_det.get(cat, 0) - len(known), 0))
             assigned: list[tuple[float, int, str]] = []
             if room < len(idx) and (not fixed or cap is not None):
-                free = [a for a in known if a not in used]
+                # a capped category: every name (an expected one too) can take the detection
+                free = [a for a in (named if cap is not None else known) if a not in used]
                 cost = np.full((len(idx), len(free)), np.inf)
+                unit: dict[tuple[int, str], str] = {}
                 for r, i in enumerate(idx):
                     for c, a in enumerate(free):
                         m = self._metric(self.tracks[a], dets[i], cam, base_pose)
                         cost[r, c] = 1e6 if m is None else m[1]
+                        unit[(i, a)] = "?" if m is None else m[0]
                 assigned = sorted((cost[r, c], idx[r], free[c]) for r, c in self._joint(cost))
                 # keep the best-fitting assignments; the worst ones are the new instances the evidence allows
                 assigned = assigned[:max(len(idx) - room, 0)]
-            for _x, i, a in assigned:
-                self.counts["closed_assigned"] += 1
+            full = cap is not None and len(named) >= cap
+            for x, i, a in assigned:
                 used.add(a)
-                out.append((i, a, "closed world: the nearest unmatched known track of the category (joint)"))
+                if full:
+                    self.counts["capped_assigned"] += 1
+                    dist = "unknown (no position)" if unit[(i, a)] == "?" else f"{x:.2f} {unit[(i, a)]}"
+                    out.append((i, a, f"cap full ({cap} {cat}): the nearest existing track, distance {dist}"))
+                else:
+                    self.counts["closed_assigned"] += 1
+                    out.append((i, a, "closed world: the nearest unmatched known track of the category (joint)"))
             idx = [i for i in idx if all(i != x[1] for x in assigned)]
             for k, i in enumerate(idx):
                 if k < room:
@@ -448,9 +511,13 @@ class Tracker:
         return a, round(d, 4)
 
     def hold(self, alias: str, arm: str, eef_world: np.ndarray) -> None:
+        """The track follows the gripper while held (``follow``). Without a 3D position it is put at the EEF: it is
+        in the hand, so it is where the hand is (bggen-fix3 B1: a held B1K hot dog was left behind)."""
         tr = self.tracks[alias]
         tr.held_by = arm
-        tr.hold_offset = None if tr.pos is None else tr.pos - eef_world
+        if tr.pos is None:
+            tr.pos = np.asarray(eef_world, dtype=np.float64).copy()
+        tr.hold_offset = tr.pos - np.asarray(eef_world, dtype=np.float64)
         tr.released_at = None
 
     def release(self, arm: str, t: int, eef_world: np.ndarray, eef_pixel: tuple[float, float] | None = None) -> str | None:

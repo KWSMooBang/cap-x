@@ -43,9 +43,12 @@ def test_close_retracted_when_the_object_stays(tmp_path):
     rel = next(t for t in trace if t["event"]["kind"] == "release")
     assert rel["event"]["obj"] is None  # nothing to let go of
     segs = json.loads((tmp_path / "out" / "backward_log.json").read_text())["segments"]
-    assert [s["kind"] for s in segs] == ["articulated"]  # a close / press on bowl_A, not a pick-and-place
+    # bggen-fix3 C2: a bowl does not open / close: a retracted grasp stays an object segment (pick / place labels,
+    # no Effect), not articulated / manipulate (that merged pick and place into one label)
+    assert [(s["kind"], s["retracted"], s["effect"]) for s in segs] == [("object", True, [])]
     rows = [json.loads(x) for x in (tmp_path / "out" / "rows_backward.jsonl").read_text().splitlines()]
-    assert not any(r["subtask"].startswith("place(bowl_A") for r in rows)
+    assert not any(r["subtask"].startswith("manipulate(") for r in rows)
+    assert any(r["subtask"].startswith("pick(bowl_A") for r in rows)
 
 
 def test_close_confirmed_by_comotion_in_the_swap(tmp_path):

@@ -33,6 +33,9 @@ class Detection:
     size: np.ndarray | None = None  # (3,) m
     mask: np.ndarray | None = field(default=None, repr=False)
     prompt: str = ""
+    # 5 / 95 percentile corners of the lifted mask points (base frame): a container's bottom .. top for the 'in' geometry
+    lo: np.ndarray | None = field(default=None, repr=False)
+    hi: np.ndarray | None = field(default=None, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {"category": self.category, "score": round(self.score, 3), "pixel": [round(x, 1) for x in self.pixel],
@@ -76,7 +79,7 @@ def detections_from_masks(cam: CameraFrame, cat: Category, results: Sequence[dic
             pts = mask_points(k["mask"], cam.depth, cam.K, cam.T_base_cam, max_depth=max_depth)
             if len(pts) >= min_points:
                 lo, hi = np.percentile(pts, 5, axis=0), np.percentile(pts, 95, axis=0)
-                det.center, det.size = np.median(pts, axis=0), hi - lo
+                det.center, det.size, det.lo, det.hi = np.median(pts, axis=0), hi - lo, lo, hi
         out.append(det)
     return out
 

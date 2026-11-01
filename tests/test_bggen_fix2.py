@@ -182,7 +182,8 @@ def test_b1k_large_fixed_objects_stay_one_track_on_a_moving_camera():
     assert rep["new"] == [] and "countertop_A" in rep["matched"] and tr.counts["bound_expected"] == 1
     rep = tr.update(20, "head", [_det("countertop", 3.5, 3.0, 0.9, big), _det("fridge", 3.9, 1.8, 0.9, (0.8, 0.7, 1.8))])
     assert rep["new"] == []
-    assert sorted(tr.tracks) == ["countertop_A", fridge] and tr.counts["closed_assigned"] >= 1
+    # (bggen-fix3: a detection of a capped, full category is counted as capped_assigned)
+    assert sorted(tr.tracks) == ["countertop_A", fridge] and tr.counts["closed_assigned"] + tr.counts["capped_assigned"] >= 1
 
 
 # --- C: expected objects --------------------------------------------------------------------------------

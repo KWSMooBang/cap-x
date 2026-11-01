@@ -4,6 +4,10 @@ Rule: the label at t says only what was knowable from observations up to t. Allo
 
 * B1 track ID unification: an alias the tracker later merged into another (``Tracker.merges``) is
   renamed in every row (the object was the same one at t too).
+* B1b same-category merge (bggen-fix3 B4; ``merge_tracks_backward``): two aliases of one category never detected
+  together, the later one appearing after the earlier one was lost, the gap explained by a carry or a base motion,
+  are one object (B1K hotdog_C..F). Renamed like B1 in every row (belief, Observe, S4, Subtask); the later alias's
+  edges win at the rows where both exist. Never below the init's count of the category. Not in mode B.
 * B2 single-shot noise: an Observe 0 / 1 that disagrees with the previous and the next 0 / 1 answers
   (which agree), with no robot contact on its objects in between, is corrected to the neighbours'
   value, and the belief rows it changed are restored. Hindsight answers (mode A tool) count as
@@ -12,7 +16,9 @@ Rule: the label at t says only what was knowable from observations up to t. Allo
   confirmed (decided by an observing source); attached to that row only.
 * B4 Subtask = the segment's intent, from the approach before the segment starts (Ver1 style). A row's
   Subtask holds from its frame on: pick -> place switches at the close event row, the next pick starts at the
-  release row (its approach); the row that confirms the end state (Effect) never moves a boundary.
+  release row (its approach); the row that confirms the end state (Effect) never moves a boundary. Only a close
+  on nothing (a press) or on an openable is articulated (open / close / toggle_on / manipulate); a retracted grasp
+  of a bowl keeps pick / place labels, and a segment without an Effect keeps them too (B3 logs ``effect []``).
 
 Forbidden (enforced, and tested): filling ``?`` from later frames, changing Delta / goal progress,
 writing a hidden process state (cooked behind a closed door) as an observation.
@@ -20,9 +26,12 @@ writing a hidden process state (cooked behind a closed door) as an observation.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
+
+import numpy as np
 
 from .graph import decided
 from .vocab import OPENABLE_KEYS, EdgeKey, is_container, statement_text
@@ -43,6 +52,7 @@ class Segment:
     label_place: str = ""
     effect: list[tuple[EdgeKey, int, int]] = field(default_factory=list)
     uncertain: bool = False  # a provisional grasp never verified (the release did not settle it either)
+    retracted: bool = False  # the co-motion check found the object where it was (nothing carried)
 
 
 @dataclass
@@ -50,6 +60,7 @@ class BackwardResult:
     rows: list[Any]
     log: list[dict[str, Any]]
     segments: list[Segment]
+    merges_backward: list[dict[str, Any]] = field(default_factory=list)  # B1b
 
 
 def _rename(key: EdgeKey, a: str, b: str) -> EdgeKey:
@@ -61,17 +72,30 @@ def unify_ids(rows: list[Any], merges: Sequence[dict[str, Any]], log: list[dict[
         a, b = m.get("from"), m.get("into")
         if not a or not b:
             continue
+        # a forward late merge: the surviving alias's own edge wins (the fresh alias lived for a frame or two). A
+        # backward merge (``prefer_from``): the later alias was the one being observed, the surviving alias's edges
+        # at those rows are stale memory -> the renamed edge wins
+        prefer = bool(m.get("prefer_from"))
+        word = re.compile(rf"\b{re.escape(a)}\b")
         n = 0
         for r in rows:
             r.observed = [(_rename(k, a, b), v) for k, v in r.observed]
-            nb = {}
+            nb: dict[EdgeKey, Any] = {}
+            renamed: set[EdgeKey] = set()
             for k, v in r.belief.items():
                 k2 = _rename(k, a, b)
-                if k2 in nb and k2 != k:
-                    continue  # the surviving alias's own edge wins
+                if k2 in nb and (k2 in renamed) == (k2 != k):
+                    continue  # same origin twice: cannot happen; keep the first
+                if k2 in nb and (k2 != k) != prefer:
+                    continue  # the preferred origin is already there
                 nb[k2] = v
-                n += k2 != k
+                if k2 != k:
+                    renamed.add(k2)
+                    n += 1
+                else:
+                    renamed.discard(k2)
             r.belief = nb
+            r.s4 = [word.sub(b, x) for x in r.s4]
             r.changed = [_rename(k, a, b) for k in r.changed]
             r.hindsight = {_rename(k, a, b): v for k, v in r.hindsight.items()}
             r.touched = [b if x == a else x for x in r.touched]
@@ -79,6 +103,67 @@ def unify_ids(rows: list[Any], merges: Sequence[dict[str, Any]], log: list[dict[
             if r.obj == a:
                 r.obj = b
         log.append({"rule": "B1", "from": a, "into": b, "t": m.get("t"), "entries_renamed": n})
+
+
+def sightings(trace: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Per alias from the forward trace: category, frames it was detected at, its position then (B1b input)."""
+    out: dict[str, dict[str, Any]] = {}
+    for line in trace:
+        for tr in line.get("tracks", []):
+            s = out.setdefault(tr["alias"], {"category": tr["category"], "seen": [], "pos": []})
+            if tr.get("seen_now") and (not s["seen"] or s["seen"][-1] != line["t"]):
+                s["seen"].append(line["t"])
+                s["pos"].append(tr.get("pos"))
+    return out
+
+
+def merge_tracks_backward(sight: dict[str, dict[str, Any]], rows: Sequence[Any], base_moving: Sequence[tuple[int, int]],
+                          caps: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """B1b (bggen-fix3 B4, mode A only): aliases of one category that are one object seen twice. Aliases in order of
+    their first detection; a later alias joins an earlier one (its cluster) when (1) they were never detected at the
+    same time (the earlier one's last detection is before the later one's first), and (2) the gap between is explained
+    -- the base moved (the camera lost it and found it again) or the earlier object was carried (held / released) in
+    it. Among candidates the nearest (last position vs first position) wins, then the most recently lost. A known
+    count (``caps``: the init's names) is never merged below: an alias joins a cluster only while the clusters (plus
+    names never detected) would exceed the cap. Returns merges {"from", "into", ...} in order (``prefer_from``)."""
+    caps = caps or {}
+    held = {a: [r.t for r in rows if a in set(r.held.values())] for a in sight}
+    released = {a: [r.t for r in rows if r.kind == "release" and r.obj == a] for a in sight}
+    out: list[dict[str, Any]] = []
+    for cat in sorted({s["category"] for s in sight.values()}):
+        names = [a for a, s in sight.items() if s["category"] == cat]
+        seen = sorted((a for a in names if sight[a]["seen"]), key=lambda a: (sight[a]["seen"][0], a))
+        never = len(names) - len(seen)
+        cap = caps.get(cat)
+        clusters: list[dict[str, Any]] = []
+        for b in seen:
+            sb = sight[b]
+            first = sb["seen"][0]
+            cands = []
+            for c in clusters:
+                if c["last_t"] >= first:
+                    continue  # detected together (or overlapping): two objects
+                why = []
+                if any(s0 < first and s1 > c["last_t"] for s0, s1 in base_moving):
+                    why.append("base moved")
+                if any(c["last_t"] <= t <= first for m in c["members"] for t in held.get(m, []) + released.get(m, [])):
+                    why.append("carried")
+                if not why:
+                    continue
+                p0, p1 = c["last_pos"], sb["pos"][0]
+                d = float(np.linalg.norm(np.asarray(p0, float) - np.asarray(p1, float))) if p0 is not None and p1 is not None else 0.0
+                cands.append((d, -c["last_t"], len(cands), c, why))
+            over = cap is None or len(clusters) + 1 + never > cap
+            if cands and over:
+                d, _, _, c, why = min(cands, key=lambda x: x[:3])
+                out.append({"t": first, "from": b, "into": c["root"], "prefer_from": True, "backward": True,
+                            "why": f"never seen together, gap {c['last_t']}-{first} explained ({', '.join(why)}), "
+                                   f"distance {d:.2f} m", "gap": [c["last_t"], first]})
+                c["members"].append(b)
+                c["last_t"], c["last_pos"] = sb["seen"][-1], sb["pos"][-1]
+                continue
+            clusters.append({"root": b, "members": [b], "last_t": sb["seen"][-1], "last_pos": sb["pos"][-1]})
+    return sorted(out, key=lambda m: m["t"])
 
 
 def _touched_between(rows: Sequence[Any], i0: int, i1: int, key: EdgeKey) -> bool:
@@ -130,9 +215,12 @@ def segments(rows: Sequence[Any], categories: dict[str, str]) -> list[Segment]:
     open_seg: dict[Any, Segment] = {}
     for i, r in enumerate(rows):
         if r.kind in ("grasp", "close", "close_empty") and r.obj:
-            empty = r.kind == "close_empty" or "grasp_retracted" in r.notes
-            kind = "articulated" if categories.get(r.obj) in OPENABLE_KEYS or empty else "object"
-            open_seg[r.arm] = Segment(r.t, r.t, r.arm, r.obj, kind, i, i, uncertain="grasp_unverified" in r.notes)
+            # bggen-fix3 C2: a retracted grasp of an object that does not open / close (a bowl) stays an object
+            # segment (pick / place labels: the approach and the close were a pick attempt); only a close on nothing
+            # (a press) or on an openable is articulated
+            kind = "articulated" if categories.get(r.obj) in OPENABLE_KEYS or r.kind == "close_empty" else "object"
+            open_seg[r.arm] = Segment(r.t, r.t, r.arm, r.obj, kind, i, i, uncertain="grasp_unverified" in r.notes,
+                                      retracted="grasp_retracted" in r.notes)
         elif r.kind in ("release", "open") and r.arm in open_seg:
             s = open_seg.pop(r.arm)
             s.end_t, s.end_row = r.t, i
@@ -234,18 +322,29 @@ def subtasks(rows: list[Any], segs: list[Segment], categories: dict[str, str], b
             r.subtask = last.label_place  # the last place, not yet confirmed as the goal
 
 
-def check_forbidden(fwd: Sequence[Any], bwd: Sequence[Any], hidden_keys: Sequence[tuple[int, EdgeKey]] = ()) -> list[str]:
-    """Violations of the forbidden list (empty = clean). Compares the backward rows with the forward rows."""
+def check_forbidden(fwd: Sequence[Any], bwd: Sequence[Any], hidden_keys: Sequence[tuple[int, EdgeKey]] = (),
+                    renamed: dict[str, str] | None = None) -> list[str]:
+    """Violations of the forbidden list (empty = clean). Compares the backward rows with the forward rows.
+    ``renamed``: B1b alias map (from -> into); the forward rows are read through it (the renamed alias's entry)."""
     bad = []
+    ren = renamed or {}
+
+    def rk(k: EdgeKey) -> EdgeKey:
+        return tuple(ren.get(x, x) if x is not None else x for x in k)  # type: ignore[return-value]
+
     for a, b in zip(fwd, bwd, strict=False):
         if a.delta != b.delta or a.goal_done != b.goal_done:
             bad.append(f"t={a.t}: Delta changed")
         av = dict(a.observed)
+        abel = dict(a.belief)
+        if ren:
+            av = {**{rk(k): v for k, v in a.observed if rk(k) == k}, **{rk(k): v for k, v in a.observed if rk(k) != k}}
+            abel = {**{k: v for k, v in a.belief.items() if rk(k) == k}, **{rk(k): v for k, v in a.belief.items() if rk(k) != k}}
         for k, v in b.observed:
             if av.get(k) == "?" and v != "?":
                 bad.append(f"t={a.t}: {statement_text(k)} ? filled with {v}")
         for k, (p, _src) in b.belief.items():
-            pa = a.belief.get(k)
+            pa = abel.get(k)
             if av.get(k) == "?" and pa is not None and decided(pa[0]) != decided(p):
                 bad.append(f"t={a.t}: belief of unobserved {statement_text(k)} changed")
     for t, k in hidden_keys:
@@ -256,12 +355,26 @@ def check_forbidden(fwd: Sequence[Any], bwd: Sequence[Any], hidden_keys: Sequenc
 
 
 def backward(fwd_rows: Sequence[Any], merges: Sequence[dict[str, Any]], categories: dict[str, str],
-             base_moving: Sequence[tuple[int, int]] = (), navigation: bool = False, goal_done: bool = False) -> BackwardResult:
+             base_moving: Sequence[tuple[int, int]] = (), navigation: bool = False, goal_done: bool = False,
+             sight: dict[str, dict[str, Any]] | None = None, caps: dict[str, int] | None = None) -> BackwardResult:
+    """``sight`` (``sightings(trace)``): enables B1b, the same-category merge of aliases never seen together."""
     rows = [r.copy() for r in fwd_rows]
     log: list[dict[str, Any]] = []
     unify_ids(rows, merges, log)
+    if sight:
+        sight = {a: {**s, "seen": list(s["seen"]), "pos": list(s["pos"])} for a, s in sight.items()}
+        for m in merges:  # forward merges first: one alias, the union of its sightings
+            a, b = m.get("from"), m.get("into")
+            if a in sight and b in sight:
+                sa = sight.pop(a)
+                both = sorted(zip(sight[b]["seen"] + sa["seen"], sight[b]["pos"] + sa["pos"], strict=True), key=lambda x: x[0])
+                sight[b]["seen"], sight[b]["pos"] = [x[0] for x in both], [x[1] for x in both]
+    late = merge_tracks_backward(sight, rows, base_moving, caps) if sight else []
+    unify_ids(rows, late, log)
+    for m in late:
+        log.append({"rule": "B1b", **m})
     remove_noise(rows, log)
     segs = segments(rows, categories)
     effects(rows, segs, log)
     subtasks(rows, segs, categories, base_moving, navigation, goal_done, log)
-    return BackwardResult(rows, log, segs)
+    return BackwardResult(rows, log, segs, late)

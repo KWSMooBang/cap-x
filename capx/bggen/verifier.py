@@ -18,6 +18,18 @@ Rules (each decision is logged with its rule id):
   that contradicts a decided belief while no event touched the subject or the target since the last
   observation is NOT applied; the key is re-asked at the next event / keyframe and applied only when
   that answer agrees (2 agreeing answers).
+* R8 process model: cooked(X) after in(X, C) and toggled_on(C) held for ``cook_s`` -> 0.7 mem (generator).
+* R9 release geometry fills ``?`` (bggen-fix3 A1): at a release the generator always runs the geometry tool for
+  the released object and the supports / containers marked near it (the agent need not ask for it). If the VDM
+  answered ``?`` (or was not asked) and the geometry is positive for the best candidate -> 0.7 / source exp (an
+  expectation, not an observation: goal steps still need an observation). Why: t08 d1 kept in(cheese, basket) at
+  0.03 because every answer was ``?`` and nobody asked the geometry.
+* R10 'in' conflict (bggen-fix3 A3): an Observe 0 for in(X, C) while the geometry says X is inside C is a
+  conflict, not an observation: P 0.5 / conflict and an immediate re-check (another camera with ``look``; mode A
+  also a hindsight frame of the same quiet interval); a re-check answer 0 lowers it (0.1 obs), 1 raises it (0.9
+  obs), ``?`` keeps the key pending and it is asked again at the next event (whose 0 then lowers it). Why: the
+  front camera sees a basket's wall, not its inside (t08 d2 / d3: one VDM 0 overruled geometry that put the
+  cheese in the basket).
 * Marks: only tracks detected in the current image are marked (the generator draws them).
 """
 
@@ -73,10 +85,13 @@ class Verifier:
         self.flat_measured: dict[str, float] = {}
         self.s4: list[str] = []  # S4 messages of the current event
         self.decisions: list[Decision] = []
+        self.geo_conflict: dict[EdgeKey, int] = {}  # R10: key -> frame of the conflicting Observe 0
+        self.new_conflicts: list[EdgeKey] = []  # R10 holds of the current event (the generator re-checks them now)
 
     def begin(self) -> None:
         self.s4 = []
         self.decisions = []
+        self.new_conflicts = []
 
     def _log(self, key: EdgeKey, rule: str, value: str | None, before: float | None, why: str = "") -> None:
         e = self.g.get(key)
@@ -137,6 +152,25 @@ class Verifier:
                 self._log(key, "R2", "?", before)
                 continue
             val = v == "1"
+            # R10: 'in' answered 0 while the geometry puts the object inside -> conflict, re-check before lowering
+            if key[0] == "in" and key in self.geo_conflict:
+                self.geo_conflict.pop(key)
+                if not val:
+                    self.pending.pop(key, None)
+                    self.g.set(key, P_OBS[1], "obs", t, observed=True)
+                    self._log(key, "R10-confirm", v, before, "re-asked after a geometry conflict: 0 again")
+                    accepted.add(key)
+                    continue
+                self._log(key, "R10-clear", v, before, "re-asked after a geometry conflict: 1")
+            elif key[0] == "in" and not val and self.geo_positive(key, geometry.get(key), categories or {}):
+                self.geo_conflict[key] = t
+                self.new_conflicts.append(key)
+                self.pending.pop(key, None)
+                self.g.set(key, 0.5, "conflict", t, observed=True)
+                self.s4.append(f"{key[1]} may be inside {key[2]} (geometry) though the image answer was no: re-checking")
+                self._log(key, "R10-hold", v, before, f"Observe 0 vs geometry inside {geometry.get(key)}")
+                accepted.add(key)
+                continue
             # R7: no-touch change needs agreeing re-observations
             if self.cfg.touch_rule and e is not None and decided(e.p) is not None and decided(e.p) != val \
                     and key[1] not in touched and (key[2] is None or key[2] not in touched) and e.source != "exp":
@@ -185,4 +219,47 @@ class Verifier:
         return why
 
     def recheck_keys(self) -> list[EdgeKey]:
-        return list(self.pending)
+        return list(dict.fromkeys([*self.pending, *self.geo_conflict]))
+
+    # --- R9 / R10 geometry ------------------------------------------------------------------------
+    def geo_positive(self, key: EdgeKey, g: dict[str, Any] | None, categories: dict[str, str]) -> bool:
+        """The geometry supports the relation: the container check (depth, ``inside``), the 2D evidence
+        (``positive``), or for a support on the depth path the center within the support radius and resting flat."""
+        if not g or key[0] not in ("on", "in"):
+            return False
+        if g.get("positive") is not None:
+            return bool(g["positive"])
+        if g.get("mode") == "depth" and "d_xy" in g and g.get("inside") is None:
+            if g["d_xy"] > g["r"] + self.cfg.veto_xy_margin:
+                return False
+            pair = f"{categories.get(key[1], key[1])}/{categories.get(key[2], key[2])}"
+            flat = self.cfg.flat_dz.get(pair, self.flat_measured.get(pair))
+            return not flat_veto(g["d_xy"], g["r"], g.get("dz"), flat, self.cfg.veto_xy_margin, self.cfg.veto_dz_margin)
+        return False
+
+    def geo_fill(self, key: EdgeKey, g: dict[str, Any] | None, t: int, categories: dict[str, str],
+                 held: Iterable[str] = ()) -> bool:
+        """R9: a release-geometry candidate the VDM did not decide (``?`` / not asked): positive geometry -> 0.7 exp."""
+        e = self.g.get(key)
+        if key[1] in set(held) or (e is not None and e.source == "robot" and e.p >= P_ROBOT[0]):
+            return False
+        if not self.geo_positive(key, g, categories):
+            return False
+        before = None if e is None else e.p
+        self.g.set(key, P_EXP[0], "exp", t)
+        self._log(key, "R9", "geometry", before, f"release geometry, Observe undecided {g}")
+        return True
+
+    def recheck(self, key: EdgeKey, v: str, t: int, how: str) -> bool:
+        """R10 re-check of a conflict at the same event (``look`` / ``hindsight``). Returns True when decided."""
+        if key not in self.geo_conflict:
+            return False
+        e = self.g.get(key)
+        before = None if e is None else e.p
+        if v not in ("0", "1"):
+            self._log(key, "R10-pending", v, before, f"{how} re-check undecided: asked again at the next event")
+            return False
+        self.geo_conflict.pop(key)
+        self.g.set(key, P_OBS[0] if v == "1" else P_OBS[1], "obs", t, observed=True)
+        self._log(key, "R10-confirm" if v == "0" else "R10-resolve", v, before, f"{how} re-check")
+        return True

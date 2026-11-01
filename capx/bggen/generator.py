@@ -33,7 +33,7 @@ from .graph import BeliefGraph, GoalTracker, Step, decided
 from .perception import Detection, Detector
 from .prompts import agent_prompt, init_prompt, observe_prompt, text_only
 from .records import CameraFrame, Episode, FrameRecord
-from .tracks import TrackConfig, Tracker
+from .tracks import TrackConfig, Tracker, box_distance
 from .verifier import Verifier, VerifierConfig
 from .vocab import (
     ARMS_ONE,
@@ -74,6 +74,19 @@ class GenConfig:
     verify_move: float = 0.03  # m of EEF motion before a provisional grasp is checked (LIBERO lifts: 0.03-0.07 m)
     verify_sep: float = 0.02  # m: the "moved with the hand" and "stayed" positions must be this far apart
     verify_sep_px: float = 20.0  # the same on the 2D path (pixels)
+    # bggen-fix3 C1: a provisional grasp whose object is found at its old place at the release is still a grasp when
+    # the hand rose at least ``carry_lift`` m while closed and released within ``put_back_radius`` m (horizontal) of
+    # where it closed: the object was lifted and put back (t02 demo_2: bowl lifted 4.3 cm and set on the same
+    # plate). 0.03 m = ``lift_dz`` (the R3 ``lifted`` threshold) = ``verify_move``; LIBERO lifts are 0.03-0.07 m.
+    carry_lift: float = 0.03
+    put_back_radius: float = 0.08
+    # bggen-fix3 A1: geometry of the released object vs the nearest supports / containers marked in the release image
+    release_geo_k: int = 2
+    release_geo_radius: float = 0.30  # m (3D path; the 2D path takes the nearest ``release_geo_k`` by pixel)
+    # bggen-fix3 A3: R10 re-check of an 'in' conflict at the same event: another camera, then (mode A) a later
+    # frame of the same quiet interval this many seconds after the event
+    recheck_look: bool = True
+    recheck_hindsight_s: float = 1.0
     cam_still_m: float = 0.01  # 2D path: the camera counts as unmoved since the close within 1 cm and 1 deg
     cam_still_deg: float = 1.0
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
@@ -553,6 +566,14 @@ class Generator:
                 self.categories.append(vc)  # init named a category the instruction parser missed: detect it too
                 self.tried[cat] = {vc.sam3_text}
         info["expected"] = self.tracker.expected()
+        if cfg.tracks.cap_from_init and parsed["branches"]:
+            # B3: a category the init's goal names has as many objects as it has names after init (detected at t=0 +
+            # expected); further detections of it are one of those (``Tracker._identify`` phase 4)
+            named = {self._cat(x) for b in parsed["branches"] for s in b for k in s for x in k[1:]
+                     if x is not None and x in self.tracker.tracks}
+            caps = {c: len(self.tracker.named(c)) for c in sorted(named)}
+            self.tracker.set_caps(caps, "init names")
+            info["caps"] = dict(self.tracker.caps)
         self.graph.remember = parsed["remember"]
         statements = parsed["observe"] or self._default_init_statements()
         statements = statements[: cfg.max_init_obs]
@@ -656,6 +677,7 @@ class Generator:
         release_pend: dict[str, Any] | None = None
         for k in self.arm_keys:
             self.tracker.follow(k, fr.eef_world(k))
+        self._update_lift(e.t)
         main = fr.cams.get(cfg.camera)
         # robot-state events first: grasp target needs the tracks as they were before this frame's detection
         if e.kind in ("grasp", "close") and arm_key is not None:
@@ -663,23 +685,7 @@ class Generator:
             target, dist = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, px)
             rec["grasp"] = {"target": target, "distance": dist}
             if target is not None:
-                frm = self._support_of(target)
-                self.tracker.hold(target, arm_key, fr.eef_world(arm_key))
-                self.grasp_z[arm_key] = float(fr.eef_world(arm_key)[2])
-                e.obj = target
-                self.graph.events.append(f"robot -grasp-> {target} @{e.t}" + (f" (from {frm})" if frm else "")
-                                         + (" (provisional)" if e.kind == "close" else ""))
-                if e.kind == "close":
-                    tr = self.tracker.tracks[target]
-                    self.pending_grasp[arm_key] = {
-                        "obj": target, "t": e.t, "row": len(self.rows), "eef0": np.asarray(fr.eef_world(arm_key), float),
-                        "pos0": None if tr.pos is None else tr.pos.copy(),
-                        # 2D path: the object's and the fingertip's pixels at the close
-                        "px0": tr.pixel.get(cfg.camera), "eef_px0": px,
-                        "cam_pose0": None if main is None else self._cam_world(main),
-                        # relations before the close, restored if the grasp is retracted
-                        "loc0": {k: (ed.p, ed.source) for k, ed in self.graph.edges.items()
-                                 if k[1] == target and k[0] in ("on", "in", "at")}}
+                self._take(e, arm_key, fr, main, target, px)
         elif e.kind in ("release", "open") and arm_key is not None:
             px = self._eef_pixel(main, fr, arm_key) if main is not None else None
             e.obj = self.tracker.release(arm_key, e.t, fr.eef_world(arm_key), px)
@@ -720,6 +726,19 @@ class Generator:
             if any(c["result"] == "retracted" for c in checks):
                 robot_keys |= self._robot_state(fr, e.t)
         rec["track"] = self.tracker.update(e.t, main.name, dets, self._img_base(main), [c.key for c in self.categories])
+        if e.kind in ("grasp", "close") and arm_key is not None and e.obj is None:
+            # B1: nothing tracked within reach before this frame's detection (stale / no position): try again with
+            # the positions just detected, so the held object follows the hand instead of staying behind
+            px = self._eef_pixel(main, fr, arm_key)
+            target, dist = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, px)
+            rec["grasp_retry"] = {"target": target, "distance": dist}
+            if target is not None:
+                self.tracker.counts["grasp_retarget"] += 1
+                self._take(e, arm_key, fr, main, target, px)
+                touched_now.add(target)
+                self.touched_at[target] = e.t
+                robot_keys |= self._robot_state(fr, e.t)
+                self.verifier.held_off_supports(target, e.t)
         for a in self.tracker.tracks:
             self.marks.assign(a, self.tracker.tracks[a].category)
         self.geo.observe_sizes()
@@ -783,7 +802,8 @@ class Generator:
                     self._set_query(key, nxt)
                     extra += got
             if extra:
-                tool["detect"] = self.tracker.update(e.t, main.name, dets + extra, self._img_base(main), plan.detect)
+                # B2: only the new detections; tracks matched by this frame's first pass keep that match
+                tool["detect"] = self.tracker.update(e.t, main.name, extra, self._img_base(main), plan.detect, keep_seen=True)
                 for a in self.tracker.tracks:
                     self.marks.assign(a, self.tracker.tracks[a].category)
                 img, marks_text, shown = self._marked(main, fr)
@@ -801,26 +821,50 @@ class Generator:
         observed: list[tuple[EdgeKey, str]] = []
         accepted: set[EdgeKey] = set()
         vals: dict[EdgeKey, str] = {}
+        # A1: at a release the geometry of the released object vs the nearby marked supports / containers is always
+        # computed (and those statements asked), whatever the agent chose
+        auto_pairs: list[tuple[str, str]] = []
+        if e.kind == "release" and e.obj and arm_key is not None and e.obj in self.tracker.tracks:
+            auto_pairs = self._release_candidates(e.obj, np.asarray(fr.eef_world(arm_key), float),
+                                                  self._eef_pixel(main, fr, arm_key), main.name)
+            for a, s in auto_pairs:
+                k = self._rel_key(a, s)
+                if k not in plan.observe:
+                    plan.observe.append(k)
+                    plan.forced.append(statement_text(k))
         if plan.observe:
             url = now_url if obs_cam is main else now_obs_url
             mt = marks_text if obs_cam is main else obs_marks
             vals, tool["observe"] = self._observe(obs_cam, before, url, mt, ev_text, plan.observe, view)
             observed = [(k, vals.get(k, "?")) for k in plan.observe]
         release = {e.obj: np.asarray(fr.eef_world(arm_key))} if e.kind == "release" and e.obj and arm_key else None
-        geom = self._geometry_for(vals, main.name, plan.geometry, release)
-        if plan.geometry:
+        geom = self._geometry_for(vals, main.name, list(plan.geometry) + auto_pairs, release)
+        if plan.geometry or auto_pairs:
             tool["geometry"] = {statement_text(k): g for k, g in geom.items()}
         hidden = self._hidden()
         touched = dict(self.touched_at)
         accepted = self._observe_apply(vals, e.t, touched, geom, hidden)
         observed = [(k, ("?" if (k[0] in STATE_PREDS and k[1] in hidden) else v)) for k, v in observed]
+        hind: dict[EdgeKey, str] = {}
+        # R10: 'in' answered 0 against the geometry -> re-check now (another camera; mode A: a later quiet frame)
+        if self.verifier.new_conflicts:
+            done_keys, tool["recheck"] = self._recheck(e, fr, obs_cam.name, list(self.verifier.new_conflicts), ev_text,
+                                                       next_gripper_t, hind)
+            accepted |= done_keys
+        # R9: release-geometry candidates the VDM left undecided: the best positive one -> expectation 0.7
+        if auto_pairs:
+            cmap = self._categories_map()
+            und = [k for k in (self._rel_key(a, s) for a, s in auto_pairs) if vals.get(k, "?") == "?" and k in geom]
+            und.sort(key=lambda k: geom[k].get("d_xy", geom[k].get("release_d_xy", 1e9)))
+            for k in und:
+                if self.verifier.geo_fill(k, geom[k], e.t, cmap, held={self.tracker.held(a) for a in self.arm_keys} - {None}):
+                    break
         for k, v in plan.expect:
             self.verifier.expect(k, v, e.t, accepted | set(plan.observe))  # asked now, even if '?'
         self._process_model(e.t)
-        hind: dict[EdgeKey, str] = {}
         if plan.hindsight and cfg.offline:
             h = self._hindsight(e, plan.hindsight, plan.hindsight_after_s, next_gripper_t)
-            hind = dict(h.pop("raw", {}))
+            hind.update(h.pop("raw", {}))
             tool["hindsight"] = h
         self.graph.age(accepted, robot_keys)
         confirmed = self.goal.update(self.graph, e.t)
@@ -832,6 +876,92 @@ class Generator:
                    pending=[statement_text(k) for k in self.verifier.recheck_keys()])
         self._trace(e, row, rec)
         return row
+
+    def _take(self, e: Event, arm_key: str, fr: FrameRecord, main: CameraFrame | None, target: str,
+              px: tuple[float, float] | None) -> None:
+        """The gripper holds ``target`` from this event on (``close``: provisionally, checked by co-motion)."""
+        frm = self._support_of(target)
+        self.tracker.hold(target, arm_key, fr.eef_world(arm_key))
+        self.grasp_z[arm_key] = float(fr.eef_world(arm_key)[2])
+        e.obj = target
+        self.graph.events.append(f"robot -grasp-> {target} @{e.t}" + (f" (from {frm})" if frm else "")
+                                 + (" (provisional)" if e.kind == "close" else ""))
+        if e.kind == "close":
+            tr = self.tracker.tracks[target]
+            self.pending_grasp[arm_key] = {
+                "obj": target, "t": e.t, "row": len(self.rows), "eef0": np.asarray(fr.eef_world(arm_key), float),
+                "pos0": None if tr.pos is None else tr.pos.copy(),
+                # 2D path: the object's and the fingertip's pixels at the close
+                "px0": tr.pixel.get(self.cfg.camera), "eef_px0": px,
+                "cam_pose0": None if main is None else self._cam_world(main),
+                # highest EEF rise above the close while closed (C1: lifted and put back), frames scanned up to lift_t
+                "max_lift": 0.0, "lift_t": e.t,
+                # relations before the close, restored if the grasp is retracted
+                "loc0": {k: (ed.p, ed.source) for k, ed in self.graph.edges.items()
+                         if k[1] == target and k[0] in ("on", "in", "at")}}
+
+    def _update_lift(self, t: int) -> None:
+        """Highest EEF rise of each provisional grasp since its close, over every robot frame up to ``t``."""
+        for arm, pend in self.pending_grasp.items():
+            for f in range(pend["lift_t"] + 1, t + 1):
+                z = float(self.ep.robot(f).eef_world(arm)[2])
+                pend["max_lift"] = max(pend["max_lift"], z - float(pend["eef0"][2]))
+            pend["lift_t"] = max(pend["lift_t"], t)
+
+    def _release_candidates(self, obj: str, eef_w: np.ndarray, eef_px: tuple[float, float] | None,
+                            cam: str) -> list[tuple[str, str]]:
+        """A1: (released object, support) pairs for the supports / containers detected in the release image (the
+        event's mark table; one right under the gripper counts though it gets no drawn mark), nearest first:
+        horizontal box distance to the release EEF (3D) or pixel distance (2D); at most ``release_geo_k``."""
+        cands = []
+        for s, tr in self.tracker.tracks.items():
+            if s == obj or not tr.seen_now or not is_support(tr.category):
+                continue
+            if tr.pos is not None:
+                size = None if tr.size is None else np.array([tr.size[0], tr.size[1], 0.0])
+                d = box_distance(np.array([eef_w[0], eef_w[1], 0.0]), np.array([tr.pos[0], tr.pos[1], 0.0]), size)
+                if d <= self.cfg.release_geo_radius:
+                    cands.append((0, d, s))
+            elif eef_px is not None and cam in tr.pixel:
+                cands.append((1, float(np.hypot(eef_px[0] - tr.pixel[cam][0], eef_px[1] - tr.pixel[cam][1])), s))
+        return [(obj, s) for _, _, s in sorted(cands)[: self.cfg.release_geo_k]]
+
+    def _recheck(self, e: Event, fr: FrameRecord, used_cam: str, keys: list[EdgeKey], ev_text: str,
+                 next_gripper_t: int, hind: dict[EdgeKey, str]) -> tuple[set[EdgeKey], dict[str, Any]]:
+        """R10: re-ask conflicting 'in' keys now -- another camera first, then (mode A) a later frame of the same quiet
+        interval. Returns (keys decided by an observation, trace info)."""
+        cfg = self.cfg
+        info: dict[str, Any] = {"keys": [statement_text(k) for k in keys]}
+        decided_keys: set[EdgeKey] = set()
+        left = list(keys)
+        if cfg.recheck_look:
+            for c in [cfg.camera, *cfg.look_views]:
+                lc = fr.cams.get(c)
+                if not left or c == used_cam or lc is None or (c != cfg.camera and (lc.K is None or lc.T_base_cam is None)):
+                    continue
+                img, text, _ = self._marked(lc, fr, seen_only=(c == cfg.camera))
+                vals, oinfo = self._observe(lc, None, encode_png(img), text, ev_text, left,
+                                            cfg.view if c == cfg.camera else cfg.look_views.get(c, "wrist"))
+                info.setdefault("look", []).append({"camera": c, "values": {statement_text(k): vals.get(k, "?") for k in left},
+                                                    "observe": oinfo})
+                for k in list(left):
+                    if self.verifier.recheck(k, vals.get(k, "?"), e.t, f"look {c}"):
+                        decided_keys.add(k)
+                        left.remove(k)
+                break  # one other camera
+        if left and cfg.offline:
+            h = self._hindsight(e, left, cfg.recheck_hindsight_s, next_gripper_t)
+            raw = dict(h.pop("raw", {}))
+            info["hindsight"] = h
+            for k in list(left):
+                v = raw.get(k, "?")
+                if v in ("0", "1"):
+                    hind[k] = v
+                if self.verifier.recheck(k, v, e.t, "hindsight"):
+                    decided_keys.add(k)
+                    left.remove(k)
+        info["pending"] = [statement_text(k) for k in left]
+        return decided_keys, info
 
     def _grasp_evidence(self, pend: dict[str, Any], arm: str, fr: FrameRecord, cam: CameraFrame,
                         dets: Sequence[Detection], hand_world: np.ndarray | None) -> tuple[str, dict[str, Any]]:
@@ -976,8 +1106,15 @@ class Generator:
         if tr is None:
             return self._check(arm, pend, e.t, "unverified", {"evidence": "track gone"}, "release")
         verdict, info = self._grasp_evidence(pend, arm, fr, cam, dets, tr.pos)
+        eef =np.asarray(fr.eef_world(arm), float)
+        info["max_lift"] = round(float(pend.get("max_lift", 0.0)), 3)
+        info["release_from_close_xy"] = round(float(np.linalg.norm(eef[:2] - pend["eef0"][:2])), 3)
         if verdict == "with_hand":
             return self._check(arm, pend, e.t, "confirmed", {"evidence": verdict, **info}, "release")
+        if verdict == "left" and info["max_lift"] >= self.cfg.carry_lift and info["release_from_close_xy"] <= self.cfg.put_back_radius:
+            # C1: at the old place at the release, but the closed hand rose >= carry_lift and came back down where it
+            # closed: lifted and put back (co-motion while held wins over "it is where it was")
+            return self._check(arm, pend, e.t, "confirmed_put_back", {"evidence": "lifted_and_put_back", **info}, "release")
         if verdict == "left":
             self._retract(arm, pend, e.t, "found where it was at the release")
             e.obj = None
@@ -1073,6 +1210,28 @@ class Generator:
             self.step(e, nxt)
         return self.rows
 
+    def unobservable_steps(self) -> list[dict[str, Any]]:
+        """A4: steps of the best branch, not confirmed, with a relation that could not be asked until the end of the
+        demonstration: its object is still in the hand at the last event (on / in / at of a held object are robot-owned,
+        e.g. at(basket, center) while the basket is carried to the end), or it was never detected (expected name). The
+        goal decision itself is unchanged; this only separates "could not be seen" from "seen and wrong"."""
+        b = self.goal.best()
+        if b is None or not self.rows:
+            return []
+        held_end = {a for a in self.rows[-1].held.values() if a}
+        unbound = set(self.tracker.expected())
+        out = []
+        for i in range(self.goal.done[b], len(self.goal.branches[b])):
+            why = {}
+            for k in self.goal.branches[b][i]:
+                if k[0] in ("on", "in", "at") and k[1] in held_end:
+                    why[statement_text(k)] = f"{k[1]} held until the end"
+                elif any(x in unbound for x in k[1:] if x):
+                    why[statement_text(k)] = "never detected"
+            if why:
+                out.append({"branch": b, "step": i, "why": why})
+        return out
+
     def summary(self) -> dict[str, Any]:
         kinds: dict[str, int] = {}
         for e in self.events:
@@ -1091,7 +1250,8 @@ class Generator:
         for tr in self.tracker.tracks.values():
             cats[tr.category] = cats.get(tr.category, 0) + 1
         identity = {**self.tracker.counts, "tracks_per_category": cats, "expected_unbound": self.tracker.expected(),
-                    "late_merges": len(self.tracker.merges)}
+                    "late_merges": len(self.tracker.merges), "caps": dict(self.tracker.caps),
+                    "capped": self.tracker.capped[:50]}
         return {"init_failed": self.init_info.get("failed"), "track_identity": identity,
                 "events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
                 "agent_fallback_reasons": reasons, "grasp_checks": self.grasp_checks,
@@ -1099,7 +1259,8 @@ class Generator:
                 "tracks": [t.to_dict() for t in self.tracker.tracks.values()],
                 "goal": {"branches": [[[statement_text(k) for k in s] for s in br] for br in self.goal.branches],
                          "best": b, "done": self.goal.done, "done_t": self.goal.done_t,
-                         "final_satisfied": self.goal.satisfied_final(self.graph)},
+                         "final_satisfied": self.goal.satisfied_final(self.graph),
+                         "unobservable": self.unobservable_steps()},
                 "final_graph": self.graph.snapshot(), "image_reads": self.ep.image_reads,
                 "detector": {"name": getattr(self.det, "name", "?"), "calls": getattr(self.det, "calls", None)},
                 "models": self.models.usage() if hasattr(self.models, "usage") else {}}

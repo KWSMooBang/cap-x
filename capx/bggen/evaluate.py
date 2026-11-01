@@ -470,12 +470,25 @@ def evaluate(out_dir: str | Path, root: str | Path, tol: int | None = None, map_
                                # the oracle task has a table region (LIBERO-Mem 8 / 9 "center"): is it in the generated goal?
                                "oracle_regions": regions, "region_relations_in_goal": in_goal,
                                "region_goal_missing": bool(regions) and bool(branches) and not in_goal}
+    # B1b (mode A backward same-category merges): rows_backward use the merged aliases; their map is built from the
+    # trace read through the same alias map (still one alias per object, unmappable = wrong; a wrong merge is scored
+    # against the one object the merged alias maps to)
+    bl = (out / "backward_log.json")
+    ren = {m["from"]: m["into"] for m in (json.loads(bl.read_text()).get("merges_backward") or [])} if bl.exists() else {}
+    tmap_b, names_b = tmap, names
+    if ren:
+        trace_b = [{**ln, "tracks": [{**tr, "alias": ren.get(tr["alias"], tr["alias"])} for tr in ln.get("tracks", [])]}
+                   for ln in trace]
+        tmap_b = TrackMap(trace_b, oracle, radius, end_t=summary.get("n_frames"))
+        names_b = sorted({ren.get(a, a) for a in names})
+        res["track_map_backward"] = {"merges": ren, "fixed": tmap_b.fixed(), "name_consistency": name_consistency(tmap_b)}
     for tag, fname in (("forward", "rows_forward.jsonl"), ("forward+backward", "rows_backward.jsonl")):
         rows = _jsonl(out / fname)
         if not rows:
             continue
-        res[tag] = {"relations": relation_accuracy(rows, oracle, tmap, names, arms, tol),
-                    "relations_remap": relation_accuracy(rows, oracle, tmap, names, arms, tol, remap=True),
+        tm, nm = (tmap_b, names_b) if tag == "forward+backward" else (tmap, names)
+        res[tag] = {"relations": relation_accuracy(rows, oracle, tm, nm, arms, tol),
+                    "relations_remap": relation_accuracy(rows, oracle, tm, nm, arms, tol, remap=True),
                     "subtask_boundary": boundary_error(rows, oracle),
                     "reobservation": reobservation(rows)}
     (out / "eval.json").write_text(json.dumps(res, indent=1))

@@ -64,7 +64,7 @@ def test_release_retracts_when_the_object_never_left(tmp_path):
     assert rel["event"]["obj"] is None  # nothing was carried: nothing placed
     assert rel["graph"]["(on bowl_A plate_B)"][0] == 0.9  # its relation before the close, remembered
     log = json.loads((tmp_path / "out" / "backward_log.json").read_text())
-    assert [x["kind"] for x in log["segments"]] == ["articulated"]
+    assert [(x["kind"], x["retracted"]) for x in log["segments"]] == [("object", True)]  # bggen-fix3 C2
 
 
 def test_release_without_evidence_leaves_the_place_unverified(tmp_path):

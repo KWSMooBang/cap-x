@@ -42,9 +42,12 @@ def b1k(mode: str = "A") -> GenConfig:
         # association; one countertop / fridge / microwave per scene (ASSUMPTION for task 45's kitchen: further
         # detections are that object); large objects (>= 0.4 m) associate by box gap; an unmatched hot dog within
         # 25 cm of a known unmatched one is that one. Not closed-world: objects enter the view later.
+        # bggen-fix3 B3 (batch1 00450030: hotdog_A..F for two hot dogs): a category the init's goal names is capped at
+        # the number of names it has after init (hotdog_A / hotdog_B expected -> 2). reacquire_radius stays 0.25 m (the
+        # two hot dogs lie close together; a larger radius would join them).
         tracks=TrackConfig(assoc_radius=0.15, assoc_px=60.0, merge_radius=0.15, grasp_radius=0.10, fixed_categories=(),
                            reacquire_radius=0.25, max_instances={"countertop": 1, "fridge": 1, "microwave": 1},
-                           large_extent=0.4),
+                           large_extent=0.4, cap_from_init=True),
         verifier=VerifierConfig(flat_dz={}),  # LIBERO table does not apply; first accepted Observe 1 per pair
         cook_s=10.0, navigation_subtask=True,
     )

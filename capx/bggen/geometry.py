@@ -24,8 +24,15 @@ from .vocab import TABLE, EdgeKey, is_container
 
 
 class Geometry:
-    def __init__(self, tracker: Tracker, support_radius_min: float = 0.03, radius_window: int = 9) -> None:
+    def __init__(self, tracker: Tracker, support_radius_min: float = 0.03, radius_window: int = 9,
+                 in_xy_margin: float = 0.02, in_bottom_margin: float = 0.02, in_top_margin: float = 0.04,
+                 overlap_min: float = 0.5) -> None:
         self.tr = tracker
+        # 'in' (container): margins around the container's box / height range. Top 4 cm: a held-size object resting
+        # on the bottom of a shallow basket sticks out of it by up to half its height (ASSUMPTION, LIBERO cheese /
+        # basket ~ 4-8 cm; measure from the batch2 geometry dumps)
+        self.in_xy_margin, self.in_bottom_margin, self.in_top_margin = in_xy_margin, in_bottom_margin, in_top_margin
+        self.overlap_min = overlap_min  # 2D path: share of the object's mask inside the support's box
         self.r_min = support_radius_min
         self.window = radius_window
         self.radii: dict[str, list[float]] = defaultdict(list)
@@ -68,8 +75,16 @@ class Geometry:
             out: dict[str, Any] = {"mode": "depth", "d_xy": round(float(np.linalg.norm(x.pos[:2] - y.pos[:2])), 3),
                                    "dz": round(float(x.pos[2] - y.pos[2]), 3), "r": round(self.radius(t) or self.r_min, 3)}
             if is_container(y.category) and y.size is not None:
-                half = 0.5 * y.size + 0.02
-                out["inside"] = bool(np.all(np.abs(x.pos - y.pos) <= half))
+                # bggen-fix3 A2: inside = the object's center within the container's box horizontally and within
+                # its 3D height range (the mask's lowest .. highest depth points + margins), not "dz to the
+                # container's reference point" (a cheese 13 cm above a basket's median point can be inside it)
+                half = 0.5 * np.asarray(y.size)[:2] + self.in_xy_margin
+                in_xy = bool(np.all(np.abs(x.pos[:2] - y.pos[:2]) <= half))
+                lo, hi = y.zlim if y.zlim is not None else (float(y.pos[2] - 0.5 * y.size[2]), float(y.pos[2] + 0.5 * y.size[2]))
+                z = float(x.pos[2])
+                in_z = lo - self.in_bottom_margin <= z <= hi + self.in_top_margin
+                out.update(inside=in_xy and in_z, z_range=[round(lo, 3), round(hi, 3)], inside_xy=in_xy, inside_z=in_z)
+                out["positive"] = out["inside"]
             return out
         out = {"mode": "2d"}
         if cam is not None and cam in x.box and cam in y.box and both_seen:
@@ -81,6 +96,10 @@ class Geometry:
                 out["r"] = round(r, 3)
         if not both_seen:
             out["unseen"] = [a for a, tt in ((s, x), (t, y)) if not tt.seen_now]
+        # 2D evidence FOR the relation (never against it): released over the support, or the mask sits in its box
+        released_over = "release_d_xy" in out and "r" in out and out["release_d_xy"] <= out["r"]
+        if released_over or (out.get("overlap", 0.0) >= self.overlap_min and out.get("bottom_contact")):
+            out["positive"] = True
         return out if len(out) > 1 else None
 
     @staticmethod
