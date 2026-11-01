@@ -79,7 +79,7 @@ uv sync --active --extra robomme
   `obs_mode="rgb+depth+segmentation"`, so `RoboMMEEnv` needs the NVIDIA ICD until ManiSkill parses `pci:` device
   ids (e.g. `split(":", 1)`).
 - Envs: `capx.envs.simulators.robomme.RoboMMEEnv(task_id="PickXtimes", dataset="test", max_steps=1300,
-  condition_frames=8)`, registered as `robomme_<TaskID>_low_level`; code env `RoboMMECodeEnv`.
+  condition_frames=32)`, registered as `robomme_<TaskID>_low_level`; code env `RoboMMECodeEnv`.
 - The GPU pod also needs `--extra contactgraspnet` in the same venv for the Contact-GraspNet server
   (`uv sync --active --extra robomme --extra contactgraspnet`); Molmo2-8B runs from `.venv-molmo` as for LIBERO.
 
@@ -151,7 +151,7 @@ Nine tasks show a demonstration before the robot gets control: VideoUnmask, Vide
 VideoPlaceButton, VideoPlaceOrder, MoveCube, InsertPeg, PatternLock and RouteStick. For these, `reset()` returns all
 of the video's frames, and RoboMME treats every reset frame except the last as the video. For CaP-X:
 
-- The **first** prompt gets `condition_frames` front-camera frames (default 8; set it in the low-level config).
+- The **first** prompt gets `condition_frames` front-camera frames (32; set it in the low-level config).
   They are sampled uniformly over the video, including the first and last frame. Each one is a PNG image with a
   caption `Video frame n/K (t = … s, frame i of N)`, after one line that says how long the video was. Wrist frames
   are not included (MME-VLA also uses one view).
@@ -161,11 +161,15 @@ of the video's frames, and RoboMME treats every reset frame except the last as t
 - `all_responses.json` keeps the first prompt with the images, and `reset_memory.condition_frame_indices` lists the
   sampled frame indices. The trial video starts with the conditioning video (every 2nd frame, with a red border, as
   RoboMME's own recorder marks demonstration frames).
-- How much video the RoboMME baselines get: the best MME-VLA policy (`perceptual-framesamp-modul`) keeps a
-  512-token memory at 16 tokens per front frame, i.e. 32 sampled frames of history. The Embodied-Astra VLM
-  baseline gets every 3rd frame, up to 750 images. 8 full-resolution frames are fewer frames than MME-VLA gets,
-  with more pixels per frame. Raise `condition_frames` for tasks whose video has many short events (e.g.
-  VideoPlaceOrder).
+- Why 32: RoboMME's best MME-VLA policy (`perceptual-framesamp-modul`, config `budget: 512`,
+  `token_per_image: 16`, `num_views: 1`) keeps a 512-token memory at 16 tokens per front frame, i.e. 32 sampled
+  frames. 32 frames give the coding model a similar number of frames (at full resolution). With 8 frames, a video
+  with several swaps (e.g. VideoUnmaskSwap) can fall between samples, so a failure would come from sampling, not
+  memory. For comparison, the Embodied-Astra VLM baseline gets every 3rd frame, up to 750 images.
+- Fallback if the model rejects that many images in one request: set `CAPX_ROBOMME_CONDITION_FRAMES=16` (overrides
+  the configs without regenerating them), or pass `--condition-frames 16` to `scripts/run_robomme_pilot.py`, which
+  sets it for every task and records it in `pilot_manifest.jsonl`. Report runs with different frame counts as
+  different conditions.
 - Tasks without a video (e.g. StopCube, PickHighlight, ButtonUnmask*) can still show brief events while the robot
   moves. Generated code only sees what it asks `get_observation()` for, and the VDM sees one image per turn.
 

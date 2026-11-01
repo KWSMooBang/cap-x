@@ -4,7 +4,8 @@ Same settings as the cap-bg LIBERO-Mem baseline (scripts/gen_capbg_baseline_conf
 copied verbatim from env_configs/libero/franka_libero_cap_agent0.yaml, the same API servers, parallel ensemble
 off, image differencing on, video recording on, max_tokens 32768, memory_mode none. RoboMME-specific:
 ``FrankaRoboMMEApiReducedSkillLibrary`` (same functions as FrankaLiberoApiReducedSkillLibrary), RoboMME's
-1300-step budget, a 3600 s wall-clock budget per trial (one attempt) and 8 conditioning-video frames.
+1300-step budget, a 3600 s wall-clock budget per trial (one attempt) and 32 conditioning-video frames
+(MME-VLA framesamp-modul: 512-token memory / 16 tokens per frame = 32 frames).
 
 Usage::
 
@@ -67,7 +68,7 @@ env:
       dataset: test
       privileged: false
       max_steps: 1300
-      condition_frames: 8
+      condition_frames: 32
     privileged: false
     apis:
       - FrankaRoboMMEApiReducedSkillLibrary
@@ -100,7 +101,9 @@ num_workers: 1
 def _notes(task: str) -> str:
     notes = []
     if task in VIDEO_TASKS:
-        notes.append("Reset returns a conditioning video: 8 uniformly sampled front-camera frames go into the first prompt.")
+        notes.append("Reset returns a conditioning video: 32 uniformly sampled front-camera frames go into the first prompt"
+                     "\n# (as MME-VLA framesamp-modul: 512 tokens / 16 per frame). "
+                     "Fallback if the model limits images: CAPX_ROBOMME_CONDITION_FRAMES=16.")
     else:
         notes.append("No conditioning video at reset.")
     if task in STICK_TASKS:

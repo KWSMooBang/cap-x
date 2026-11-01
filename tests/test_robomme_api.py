@@ -158,7 +158,7 @@ def patched_models(monkeypatch):
     monkeypatch.setattr(libero_reduced, "init_pyroki", lambda *a, **k: numeric_ik)
 
 
-def make_env(monkeypatch, task_id="PickXtimes", n_demo=0, condition_frames=8, **fake_kw) -> sim_mod.RoboMMEEnv:
+def make_env(monkeypatch, task_id="PickXtimes", n_demo=0, condition_frames=32, **fake_kw) -> sim_mod.RoboMMEEnv:
     def fake_load(task_id, episode_idx=0, dataset="test", action_space="joint_angle", max_steps=1300, **flags):
         assert action_space == "joint_angle"
         assert flags["include_front_depth"] and flags["include_front_camera_extrinsic"]
@@ -169,7 +169,7 @@ def make_env(monkeypatch, task_id="PickXtimes", n_demo=0, condition_frames=8, **
     return sim_mod.RoboMMEEnv(task_id=task_id, condition_frames=condition_frames)
 
 
-def make_code_env(monkeypatch, task_id="PickXtimes", n_demo=0, condition_frames=8, **fake_kw) -> RoboMMECodeEnv:
+def make_code_env(monkeypatch, task_id="PickXtimes", n_demo=0, condition_frames=32, **fake_kw) -> RoboMMECodeEnv:
     low = make_env(monkeypatch, task_id, n_demo, condition_frames, **fake_kw)
     cfg = CodeExecEnvConfig(low_level=low, apis=["FrankaRoboMMEApiReducedSkillLibrary"], privileged=False,
                             prompt="You are controlling a Franka Emika robot with API described below.\n"
@@ -350,6 +350,34 @@ def test_success_latches_and_stops_code(monkeypatch, patched_models):
         low.step(np.zeros(8))
 
 
+def test_step_cap_latches_on_the_last_step(monkeypatch, patched_models):
+    """Reaching max_steps exactly ends the episode on that step, not at the next action."""
+    code_env = make_code_env(monkeypatch)
+    low = code_env.low_level_env
+    low.max_steps = 15  # exactly one close_gripper() (15 control steps)
+    code_env.reset(seed=1)
+    _, _, _, truncated, info = code_env.step("close_gripper()\nprint('after')")
+    assert truncated and info["episode_end_reason"] == "step_cap" and low._sim_step_count == 15
+    assert "after" not in info["stdout"]
+    with pytest.raises(EpisodeTruncated):
+        low.step(np.zeros(8))
+
+
+def test_success_on_last_step_counts_as_success(monkeypatch, patched_models):
+    code_env = make_code_env(monkeypatch, success_at=15)
+    code_env.low_level_env.max_steps = 15
+    code_env.reset(seed=1)
+    _, reward, _, _, info = code_env.step("close_gripper()")
+    assert info["episode_end_reason"] == "success" and reward == 1.0
+
+
+def test_condition_frames_env_override(monkeypatch, patched_models):
+    monkeypatch.setenv(sim_mod.CONDITION_FRAMES_ENV, "16")
+    code_env = make_code_env(monkeypatch, task_id="VideoRepick", n_demo=100)
+    obs, _ = code_env.reset(seed=1)
+    assert code_env.low_level_env.condition_frames == 16 and len(_images(obs["full_prompt"])) == 16
+
+
 def test_fail_and_step_cap(monkeypatch, patched_models):
     code_env = make_code_env(monkeypatch, fail_at=3)
     code_env.reset(seed=1)
@@ -386,13 +414,13 @@ def _texts(prompt) -> str:
 
 
 def test_conditioning_frames_in_first_prompt_only(monkeypatch, patched_models):
-    code_env = make_code_env(monkeypatch, task_id="VideoUnmaskSwap", n_demo=40)
+    code_env = make_code_env(monkeypatch, task_id="VideoUnmaskSwap", n_demo=100)
     obs, info = code_env.reset(seed=1)
     images = _images(obs["full_prompt"])
-    assert len(images) == 8 and all(u.startswith("data:image/png;base64,") for u in images)
-    assert info["condition_frame_indices"] == uniform_frame_indices(40, 8)
+    assert len(images) == 32 and all(u.startswith("data:image/png;base64,") for u in images)
+    assert info["condition_frame_indices"] == uniform_frame_indices(100, 32)
     text = _texts(obs["full_prompt"])
-    assert "40 frames (2.0 s" in text and "Video frame 8/8 (t = 1.95 s, frame 40 of 40)" in text
+    assert "100 frames (5.0 s" in text and "Video frame 32/32 (t = 4.95 s, frame 100 of 100)" in text
     # The frames are the conditioning video (values 1..40), not the current scene (200).
     import base64
     import io
@@ -401,12 +429,12 @@ def test_conditioning_frames_in_first_prompt_only(monkeypatch, patched_models):
 
     first = np.asarray(Image.open(io.BytesIO(base64.b64decode(images[0].split(",", 1)[1]))))
     last = np.asarray(Image.open(io.BytesIO(base64.b64decode(images[-1].split(",", 1)[1]))))
-    assert first[0, 0, 0] == 1 and last[0, 0, 0] == 40
+    assert first[0, 0, 0] == 1 and last[0, 0, 0] == 100
     # Decision prompts are built from the env's own prompt, which never holds the video.
     obs2, *_ = code_env.step("x = 1")
     assert _images(obs2["full_prompt"]) == []
     obs3, _ = code_env.reset(seed=1)
-    assert len(_images(obs3["full_prompt"])) == 8  # no build-up across trials
+    assert len(_images(obs3["full_prompt"])) == 32  # no build-up across trials
 
 
 def test_condition_frames_option_and_no_video_task(monkeypatch, patched_models):
@@ -495,7 +523,7 @@ def test_trial_success_ends_with_reason_and_logs(monkeypatch, patched_models, tm
     assert responses[0]["vdm_usage"] == [{"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}]
     assert responses[-1]["decision"] == "truncated" and responses[-1]["reason"] == "success"
     coding_prompt = [p for m, p in prompts if m == "fake"][0]
-    assert len(_images(coding_prompt)) == 8
+    assert len(_images(coding_prompt)) == 12  # all 12 video frames (fewer than 32)
     assert not _contains_secret([p for _, p in prompts])
     # Video buffer: conditioning frames (subsampled, red border) come first.
     assert "taskcompleted_1" in trial_dir.name

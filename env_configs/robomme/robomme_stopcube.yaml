@@ -21,7 +21,7 @@ env:
       dataset: test
       privileged: false
       max_steps: 1300
-      condition_frames: 8
+      condition_frames: 32
     privileged: false
     apis:
       - FrankaRoboMMEApiReducedSkillLibrary

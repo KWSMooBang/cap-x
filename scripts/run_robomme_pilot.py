@@ -63,6 +63,8 @@ class Args:
     start_servers: bool = True
     dry_run: bool = False
     """Print the plan and commands without running anything."""
+    condition_frames: int | None = None
+    """Override the configs' condition_frames (32), e.g. 16 if the model rejects that many images."""
     extra: list[str] = field(default_factory=list)
     """Extra launch.py flags, e.g. --extra --trial-timeout-s 1800."""
 
@@ -126,6 +128,8 @@ def main(args: Args) -> int:
     log_dir = REPO_ROOT / args.log_root / args.run_name
     model_dir = run_dir / args.model.replace("/", "_")  # launch.py inserts the model name before the last part
     env = dict(os.environ)
+    if args.condition_frames is not None:
+        env["CAPX_ROBOMME_CONDITION_FRAMES"] = str(args.condition_frames)
     api_key = env.get(args.api_key_env)  # passed like the documented `--api-key "$NEBIUS_API_KEY"`, never logged
 
     plan = []
@@ -139,7 +143,7 @@ def main(args: Args) -> int:
     todo = [p for p in plan if p[3] is not None]
     manifest = {
         "run_name": args.run_name, "memory_mode": args.memory_mode, "model": args.model, "vdm_model": args.vdm_model,
-        "trials": args.trials, "workers": args.workers, "tasks": args.tasks, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "trials": args.trials, "workers": args.workers, "condition_frames": args.condition_frames or 32, "tasks": args.tasks, "started": time.strftime("%Y-%m-%d %H:%M:%S"),
         "commands": {t: task_command(args, t, r, run_dir / f"robomme_{t.lower()}") for t, _, _, r in todo},
     }
     if args.dry_run:

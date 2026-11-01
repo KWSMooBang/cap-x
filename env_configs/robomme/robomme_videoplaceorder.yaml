@@ -2,7 +2,8 @@
 # RoboMME VideoPlaceOrder (Reference suite), test split. CaP-X baseline (memory_mode none) with the cap-bg LIBERO-Mem
 # baseline settings: CaP-Agent0 prompts, FrankaRoboMMEApiReducedSkillLibrary (same functions as
 # FrankaLiberoApiReducedSkillLibrary), parallel ensemble OFF, VDM on, video on, max_tokens 32768.
-# Reset returns a conditioning video: 8 uniformly sampled front-camera frames go into the first prompt.
+# Reset returns a conditioning video: 32 uniformly sampled front-camera frames go into the first prompt
+# (as MME-VLA framesamp-modul: 512 tokens / 16 per frame). Fallback if the model limits images: CAPX_ROBOMME_CONDITION_FRAMES=16.
 # Trial k plays test episode k-1 (fixed). Budget: 1300 control steps (RoboMME paper), 3600 s wall clock, one attempt.
 # Molmo (point_prompt_molmo) needs a separate Molmo2-8B vLLM server at 127.0.0.1:8122 (see docs/capbg-baseline.md).
 #
@@ -21,7 +22,7 @@ env:
       dataset: test
       privileged: false
       max_steps: 1300
-      condition_frames: 8
+      condition_frames: 32
     privileged: false
     apis:
       - FrankaRoboMMEApiReducedSkillLibrary

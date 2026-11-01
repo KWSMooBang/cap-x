@@ -10,6 +10,7 @@ Camera ``pose_mat`` is camera -> base with OpenCV camera axes, depth is in metre
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -32,6 +33,9 @@ from capx.integrations.robomme.geometry import (
     pose_matrix,
     uniform_frame_indices,
 )
+
+# Environment variable that overrides ``condition_frames`` without regenerating configs.
+CONDITION_FRAMES_ENV = "CAPX_ROBOMME_CONDITION_FRAMES"
 
 EPISODES_PER_SPLIT = {"train": 100, "val": 50, "test": 50}
 
@@ -75,7 +79,7 @@ class RoboMMEEnv(BaseEnv):
         privileged: bool = False,
         max_steps: int = DEFAULT_MAX_STEPS,
         include_depth: bool = True,
-        condition_frames: int = 8,
+        condition_frames: int = 32,
         max_joint_step: float = 0.06,
         video_subsample: int = 2,
         enable_render: bool = True,
@@ -86,7 +90,9 @@ class RoboMMEEnv(BaseEnv):
         self.dataset = dataset
         self.privileged = privileged
         self.max_steps = int(max_steps)
-        self.condition_frames = int(condition_frames)
+        # CAPX_ROBOMME_CONDITION_FRAMES overrides the config (fallback, e.g. 16, if the model limits images).
+        override = os.environ.get(CONDITION_FRAMES_ENV)
+        self.condition_frames = int(override) if override else int(condition_frames)
         self.max_joint_step = float(max_joint_step)
         self.is_stick = task_id in STICK_TASKS
         self.viser_debug = False  # not supported; kept for CodeExecutionEnvBase
@@ -181,6 +187,12 @@ class RoboMMEEnv(BaseEnv):
             if self._record_frames:
                 self._record_frame()
             raise EpisodeTruncated(f"Episode ended after {self._sim_step_count} control steps")
+        if self._sim_step_count >= self.max_steps:
+            # Budget used up on this step: end now, so code stops here instead of at its next action.
+            self.episode_end_reason = "step_cap"
+            if self._record_frames:
+                self._record_frame()
+            raise EpisodeTruncated(f"Episode truncated: reached max_steps={self.max_steps} control steps")
         return self.get_observation(), self._reward, bool(terminated), bool(truncated), info
 
     # ----------------------- joint-control interface (as FrankaLiberoEnv) -----------------------

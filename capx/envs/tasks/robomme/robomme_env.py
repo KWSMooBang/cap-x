@@ -51,7 +51,7 @@ class RoboMMECodeEnv(CodeExecutionEnvBase):
     ``episode_idx`` on the low-level env (``RoboMMEEnv``).
 
     Conditioning video (Video* / Imitation tasks): ``reset()`` appends ``condition_frames`` front-camera frames
-    (low-level env option, default 8), uniformly sampled with their times, to the **first** prompt only
+    (low-level env option, default 32; env var CAPX_ROBOMME_CONDITION_FRAMES overrides it), uniformly sampled with their times, to the **first** prompt only
     (the returned observation's ``full_prompt``). Multi-turn decision prompts are built from the env's own
     prompt, which never holds them: the memory-less baseline sees the video once.
 

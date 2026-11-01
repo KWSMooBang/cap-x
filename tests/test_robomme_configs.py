@@ -55,7 +55,7 @@ def test_config_matches_libero_mem_baseline(path):
     assert cfg["apis"] == ["FrankaRoboMMEApiReducedSkillLibrary"] and cfg["privileged"] is False
     low = cfg["low_level"]
     assert low["_target_"] == "capx.envs.simulators.robomme.RoboMMEEnv"
-    assert low["dataset"] == "test" and low["max_steps"] == 1300 and low["condition_frames"] == 8
+    assert low["dataset"] == "test" and low["max_steps"] == 1300 and low["condition_frames"] == 32
     assert low["privileged"] is False
 
 
