@@ -12,8 +12,8 @@ per-alias counts are written to eval.json / eval.md.
 Metrics, for the forward pass (= mode B) and forward + backward (mode A), one line each:
 
 * relation accuracy: decided relations (P >= 0.7 or <= 0.3) in each row's Belief vs the oracle, over the
-  relations the oracle covers, with ONE map per episode (``TrackMap.fixed``: each alias -> the object it was
-  matched to for the most frames), so a name swap is scored wrong; the per-row re-matched map gives an auxiliary
+  relations the oracle covers, with ONE one-to-one map per episode (``TrackMap.fixed``: Hungarian on the frames each alias was
+  matched to each object; a decided prediction on an alias without an object counts wrong), so a name swap is scored wrong; the per-row re-matched map gives an auxiliary
   number (``relations_remap``) and every re-match is a name-consistency error; undecided rate (0.3 < P < 0.7) over the same
   keys. Event tolerance ``tol`` frames (default 5, B1K 15): a decided value counts as right if the oracle has
   it at any frame within +-tol (an annotation boundary or a release one frame off is not an error); how
@@ -61,11 +61,15 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
 class TrackMap:
     """Alias -> oracle object over time (see the module docstring)."""
 
-    def __init__(self, trace: Sequence[dict[str, Any]], oracle: Oracle, radius: float = 0.15) -> None:
+    def __init__(self, trace: Sequence[dict[str, Any]], oracle: Oracle, radius: float = 0.15,
+                 end_t: int | None = None) -> None:
+        """``end_t``: the episode's frame count; the last trace line's observations count until it (None: 1 frame)."""
         self.radius = radius
         by_cat: dict[str, list[str]] = {}
         for sim, cat in oracle.objects.items():
             by_cat.setdefault(cat, []).append(sim)
+        self.oracle_categories = set(by_cat)
+        self.cat_of: dict[str, str] = {}  # alias -> category (every alias of the trace, seen or not)
         single = {c: s[0] for c, s in by_cat.items() if len(s) == 1}
         cur: dict[str, str] = {}
         self.ts: list[int] = []
@@ -83,6 +87,7 @@ class TrackMap:
             pairs = []
             for tr in line.get("tracks", []):
                 a, cat = tr["alias"], tr["category"]
+                self.cat_of.setdefault(a, cat)
                 if cat in single:
                     if cur.get(a) != single[cat]:
                         self._set(cur, t, a, single[cat], None)
@@ -111,20 +116,51 @@ class TrackMap:
                     self.unmatched[a] = self.unmatched.get(a, 0) + 1
             self.ts.append(t)
             self.maps.append(dict(cur))
-        # time-weighted votes: an observation counts for the frames until the next trace line
+        # time-weighted votes: an observation counts for the frames until the next trace line (the last one until
+        # the end of the episode)
         self.frames: dict[str, dict[str, int]] = {}
         for k, obs in enumerate(seen):
-            w = (self.ts[k + 1] - self.ts[k]) if k + 1 < len(self.ts) else 1
+            nxt = self.ts[k + 1] if k + 1 < len(self.ts) else (end_t if end_t is not None else self.ts[k] + 1)
+            w = max(nxt - self.ts[k], 1)
             for a, sim in obs:
                 f = self.frames.setdefault(a, {})
-                f[sim] = f.get(sim, 0) + max(w, 1)
-        self._fixed = {a: max(f, key=lambda s: (f[s], self.counts[a].get(s, 0))) for a, f in self.frames.items()}
+                f[sim] = f.get(sim, 0) + w
+        self._fixed, self.fixed_how = self._one_to_one(by_cat)
+
+    def _one_to_one(self, by_cat: dict[str, list[str]]) -> tuple[dict[str, str], dict[str, str]]:
+        """Episode map, one alias per oracle object: per category, the assignment maximizing the matched frames
+        (Hungarian). Aliases that lose (another alias of the same object had more frames) stay unmapped: their
+        predictions count as unmappable (wrong) and they are name-consistency errors. An alias never matched to any
+        object is mapped by elimination only when it is the category's single unmatched alias and one object is
+        left (e.g. a fridge seen only behind its door)."""
+        from scipy.optimize import linear_sum_assignment
+
+        fixed: dict[str, str] = {}
+        how: dict[str, str] = {}
+        for cat, sims in by_cat.items():
+            aliases = sorted(a for a, c in self.cat_of.items() if c == cat)
+            voted = [a for a in aliases if self.frames.get(a)]
+            if voted:
+                w = np.array([[self.frames[a].get(s, 0) for s in sims] for a in voted], float)
+                r, c = linear_sum_assignment(-w)
+                for i, j in zip(r, c, strict=True):
+                    if w[i, j] > 0:
+                        fixed[voted[i]], how[voted[i]] = sims[j], "frames"
+            left_a = [a for a in aliases if a not in fixed and not self.frames.get(a)]
+            left_s = [s for s in sims if s not in fixed.values()]
+            if len(left_a) == 1 and len(left_s) == 1:
+                fixed[left_a[0]], how[left_a[0]] = left_s[0], "elimination"
+        return fixed, how
 
     def fixed(self) -> dict[str, str]:
-        """Episode-level map: each alias -> the oracle object it was matched to for the most frames (time-weighted
-        majority). Relation accuracy uses this, so a track that swaps objects mid-episode is scored wrong after the
-        swap (and the swap counts against name consistency)."""
+        """Episode-level map, one-to-one (``_one_to_one``). Relation accuracy uses it, so a track that swaps objects
+        mid-episode is scored wrong after the swap, and the swap counts against name consistency."""
         return dict(self._fixed)
+
+    def unmappable(self, alias: str) -> bool:
+        """An alias of a category the oracle has, without an object in the map: its predictions cannot be right."""
+        cat = self.cat_of.get(alias, alias.rsplit("_", 1)[0])
+        return cat in self.oracle_categories
 
     def _set(self, cur: dict[str, str], t: int, a: str, sim: str, d: float | None) -> None:
         self.changes.append({"t": t, "alias": a, "from": cur.get(a), "to": sim, "dist": None if d is None else round(d, 3)})
@@ -148,7 +184,9 @@ class TrackMap:
         per_obj: dict[str, list[str]] = {}
         for a, c in self.counts.items():
             per_obj.setdefault(self._fixed.get(a, max(c, key=c.get)), []).append(a)
-        return {"radius": self.radius, "fixed": self.fixed(), "first": self.first(), "final": self.final(),
+        return {"radius": self.radius, "fixed": self.fixed(), "fixed_how": self.fixed_how,
+                "aliases_without_object": sorted(a for a in self.cat_of if a not in self._fixed
+                                                 and self.cat_of[a] in self.oracle_categories), "first": self.first(), "final": self.final(),
                 "n_changes": sum(1 for c in self.changes if c["from"] is not None),
                 "changes": self.changes[:max_changes], "counts": self.counts, "aliases_per_object": per_obj,
                 "unmatched_observations": self.unmatched}
@@ -230,7 +268,7 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
     (re-matching allowed; an auxiliary number that forgives name swaps)."""
     covered = set(oracle.relations)
     art = articulated_intervals(oracle)
-    right = wrong = undecided = saved = unmapped = 0
+    right = wrong = undecided = saved = unmapped = unmappable = 0
     per_pred: dict[str, list[int]] = {}
     art_counts: dict[str, int] = {}
     errors = []
@@ -256,19 +294,31 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
                 continue
             vals = [_truth(key, s, amap) for s in states]
             if vals[0] is None:
-                unmapped += 1
+                objs = [x for x in (key[1], key[2]) if x and x != "table" and x not in (arms or ())]
+                lost = isinstance(tmap, TrackMap) and any(x not in amap and tmap.unmappable(x) for x in objs)
+                d = decided(p)
+                if lost and d is not None:
+                    # an alias of an oracle category with no object in the map (lost the one-to-one assignment /
+                    # never matched): the prediction cannot be right -> wrong, and counted apart
+                    unmappable += 1
+                    wrong += 1
+                    per_pred.setdefault(key[0], [0, 0, 0, 0])[3] += 1
+                    if len(errors) < 40:
+                        errors.append({"t": t, "stmt": stmt, "p": p, "source": src, "truth": "unmappable"})
+                else:
+                    unmapped += 1
                 continue
             d = decided(p)
             if d is None:
                 undecided += 1
-                per_pred.setdefault(key[0], [0, 0, 0])[2] += 1
+                per_pred.setdefault(key[0], [0, 0, 0, 0])[2] += 1
                 continue
             options = {v for v in vals if v is not None}
             ok = d in options
             saved += ok and d != vals[0]
             right += ok
             wrong += not ok
-            pp = per_pred.setdefault(key[0], [0, 0, 0])
+            pp = per_pred.setdefault(key[0], [0, 0, 0, 0])
             pp[0 if ok else 1] += 1
             if not ok and len(errors) < 40:
                 errors.append({"t": t, "stmt": stmt, "p": p, "source": src, "truth": vals[0],
@@ -277,9 +327,11 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
     return {"accuracy": round(right / n, 4) if n else None, "decided": n, "undecided": undecided,
             "undecided_rate": round(undecided / (n + undecided), 4) if n + undecided else None,
             "tolerance_frames": tol, "right_only_within_tolerance": saved, "not_mapped": unmapped,
-            "per_pred": {k: {"right": v[0], "wrong": v[1], "undecided": v[2],
-                             "accuracy": round(v[0] / (v[0] + v[1]), 4) if v[0] + v[1] else None} for k, v in per_pred.items()},
-            "map": "per-row (re-matching allowed)" if remap else "episode-level (time-weighted majority)",
+            "unmappable_wrong": unmappable,
+            "per_pred": {k: {"right": v[0], "wrong": v[1] + v[3], "undecided": v[2], "unmappable": v[3],
+                             "accuracy": round(v[0] / (v[0] + v[1] + v[3]), 4) if v[0] + v[1] + v[3] else None}
+                         for k, v in per_pred.items()},
+            "map": "per-row (re-matching allowed)" if remap else "episode-level (one-to-one, time-weighted)",
             "articulated": {"intervals": [list(x) for x in art], "excluded_robot_keys": art_counts},
             "errors": errors}
 
@@ -337,7 +389,7 @@ def name_consistency(tmap: TrackMap) -> dict[str, Any]:
     per_obj = tmap.to_dict()["aliases_per_object"]
     split = {s: v for s, v in per_obj.items() if len(v) > 1}
     return {"rate": round(ok / n, 4) if n else None, "n": n, "unstable_aliases": unstable[:20],
-            "objects_with_several_aliases": split,
+            "objects_with_several_aliases": split, "aliases_without_object": tmap.to_dict()["aliases_without_object"],
             "remap_errors": [c for c in tmap.changes if c["from"] is not None][:30],
             "map_changes": sum(1 for c in tmap.changes if c["from"] is not None)}
 
@@ -370,7 +422,7 @@ def evaluate(out_dir: str | Path, root: str | Path, tol: int | None = None, map_
     radius = DEFAULT_MAP_RADIUS.get(bench, 0.15) if map_radius is None else map_radius
     names = sorted({t["alias"] for line in trace for t in line.get("tracks", [])} | {t["alias"] for t in summary.get("tracks", [])})
     arms = summary.get("arms") or [None]
-    tmap = TrackMap(trace, oracle, radius)
+    tmap = TrackMap(trace, oracle, radius, end_t=summary.get("n_frames"))
     res: dict[str, Any] = {"alias_map": tmap.first(), "track_map": tmap.to_dict(), "oracle_relations": oracle.relations,
                            "tolerance_frames": tol, "name_consistency": name_consistency(tmap),
                            "init_failed": summary.get("init_failed"), "track_identity": summary.get("track_identity")}
@@ -395,7 +447,7 @@ def eval_table(res: dict[str, Any]) -> str:
     if res.get("init_failed"):
         lines += [f"> **INIT FAILED — NO GOAL**: {res['init_failed']}", ""]
     lines += [f"Event tolerance: +-{res.get('tolerance_frames')} frames (a value the oracle has within it counts as right).", "",
-              "Relation accuracy uses one oracle<->track map per episode (time-weighted majority); the "
+              "Relation accuracy uses one oracle<->track map per episode (one-to-one, time-weighted); the "
               "'re-match allowed' column re-matches at every row (auxiliary: forgives name swaps).", "",
               "| pass | rel. accuracy | rel. acc. (re-match allowed) | decided | undecided rate | right only within tol. | boundary err intent (mean / median) "
               "| boundary err contact (mean / median) | re-observation |",
@@ -426,7 +478,9 @@ def eval_table(res: dict[str, Any]) -> str:
         art = fw["relations"]["articulated"]
         lines += ["", f"Articulated grasps (door / switch segments +-tol; only the arm on the door: its inhand of it and its handempty): "
                       f"{art['intervals']} -> {art['excluded_robot_keys']}",
-                  f"Keys not evaluated (an object not mapped to the oracle): {fw['relations']['not_mapped']}",
+                  f"Decided predictions on an alias with no oracle object in the episode map (counted WRONG): "
+                  f"{fw['relations']['unmappable_wrong']}; keys not evaluated (category / arm not covered by the oracle): "
+                  f"{fw['relations']['not_mapped']}",
                   f"Generated boundaries (frames): {fw['subtask_boundary'].get('generated')}",
                   f"Signed boundary errors (+ late): intent {fw['subtask_boundary']['intent'].get('signed')}, "
                   f"contact {fw['subtask_boundary']['contact'].get('signed')}"]

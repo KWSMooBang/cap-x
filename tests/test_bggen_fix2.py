@@ -255,7 +255,9 @@ def test_eval_maps_tracks_over_the_episode_with_tolerance_and_articulated(tmp_pa
                                   _trk("bowl_B", "bowl", [0.5, 0, 0]), _trk("plate_A", "plate", [0, 0, -0.02])]}]
     tm = TrackMap(trace, o, 0.15)
     assert tm.first() == {"bowl_A": "bowl_1", "bowl_B": "bowl_2", "plate_A": "plate_1", "fridge_A": "fridge_1"}
-    assert tm.at(60)["bowl_C"] == "bowl_1"  # a renamed track is still evaluated (frame-0 map: skipped)
+    assert tm.at(60)["bowl_C"] == "bowl_1"  # per row: the renamed track is matched (auxiliary metric)
+    # episode map is one-to-one: bowl_A (60 frames) keeps bowl_1, the split name bowl_C (1 frame) has no object
+    assert tm.fixed()["bowl_A"] == "bowl_1" and "bowl_C" not in tm.fixed()
     nc = name_consistency(tm)
     assert nc["objects_with_several_aliases"] == {"bowl_1": ["bowl_A", "bowl_C"]}
     names = ["bowl_A", "bowl_B", "bowl_C", "plate_A", "fridge_A"]
@@ -265,10 +267,12 @@ def test_eval_maps_tracks_over_the_episode_with_tolerance_and_articulated(tmp_pa
             {"t": 25, "belief": {"(inhand_left fridge_A)": [0.97, "robot"], "(handempty_left)": [0.03, "robot"]}}]
     r5 = relation_accuracy(rows, o, tm, names, arms, tol=5)
     r0 = relation_accuracy(rows, o, tm, names, arms, tol=0)
-    assert r5["decided"] == 2 and r5["accuracy"] == 1.0 and r5["right_only_within_tolerance"] == 1
-    assert r0["accuracy"] == 0.5
+    # bowl_C's prediction cannot be right without an object: counted wrong (unmappable)
+    assert r5["decided"] == 2 and r5["accuracy"] == 0.5 and r5["right_only_within_tolerance"] == 1
+    assert r5["unmappable_wrong"] == 1 and r5["per_pred"]["on"]["unmappable"] == 1
+    assert r0["accuracy"] == 0.0
     assert r5["articulated"]["excluded_robot_keys"] == {"inhand=1": 1, "handempty=0": 1}
-    assert r5["per_pred"]["on"]["right"] == 2 and "handempty" not in r5["per_pred"]
+    assert r5["per_pred"]["on"]["right"] == 1 and "handempty" not in r5["per_pred"]
     assert contact_boundaries(o) == [40, 50]
     b = boundary_error([{"t": 0, "subtask": "a"}, {"t": 42, "subtask": "b"}, {"t": 55, "subtask": "c"}], o)
     assert b["intent"]["reference"] == [20, 40] and b["contact"]["signed"] == [2, 5]
@@ -366,3 +370,57 @@ def test_reacquire_is_a_joint_assignment_not_score_greedy():
                     detected_categories=["bowl"])
     assert rep["new"] == [] and tr.counts["reacquired"] == 2 and tr.counts["closed_assigned"] == 0
     assert np.isclose(tr.tracks[a].pos[1], -0.105) and np.isclose(tr.tracks[b].pos[1], -0.29)
+
+
+# --- review of fa5dda6 (lead_cap-bg, 3 x P2, evaluation) ---------------------------------------------------
+
+def _bowls_oracle(root: Path, relations=("on",), extra: dict | None = None):
+    states = [{"t": t, "pos": {"bowl_1": [0, 0, 0], "bowl_2": [0.5, 0, 0], "plate_1": [0, 0, -0.02]},
+               "true": [["on", "bowl_1", "plate_1"]], "inhand": {"main": None}} for t in range(0, 101, 2)]
+    objects = {"bowl_1": "bowl", "bowl_2": "bowl", "plate_1": "plate", **(extra or {})}
+    write_oracle(root, {"objects": objects, "relations": list(relations), "arms": ["main"]}, states, [], {"success": True})
+    return load_oracle(root)
+
+
+def test_last_observation_is_weighted_to_the_episode_end(tmp_path):
+    o = _bowls_oracle(tmp_path)
+    trace = [{"t": 0, "tracks": [_trk("bowl_A", "bowl", [0, 0, 0])]},
+             {"t": 10, "tracks": [_trk("bowl_A", "bowl", [0.5, 0, 0])]}]  # from t=10 to the end (100) on bowl_2
+    assert TrackMap(trace, o, 0.15, end_t=100).fixed()["bowl_A"] == "bowl_2"  # 90 frames vs 10
+    assert TrackMap(trace, o, 0.15).fixed()["bowl_A"] == "bowl_1"  # no episode length: the last line counts 1 frame
+
+
+def test_aliases_without_an_object_are_counted_wrong_not_skipped(tmp_path):
+    o = _bowls_oracle(tmp_path, relations=("on", "open"), extra={"fridge_1": "fridge"})
+    # two fridge names, never seen (behind the robot): no elimination possible -> neither has an object
+    two = [{"t": 0, "tracks": [_trk("fridge_A", "fridge", None, False), _trk("fridge_B", "fridge", None, False)]}]
+    tm = TrackMap(two, o, 0.15, end_t=100)
+    assert tm.fixed() == {} and tm.to_dict()["aliases_without_object"] == ["fridge_A", "fridge_B"]
+    rows = [{"t": 20, "belief": {"(open fridge_B)": [0.1, "mem"]}}]
+    r = relation_accuracy(rows, o, tm, ["fridge_A", "fridge_B"], [None])
+    assert r["decided"] == 1 and r["accuracy"] == 0.0 and r["unmappable_wrong"] == 1 and r["not_mapped"] == 0
+    # one never-seen fridge name: the single object is left -> mapped by elimination and scored normally
+    one = [{"t": 0, "tracks": [_trk("fridge_A", "fridge", None, False)]}]
+    tm1 = TrackMap(one, o, 0.15, end_t=100)
+    assert tm1.fixed() == {"fridge_A": "fridge_1"} and tm1.fixed_how["fridge_A"] == "elimination"
+    r1 = relation_accuracy([{"t": 20, "belief": {"(open fridge_A)": [0.1, "mem"]}}], o, tm1, ["fridge_A"], [None])
+    assert r1["accuracy"] == 1.0 and r1["unmappable_wrong"] == 0
+
+
+def test_episode_map_is_one_to_one(tmp_path):
+    o = _bowls_oracle(tmp_path)
+    plate = _trk("plate_A", "plate", [0, 0, -0.02])
+    # bowl_A follows bowl_1 for 40 frames, then the tracker calls it bowl_C for the remaining 60
+    trace = [{"t": 0, "tracks": [_trk("bowl_A", "bowl", [0, 0, 0]), _trk("bowl_B", "bowl", [0.5, 0, 0]), plate]},
+             {"t": 40, "tracks": [_trk("bowl_A", "bowl", [0, 0, 0], False), _trk("bowl_C", "bowl", [0, 0, 0]),
+                                  _trk("bowl_B", "bowl", [0.5, 0, 0]), plate]}]
+    tm = TrackMap(trace, o, 0.15, end_t=100)
+    fx = tm.fixed()
+    assert fx["bowl_C"] == "bowl_1" and "bowl_A" not in fx and fx["bowl_B"] == "bowl_2"
+    assert sorted(fx.values()) == sorted(set(fx.values()))  # one alias per object
+    nc = name_consistency(tm)
+    assert nc["objects_with_several_aliases"] == {"bowl_1": ["bowl_A", "bowl_C"]} and nc["aliases_without_object"] == ["bowl_A"]
+    assert nc["rate"] < 1.0
+    rows = [{"t": 20, "belief": {"(on bowl_A plate_A)": [0.9, "obs"]}}]  # right object, but a name without an object
+    r = relation_accuracy(rows, o, tm, ["bowl_A", "bowl_B", "bowl_C", "plate_A"], [None])
+    assert r["accuracy"] == 0.0 and r["unmappable_wrong"] == 1
