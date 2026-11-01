@@ -261,16 +261,34 @@ def condition_video_segment_prompt(
     ]
 
 
+TRUNCATED_MARK = "[truncated: the description of this part was cut off by the output token limit]"
+
+
 def assemble_condition_video_description(parts: list[dict[str, Any]], control_freq: float = CONTROL_FREQ_HZ) -> str:
-    """The text that goes into the first prompt: each part's events in order, then the last part's state."""
+    """The text that goes into the first prompt: each part's events in order, then the final state.
+
+    A part whose reply was cut off at max_tokens is marked TRUNCATED_MARK. The final state is the last complete
+    part's STATE; if that is not the last part, the heading says from which part it is.
+    """
     lines = []
     for p in parts:
         lines.append(f"Part {p['part']}/{len(parts)} (t = {p['first'] / control_freq:.2f}-"
                      f"{p['last'] / control_freq:.2f} s):")
         lines.append(p["events"] or "none")
+        if p.get("truncated"):
+            lines.append(TRUNCATED_MARK)
         lines.append("")
-    lines.append("Final state (end of the video):")
-    lines.append(parts[-1]["state"] if parts else "unknown")
+    complete = [p for p in parts if not p.get("truncated")]
+    if not complete:
+        lines.append("Final state: unknown (every part was cut off).")
+    elif complete[-1] is parts[-1]:
+        lines.append("Final state (end of the video):")
+        lines.append(complete[-1]["state"])
+    else:
+        last = complete[-1]
+        lines.append(f"Final state: unknown (the description of the last part(s) was cut off). State at the end of "
+                     f"part {last['part']} (t = {last['last'] / control_freq:.2f} s):")
+        lines.append(last["state"])
     return "\n".join(lines).strip()
 
 
@@ -313,9 +331,13 @@ def describe_condition_video_segmented(
         reply = (out.get("content") or "").strip()
         if not reply:
             raise RuntimeError(f"VDM gave no description for conditioning-video part {k}/{len(segments)} (twice)")
-        events, state = split_segment_reply(reply)
+        truncated = out.get("finish_reason") == "length"  # cut off on both attempts
+        events, part_state = split_segment_reply(reply)
         parts.append({"part": k, "first": seg[0], "last": seg[-1], "n_frames": len(seg), "shared": shared,
-                      "events": events, "state": state, "reply": reply, "reasoning": out.get("reasoning")})
+                      "events": events, "state": part_state, "reply": reply, "reasoning": out.get("reasoning"),
+                      "truncated": truncated, "state_in": state})
+        if not truncated:  # a cut-off STATE is never passed on: the next part gets the last complete one
+            state = part_state
         prev = seg
     description = assemble_condition_video_description(parts, control_freq)
     used = sorted({i for seg in segments for i in seg})
@@ -327,10 +349,44 @@ def describe_condition_video_segmented(
         "frame_indices": used,
         "vdm_calls": calls,
         "parts": parts,
+        "truncated_parts": [p["part"] for p in parts if p["truncated"]],
         "how": (f"{len(used)} of its frames ({'every frame' if stride_used == 1 else f'every {stride_used}th frame'}, "
                 f"in {len(segments)} overlapping parts, in time order)"),
     }
     return description, log
+
+
+def describe_condition_video_single(
+    query: Callable[[Any, list[dict[str, Any]]], dict[str, Any]],
+    vdm_args: Any,
+    goal: str | None,
+    frames: list[tuple[int, np.ndarray]],
+    total: int,
+    control_freq: float = CONTROL_FREQ_HZ,
+) -> tuple[str, dict[str, Any]]:
+    """The first version (condition_video_segment_frames 0): one VDM call with the sampled ``frames``.
+
+    An empty or cut-off reply is asked once more; empty twice raises RuntimeError, cut off twice is used with
+    TRUNCATED_MARK appended (``truncated`` in the log).
+    """
+    prompt = condition_video_vdm_prompt(goal, frames, total, control_freq)
+    calls: list[dict[str, Any]] = []
+    out: dict[str, Any] = {}
+    for attempt in range(2):
+        start = time.time()
+        out = query(vdm_args, prompt)
+        calls.append({"attempt": attempt + 1, "n_frames": len(frames), "latency_s": round(time.time() - start, 2),
+                      "finish_reason": out.get("finish_reason"), "usage": out.get("usage")})
+        if (out.get("content") or "").strip() and out.get("finish_reason") != "length":
+            break
+    description = (out.get("content") or "").strip()
+    if not description:
+        raise RuntimeError(f"VDM {getattr(vdm_args, 'model', '?')} gave no conditioning-video description (twice)")
+    truncated = out.get("finish_reason") == "length"
+    if truncated:
+        description += "\n" + TRUNCATED_MARK
+    return description, {"vdm_calls": calls, "vdm_reasoning": out.get("reasoning"), "truncated": truncated,
+                         "n_frames": len(frames), "frame_indices": [i for i, _ in frames]}
 
 
 class RoboMMECodeEnv(CodeExecutionEnvBase):
@@ -405,8 +461,10 @@ class RoboMMECodeEnv(CodeExecutionEnvBase):
 
 __all__ = [
     "CONDITION_VIDEO_SEGMENT_DEFAULTS",
+    "TRUNCATED_MARK",
     "RoboMMECodeEnv",
     "describe_condition_video_segmented",
+    "describe_condition_video_single",
     "plan_condition_video_segments",
     "split_segment_reply",
     "condition_video_text_content",

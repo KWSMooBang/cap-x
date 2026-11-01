@@ -61,6 +61,12 @@ prompt. Unknown models are assumed to take images (as before). Images reach the 
   missed a swap because the VDM described the set as a whole drifting left. It is told not to state the answer, the
   target or a plan. The first prompt gets every part's events in order, followed by the last part's state as
   "Final state (end of the video)". An empty or cut-off part is asked once more; an empty reply twice fails the trial.
+  A part cut off at `max_tokens` on both attempts is used with
+  `[truncated: the description of this part was cut off by the output token limit]` after its events and listed in
+  `truncated_parts`. Its STATE is not passed on: the next part gets the last complete STATE, and if the last part
+  was cut off, the final state heading says it is unknown and gives the last complete part's state. The VDM's
+  `max_tokens` is the config's `max_tokens` (32768). The first smoke's single call used 4,590 completion tokens,
+  3,826 of them reasoning. The single-call version marks a reply cut off twice the same way.
   `condition_video_segment_frames: 0` gives the first version: one call with the 32 sampled frames.
   The CLI flags are `--condition-video-stride`, `--condition-video-segment-frames`, `--condition-video-overlap` and
   `--condition-video-max-segments`. The RoboMME ensemble configs set the four keys explicitly.
@@ -187,7 +193,8 @@ off there is no `ensemble_calls` key.
 Prices are in `env_configs/pricing/nebius.yaml` (USD per 1M input / output tokens, Nebius catalogue 2026-11-01):
 gpt-oss-120b 0.15/0.6, Qwen3-235B-2507 0.2/0.6, DeepSeek-V4-Flash-0731 0.14/0.28, DeepSeek-V4-Pro 1.75/3.5,
 Qwen3.8-27B 0.45/3, Kimi-K3 3/15, and the alternatives Kimi-K2.7-Code 0.95/4, GLM-5.3 1.4/4.4,
-Nemotron-3-Ultra-550b 1/3, Qwen3.5-397B-A17B 0.6/3.6 (check the GLM / Nemotron / Qwen3.5 / Flash IDs in the catalogue). `scripts/model_costs.py` sums each trial's calls per model (ensemble: every
+`nvidia/Nemotron-3-Ultra-550b-a55b` 1/3, Qwen3.5-397B-A17B 0.6/3.6 (text2text on Nebius; all of them are in
+`TEXT_ONLY_MODELS`; the GLM ID `zai-org/GLM-5.3` is unconfirmed). `scripts/model_costs.py` sums each trial's calls per model (ensemble: every
 candidate and synthesis call in `ensemble_calls`; no ensemble: `usage`, `truncated_first_usage`, `s5_first_reply`
 under the coding model; `vdm_usage` under the VDM model) and prices them as prompt × input + completion × output
 (reasoning tokens are completion tokens). Molmo (local) and cached-input discounts are not included; the Nebius
@@ -254,7 +261,9 @@ kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg && git fetch origin
 ```
 
 Read `outputs/condition_video_desc/20261102_cvdesc_seg/<Task>_ep0.md` (description, every part's raw reply, the old
-single-call description) and `SUMMARY.txt` (calls, seconds, tokens, $ per task). The PNGs in `<Task>_ep0_frames/` are
+single-call description) and `SUMMARY.txt` (calls, seconds, tokens, $ and cut-off parts per task). The script reports
+each method separately: the part-by-part description and the single-call comparison. With `--segment-frames 0`
+the single call is the description itself, as in the trial. The PNGs in `<Task>_ep0_frames/` are
 the frames the VDM saw. Settings come from the configs; override them with `--stride`, `--segment-frames`,
 `--overlap`, `--max-segments`.
 

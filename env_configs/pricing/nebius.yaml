@@ -11,8 +11,8 @@ models:
   deepseek-ai/DeepSeek-V4-Pro: {input: 1.75, output: 3.5}
   Qwen/Qwen3.8-27B: {input: 0.45, output: 3.0}
   moonshotai/Kimi-K3: {input: 3.0, output: 15.0}
-  # Candidate replacements (lead, 2026-11-01). Check the exact model IDs in the Nebius catalogue before use.
+  # Candidate replacements (lead, 2026-11-01). DeepSeek-V4-Flash-0731 and Nemotron IDs confirmed in the catalogue.
   zai-org/GLM-5.3: {input: 1.4, output: 4.4}
-  nvidia/Nemotron-3-Ultra-550b: {input: 1.0, output: 3.0}
+  nvidia/Nemotron-3-Ultra-550b-a55b: {input: 1.0, output: 3.0}
   Qwen/Qwen3.5-397B-A17B: {input: 0.6, output: 3.6}
   deepseek-ai/DeepSeek-V4-Flash-0731: {input: 0.14, output: 0.28}

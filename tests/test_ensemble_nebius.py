@@ -305,7 +305,7 @@ def _usage(p=100, c=20, r=5):
     return {"prompt_tokens": p, "completion_tokens": c, "completion_tokens_details": {"reasoning_tokens": r}}
 
 
-def _run_trial(monkeypatch, tmp_path, config, n_demo=12):
+def _run_trial(monkeypatch, tmp_path, config, n_demo=12, wrap=None):
     calls: list[tuple[str, Any]] = []
 
     def fake(args, prompt):
@@ -324,6 +324,8 @@ def _run_trial(monkeypatch, tmp_path, config, n_demo=12):
             text = "FINISH" if "console stdout" in str(prompt).lower() or "Executed:" in str(prompt) else CODE
         return {"content": text, "reasoning": None, "finish_reason": "stop", "usage": _usage()}
 
+    if wrap is not None:
+        fake = wrap(fake)
     monkeypatch.setattr(trial_mod, "_query_model", fake)
     monkeypatch.setattr(client, "query_model", fake)
     monkeypatch.setattr(trial_mod, "_write_video", lambda frames, base_dir, suffix="": None)
@@ -725,7 +727,7 @@ def test_generator_candidates_argument():
     cfg = yaml.safe_load(text)
     assert [c["model"] for c in cfg["ensemble"]["candidates"]] == [m for m, _ in swapped]
     assert "GLM-5.3" in text.split("\n")[3] and "All coding-side models are text-only" in text
-    mixed = gen_ens.build([("Qwen/Qwen3.5-397B-A17B", [0.5])], SYNTH)[Path("libero_mem") / "task_06_swap_bowls.yaml"]
+    mixed = gen_ens.build([("Qwen/Qwen3.8-27B", [0.5])], SYNTH)[Path("libero_mem") / "task_06_swap_bowls.yaml"]
     assert "Text-only: DeepSeek-V4-Pro." in mixed
     assert gen_ens.load_models() == ([(m, t) for m, t in NEBIUS], SYNTH)
     # --check with a different choice reports stale files and writes nothing.
@@ -740,6 +742,134 @@ def test_generator_candidates_argument():
 
 def test_new_prices():
     prices = model_costs.load_prices()
-    assert prices["zai-org/GLM-5.3"] == (1.4, 4.4) and prices["nvidia/Nemotron-3-Ultra-550b"] == (1.0, 3.0)
+    assert prices["zai-org/GLM-5.3"] == (1.4, 4.4) and prices["nvidia/Nemotron-3-Ultra-550b-a55b"] == (1.0, 3.0)
     assert prices["Qwen/Qwen3.5-397B-A17B"] == (0.6, 3.6)
     assert prices["deepseek-ai/DeepSeek-V4-Flash-0731"] == (0.14, 0.28)
+
+
+# --------------------------------------------------------------------------------------------------
+# Review fixes (65cdcc4): cut-off parts, describe script methods, model IDs
+# --------------------------------------------------------------------------------------------------
+
+def _seg_query(cut_parts: set[int]):
+    import numpy as np  # noqa: F401
+
+    prompts: list = []
+
+    def query(args, prompt):
+        prompts.append(prompt)
+        text = str(prompt)
+        part = int(text.split("This is part ")[1].split(" of")[0])
+        if part in cut_parts:
+            return {"content": f"EVENTS:\n{part}. partial event\nSTATE:\n- half a sta", "finish_reason": "length",
+                    "usage": _usage()}
+        return {"content": f"EVENTS:\n{part}. event\nSTATE:\nstate after part {part}", "finish_reason": "stop",
+                "usage": _usage()}
+
+    return query, prompts
+
+
+def _frames(n):
+    import numpy as np
+
+    return [np.full((4, 4, 3), i, dtype=np.uint8) for i in range(n)]
+
+
+def test_cut_off_part_is_marked_and_its_state_not_passed_on():
+    query, prompts = _seg_query({2})
+    desc, log = rme.describe_condition_video_segmented(
+        query, SimpleNamespace(model="v"), None, _frames(50), stride=1, segment_frames=20, overlap=4, max_segments=12)
+    assert len(prompts) == 4  # part 2 asked twice
+    assert log["truncated_parts"] == [2] and [p["truncated"] for p in log["parts"]] == [False, True, False]
+    assert "half a sta" not in str(prompts[3]) and "state after part 1" in str(prompts[3])  # part 3 gets part 1's
+    assert log["parts"][2]["state_in"] == "state after part 1"
+    part2 = desc.split("Part 2/3")[1].split("Part 3/3")[0]
+    assert "2. partial event" in part2 and rme.TRUNCATED_MARK in part2
+    assert desc.endswith("Final state (end of the video):\nstate after part 3")
+
+
+def test_cut_off_last_part_falls_back_to_last_complete_state():
+    query, _ = _seg_query({3})
+    desc, log = rme.describe_condition_video_segmented(
+        query, SimpleNamespace(model="v"), None, _frames(50), stride=1, segment_frames=20, overlap=4, max_segments=12)
+    assert log["truncated_parts"] == [3] and "half a sta" not in desc.split("Final state")[1]
+    assert "Final state: unknown (the description of the last part(s) was cut off). State at the end of part 2" in desc
+    assert desc.endswith("state after part 2")
+
+
+def test_single_call_cut_off_marked():
+    calls = []
+
+    def query(args, prompt):
+        calls.append(prompt)
+        return {"content": "1. t = 0.1 s: the cup", "finish_reason": "length", "usage": _usage()}
+
+    desc, log = rme.describe_condition_video_single(query, SimpleNamespace(model="v"), None,
+                                                    list(enumerate(_frames(3))), 3)
+    assert len(calls) == 2 and log["truncated"] and desc.endswith(rme.TRUNCATED_MARK)
+
+
+def test_trial_logs_truncated_parts(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    def cut_part_2(model_fn):
+        def f(args, prompt):
+            out = model_fn(args, prompt)
+            if "demonstration video" in str(prompt[0]["content"]) and "part 2 of" in str(prompt):
+                out = {**out, "finish_reason": "length"}
+            return out
+        return f
+
+    config = _trial_config(tmp_path, condition_video_segment_frames=20, condition_video_overlap=4)
+    _, responses = _run_trial(monkeypatch, tmp_path, config, n_demo=50, wrap=cut_part_2)
+    cv = responses[0]["condition_video"]
+    assert cv["truncated_parts"] == [2] and rme.TRUNCATED_MARK in cv["description"]
+    assert [c["part"] for c in cv["vdm_calls"]] == [1, 2, 2, 3]
+
+
+import describe_condition_video as describe_cv  # noqa: E402
+
+
+def test_describe_script_segment_frames_zero_is_single_call():
+    calls = []
+
+    def query(args, prompt):
+        calls.append(prompt)
+        return {"content": "1. t = 0.0 s: cup", "finish_reason": "stop", "usage": _usage(100, 10)}
+
+    frames = _frames(60)
+    sampled = list(enumerate(frames))[::2]
+    seg = {"stride": 1, "segment_frames": 0, "overlap": 4, "max_segments": 12}
+    rec = describe_cv.describe_task(query, SimpleNamespace(model="v"), "g", frames, sampled, seg, also_single=False)
+    assert len(calls) == 1 and client.count_prompt_images(calls[0]) == 30  # not split frame by frame
+    assert rec["method"] == "single" and rec["description"] == "1. t = 0.0 s: cup"
+    assert rec["methods"] == {"single": {"calls": 1, "wall_s": rec["methods"]["single"]["wall_s"],
+                                         "prompt_tokens": 100, "completion_tokens": 10}}
+    assert rec["frame_indices"] == [i for i, _ in sampled]
+
+
+def test_describe_script_comparison_counted_separately(tmp_path):
+    calls = []
+
+    def query(args, prompt):
+        calls.append(prompt)
+        seg = "This is part" in str(prompt)
+        return {"content": "EVENTS:\n1. e\nSTATE:\ns" if seg else "single text", "finish_reason": "stop",
+                "usage": _usage(100, 10)}
+
+    frames = _frames(50)
+    seg = {"stride": 1, "segment_frames": 20, "overlap": 4, "max_segments": 12}
+    rec = describe_cv.describe_task(query, SimpleNamespace(model="v"), "g", frames, list(enumerate(frames))[:32],
+                                    seg, also_single=True)
+    assert len(calls) == 4
+    assert rec["method"] == "segmented" and rec["methods"]["segmented"]["calls"] == 3
+    assert rec["methods"]["single (comparison)"]["calls"] == 1
+    assert rec["methods"]["single (comparison)"]["prompt_tokens"] == 100
+    assert rec["single"]["description"] == "single text"
+    describe_cv.write_markdown(tmp_path / "x.md", {**rec, "task": "T", "episode": 0})
+    md = (tmp_path / "x.md").read_text()
+    assert "- segmented: 3 calls" in md and "- single (comparison): 1 calls" in md and "single text" in md
+
+
+def test_text_only_ids():
+    assert client.is_text_only_model("nvidia/Nemotron-3-Ultra-550b-a55b")
+    assert client.is_text_only_model("Qwen/Qwen3.5-397B-A17B")
+    assert not client.is_text_only_model("nvidia/Nemotron-3-Ultra-550b")

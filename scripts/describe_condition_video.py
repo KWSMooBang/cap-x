@@ -52,7 +52,8 @@ class Args:
     temperature: float = 1.0
     """As launch.py's default (the trial passes --temperature to the VDM)."""
     also_single: bool = False
-    """Also run the single-call description of the condition_frames sampled frames (the first version)."""
+    """Also run the single-call description of the condition_frames sampled frames (the first version) for
+    comparison; reported as its own method. With --segment-frames 0 the single call is the description itself."""
     save_frames: bool = True
     out_root: str = "outputs/condition_video_desc"
 
@@ -63,15 +64,51 @@ def _tokens(usage) -> tuple[int, int]:
     return int(usage.get("prompt_tokens") or 0), int(usage.get("completion_tokens") or 0)
 
 
+def _method_stats(calls: list[dict], wall_s: float) -> dict:
+    p_tok = sum(_tokens(c.get("usage"))[0] for c in calls)
+    c_tok = sum(_tokens(c.get("usage"))[1] for c in calls)
+    return {"calls": len(calls), "wall_s": round(wall_s, 2), "prompt_tokens": p_tok, "completion_tokens": c_tok}
+
+
+def describe_task(query, vdm_args, goal: str | None, frames: list, sampled: list, seg: dict[str, int],
+                  also_single: bool) -> dict:
+    """Description(s) of one conditioning video, as the trial would make them.
+
+    ``seg["segment_frames"] > 0``: the part-by-part description (plus, with ``also_single``, the single-call one
+    for comparison). ``segment_frames`` 0: the single-call description of ``sampled`` (what the trial then uses).
+    ``methods`` holds calls / wall time / tokens per method, so a comparison call is never folded into another.
+    """
+    from capx.envs.tasks.robomme.robomme_env import (
+        describe_condition_video_segmented,
+        describe_condition_video_single,
+    )
+
+    record: dict = {"goal": goal, "total_frames": len(frames), "settings": seg, "methods": {}}
+    if seg["segment_frames"] > 0:
+        start = time.time()
+        description, log = describe_condition_video_segmented(query, vdm_args, goal, frames, **seg)
+        record.update(method="segmented", description=description, **log)
+        record["methods"]["segmented"] = _method_stats(log["vdm_calls"], time.time() - start)
+    if seg["segment_frames"] <= 0 or also_single:
+        start = time.time()
+        single, slog = describe_condition_video_single(query, vdm_args, goal, sampled, len(frames))
+        stats = _method_stats(slog["vdm_calls"], time.time() - start)
+        if seg["segment_frames"] <= 0:
+            record.update(method="single", description=single, vdm_calls=slog["vdm_calls"],
+                          frame_indices=slog["frame_indices"], n_frames=slog["n_frames"],
+                          truncated_parts=[1] if slog["truncated"] else [], parts=[])
+            record["methods"]["single"] = stats
+        else:
+            record["single"] = {"description": single, **slog}
+            record["methods"]["single (comparison)"] = stats
+    return record
+
+
 def main(a: Args) -> int:
     from PIL import Image
 
     from capx.envs.configs.instantiate import instantiate
-    from capx.envs.tasks.robomme.robomme_env import (
-        CONDITION_VIDEO_SEGMENT_DEFAULTS,
-        condition_video_vdm_prompt,
-        describe_condition_video_segmented,
-    )
+    from capx.envs.tasks.robomme.robomme_env import CONDITION_VIDEO_SEGMENT_DEFAULTS
     from capx.llm.client import ModelQueryArgs, query_model
     from model_costs import cost_by_model, load_prices
 
@@ -93,48 +130,29 @@ def main(a: Args) -> int:
         low = instantiate(low_cfg)  # RoboMMEEnv: loads the episode and resets (no control steps)
         try:
             frames = list(low.handle.conditioning_frames("front"))
-            goal = low.handle.task_language
             if not frames:
                 print(f"{task}: no conditioning video")
                 continue
-            start = time.time()
-            description, log = describe_condition_video_segmented(query_model, vdm_args, goal, frames, **seg)
-            record = {"task": task, "episode": a.episode, "goal": goal, "total_frames": len(frames),
-                      "vdm_model": a.vdm_model, "settings": seg, "wall_s": round(time.time() - start, 2),
-                      "description": description, **log}
-            if a.also_single:
-                sampled = low.conditioning_frames()
-                t0 = time.time()
-                out = query_model(vdm_args, condition_video_vdm_prompt(goal, sampled, len(frames)))
-                record["single"] = {"n_frames": len(sampled), "latency_s": round(time.time() - t0, 2),
-                                    "usage": out.get("usage"), "finish_reason": out.get("finish_reason"),
-                                    "description": out.get("content")}
+            record = describe_task(query_model, vdm_args, low.handle.task_language, frames,
+                                   low.conditioning_frames(), seg, a.also_single)
+            record.update(task=task, episode=a.episode, vdm_model=a.vdm_model, max_tokens=vdm_args.max_tokens)
             stem = f"{task}_ep{a.episode}"
             (out_dir / f"{stem}.json").write_text(json.dumps(record, indent=2, default=str))
-            md = [f"# {task} episode {a.episode}", "", f"Goal: {goal}", "",
-                  f"{len(frames)} frames; settings {seg} -> stride {log['segmentation']['stride']}, "
-                  f"{log['segmentation']['n_segments']} parts, {len(log['vdm_calls'])} VDM calls, "
-                  f"{record['wall_s']} s", "", "## Description (as inserted into the first prompt)", "",
-                  "```text", description, "```", ""]
-            for p in log["parts"]:
-                md += [f"## Part {p['part']} raw reply (frames {p['first'] + 1}-{p['last'] + 1})", "",
-                       "```text", p["reply"], "```", ""]
-            if a.also_single:
-                md += ["## Single-call description (32 sampled frames)", "", "```text",
-                       str(record["single"]["description"]), "```", ""]
-            (out_dir / f"{stem}.md").write_text("\n".join(md))
+            write_markdown(out_dir / f"{stem}.md", record)
             if a.save_frames:
                 fdir = out_dir / f"{stem}_frames"
                 fdir.mkdir(exist_ok=True)
-                for i in log["frame_indices"]:
+                for i in record["frame_indices"]:
                     Image.fromarray(frames[i]).save(fdir / f"frame_{i + 1:04d}.png")
-            usages = [c["usage"] for c in log["vdm_calls"]] + (
-                [record["single"]["usage"]] if a.also_single else [])
-            p_tok = sum(_tokens(u)[0] for u in usages)
-            c_tok = sum(_tokens(u)[1] for u in usages)
-            cost = cost_by_model({a.vdm_model: {"prompt": p_tok, "completion": c_tok}}, prices)["total"]
-            summary.append(f"{task}: {len(log['vdm_calls'])} calls, {record['wall_s']} s, "
-                           f"tokens {p_tok:,} in / {c_tok:,} out, ${cost:.3f} -> {out_dir / (stem + '.md')}")
+            parts = []
+            for name, m in record["methods"].items():
+                cost = cost_by_model({a.vdm_model: {"prompt": m["prompt_tokens"],
+                                                    "completion": m["completion_tokens"]}}, prices)["total"]
+                parts.append(f"{name}: {m['calls']} calls, {m['wall_s']} s, tokens {m['prompt_tokens']:,} in / "
+                             f"{m['completion_tokens']:,} out, ${cost:.3f}")
+            cut = record.get("truncated_parts") or []
+            summary.append(f"{task}: " + "; ".join(parts) + (f"; TRUNCATED parts {cut}" if cut else "")
+                           + f" -> {out_dir / (stem + '.md')}")
             print(summary[-1])
         finally:
             try:
@@ -143,6 +161,27 @@ def main(a: Args) -> int:
                 pass
     (out_dir / "SUMMARY.txt").write_text("\n".join(summary) + "\n")
     return 0
+
+
+def write_markdown(path: Path, record: dict) -> None:
+    seg = record["settings"]
+    md = [f"# {record.get('task', '?')} episode {record.get('episode', '?')}", "", f"Goal: {record['goal']}", "",
+          f"{record['total_frames']} frames; method {record['method']}; settings {seg}; VDM max_tokens "
+          f"{record.get('max_tokens')}"]
+    for name, m in record["methods"].items():
+        md.append(f"- {name}: {m['calls']} calls, {m['wall_s']} s, {m['prompt_tokens']:,} / "
+                  f"{m['completion_tokens']:,} tokens")
+    if record.get("truncated_parts"):
+        md.append(f"- cut off at max_tokens (both attempts): parts {record['truncated_parts']}")
+    md += ["", "## Description (as inserted into the first prompt)", "", "```text", record["description"], "```", ""]
+    for p in record.get("parts") or []:
+        flag = " (cut off)" if p.get("truncated") else ""
+        md += [f"## Part {p['part']} raw reply (frames {p['first'] + 1}-{p['last'] + 1}){flag}", "",
+               "```text", p["reply"], "```", ""]
+    if "single" in record:
+        md += ["## Single-call description (comparison; sampled frames)", "", "```text",
+               str(record["single"]["description"]), "```", ""]
+    path.write_text("\n".join(md))
 
 
 if __name__ == "__main__":
