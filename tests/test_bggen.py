@@ -136,10 +136,50 @@ def test_libero_dump_structure_and_width(tmp_path):
     s = libero_mem.dump_structure(p)
     assert s["demos"] == 1 and s["lengths"]["demo_0"] == 5
     assert s["datasets"]["data/demo_0/states"]["shape"] == [5, 40]
-    assert s["gripper_width_demo0"]["max"] == pytest.approx(0.08)
+    assert s["gripper_first_demo"]["width_abs_sum"]["max"] == pytest.approx(0.08)
+    assert s["gripper_source"] == "obs/gripper_states"
     assert libero_mem.instruction_of(p).startswith("swap the 2 bowls")
     rot = np.array([[0, -1, 0], [1, 0, 0], [0, 0, 1.0]])
     assert np.allclose(libero_mem.world_to_base(np.array([1.0, 1.0, 1.0]), np.array([1.0, 0, 0]), rot), rot.T @ [0, 1, 1])
+
+
+def test_libero_dump_raw_layout_demo1_states_only(tmp_path):
+    """kubectl 1a: LIBERO-Mem-Raw demos start at demo_1 and hold only actions / init_state / states; the dump
+    used to list no dataset at all. Fingers are states[:, 8:10] (q1 negative): width = q0 - q1."""
+    import h5py
+
+    p = tmp_path / "raw.hdf5"
+    st = np.zeros((418, 90))
+    st[:, 8] = np.linspace(0.04, 0.0021, 418)
+    st[:, 9] = -st[:, 8]
+    with h5py.File(p, "w") as f:
+        for d in ("demo_1", "demo_2", "demo_10"):
+            g = f.create_group(f"data/{d}")
+            g.create_dataset("actions", data=np.zeros((418, 7)))
+            g.create_dataset("init_state", data=st[0])
+            g.create_dataset("states", data=st)
+    s = libero_mem.dump_structure(p)
+    assert s["first_demo"] == "demo_1" and s["demos"] == 3 and libero_mem.first_demo(p) == "demo_1"
+    assert set(s["datasets"]) == {"data/demo_1/actions", "data/demo_1/init_state", "data/demo_1/states"}
+    assert s["gripper_source"] == "states[:, 8:10]"
+    w = s["gripper_first_demo"]["width_abs_sum"]
+    assert w["max"] == pytest.approx(0.08) and w["min"] == pytest.approx(0.0042)
+    assert np.allclose(libero_mem.gripper_width(np.array([[0.02, -0.02], [0.02, 0.02]])), [0.04, 0.04])
+
+
+def test_final_goal_relations_of_a_sequence():
+    swap = [[(("on", "A", "pA"),), (("on", "B", "pB"),), (("on", "A", "pC"),)]]
+    assert libero_mem.final_goal_preds(swap) == [[("on", "A", "pC"), ("on", "B", "pB")]]
+
+    class Src:
+        def goal_state(self):
+            return [["sequence", ["on", "A", "pA"], ["on", "B", "pB"], ["on", "A", "pC"]]]
+
+        def eval_predicate(self, p):
+            return tuple(p) in {("on", "A", "pC"), ("on", "B", "pB")}
+
+    g = libero_mem.goal_success(Src())
+    assert g["success"] and g["branches"] == [{"on A pC": True, "on B pB": True}]
 
 
 def test_episode_roundtrip_causal_and_no_truth(tmp_path):
@@ -158,7 +198,8 @@ def test_episode_roundtrip_causal_and_no_truth(tmp_path):
 
 def test_gripper_events_swap():
     w = make_world()
-    ev = gripper_events(np.array(w.width), EventConfig(), None, np.stack(w.eef))
+    assert [e.kind for e in gripper_events(np.array(w.width), EventConfig())] == ["close", "release"] * 3  # width alone: unknown
+    ev = gripper_events(np.array(w.width), EventConfig(closed_width=0.0), None, np.stack(w.eef))
     kinds = [e.kind for e in ev]
     assert kinds == ["grasp", "release"] * 3
     for e, g in zip([e for e in ev if e.kind == "grasp"], w.grasp_t):
@@ -169,8 +210,26 @@ def test_gripper_events_swap():
 
 def test_gripper_close_empty_and_open():
     width = np.r_[np.full(10, 0.08), np.linspace(0.08, 0.0, 10), np.zeros(10), np.linspace(0, 0.08, 10), np.full(10, 0.08)]
-    kinds = [e.kind for e in gripper_events(width, EventConfig())]
+    kinds = [e.kind for e in gripper_events(width, EventConfig(closed_width=0.0))]
     assert kinds == ["close_empty", "open"]
+    # LIBERO-Mem (kubectl 1a): a bowl-rim grasp stops at 4.2-5.6 mm, the same as an empty close (4.2 mm):
+    # with closed_width unknown both are "close" (decided later by co-motion), never "close_empty"
+    rim = np.r_[np.full(10, 0.08), np.linspace(0.08, 0.0042, 10), np.full(20, 0.0042), np.linspace(0.0042, 0.08, 10)]
+    assert [e.kind for e in gripper_events(rim, EventConfig())] == ["close", "release"]
+    assert [e.kind for e in gripper_events(rim, EventConfig(closed_width=0.0042))] == ["close_empty", "open"]
+
+
+def test_base_debounce_merges_short_stops_and_drops_short_moves():
+    fps = 30.0
+    # 1.0 m drive with two 0.5 s pauses (one move), a 2 s stop, then a 3 cm shuffle (dropped)
+    x = np.r_[np.zeros(30), np.linspace(0, 0.4, 40), np.full(15, 0.4), np.linspace(0.4, 0.7, 30), np.full(15, 0.7),
+              np.linspace(0.7, 1.0, 30), np.full(60, 1.0), np.linspace(1.0, 1.03, 20), np.full(60, 1.03)]
+    T = np.tile(np.eye(4), (len(x), 1, 1))
+    T[:, 0, 3] = x
+    raw = base_events(T, fps, EventConfig(base_min_stop_s=0.0, base_min_move_m=0.0))
+    ev = base_events(T, fps, EventConfig())
+    assert len(raw) > len(ev) and [e.kind for e in ev] == ["base_start", "base_stop"]
+    assert ev[0].info["disp_m"] == pytest.approx(1.0, abs=0.05)
 
 
 def test_base_events_and_keyframes():
@@ -359,7 +418,9 @@ def test_swap_forward_matches_design(swap_run):
     root, out, w, s, brain = swap_run
     trace = _jsonl(out / "trace.jsonl")
     assert s["goal"]["final_satisfied"] and max(s["goal"]["done"]) == 3
-    assert s["events"]["grasp"] == 3 and s["events"]["release"] == 3
+    # LIBERO preset: width cannot tell a grasp, so closes are provisional and co-motion confirms all three
+    assert s["events"]["close"] == 3 and s["events"]["release"] == 3
+    assert [c["result"] for c in s["grasp_checks"]] == ["confirmed"] * 3
     # names stay with the objects (bowl_A was first on plate_B)
     assert s["init"]["notes"]["orig(bowl_A)"] == "plate_B" and s["init"]["notes"]["orig(bowl_B)"] == "plate_C"
     rel = [t for t in trace if t["event"]["kind"] == "release"]

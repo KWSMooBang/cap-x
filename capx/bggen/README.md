@@ -16,7 +16,7 @@ Branch `exp/agent-bg-gen` only: this code is not merged into bg or main. `capx/b
 |---|---|
 | `records.py` | `FrameRecord` / `CameraFrame` / `ArmState`; the on-disk episode format; `Episode` (causal image access; refuses `oracle` / `truth` / `task_info` attributes) |
 | `adapters/libero_mem.py`, `adapters/b1k.py` | benchmark data → `<root>/episode/` + `<root>/oracle/` (download only the needed files, dump the structure, prepare) |
-| `events.py` | per-arm gripper grasp / close_empty / release / open, base start / stop, keyframes every `keyframe_s` |
+| `events.py` | per-arm gripper events, base start / stop (debounced), keyframes every `keyframe_s`. A close is `grasp` / `close_empty` when the robot's fully-closed width is known (B1K). Otherwise it is `close`: the generator holds the nearest track provisionally and confirms or retracts it by co-motion (LIBERO-Mem: a bowl-rim grasp closes to 4–6 mm, the same as an empty hand). |
 | `perception.py` | SAM3 per category on any camera; depth path lifts masks to 3D (as bg_est2); 2D path keeps masks only. `FormatFakeDetector` (fixed boxes, smoke only) |
 | `tracks.py` | association, aliases from the image left, held objects follow the EEF, names from events (release place → last held object; late merges recorded) |
 | `vocab.py` | edge keys / statement text (`(on a b)`, `(inhand_left x)`, `(handempty)`); categories = bg_est2 `VOCABULARY_V2` + B1K (hot dog, refrigerator, microwave, countertop) with prompt candidates |
@@ -84,7 +84,7 @@ Swap task file: `KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_emp
 
 - **File ↔ task (ASSUMPTION):** HF files are numbered 1–10, and file 7 = cap-x `task_id` 6. `prepare` aborts if the instructions differ.
 - **README:** says only "initial states, proprioception, control actions".
-- **Layout (ASSUMED, LIBERO standard):** `data/demo_i/{actions, states, obs/{ee_pos, gripper_states, ...}}`, plus `data@problem_info`. `dump-libero` writes the real one.
+- **Layout (measured on kubectl 1a):** demos start at `demo_1` (120 demos). Each holds only `actions` (N, 7), `init_state` (90,) and `states` (N, 90); there is no `obs/`. `states` = robosuite [time, qpos …], so the fingers are `states[:, 8:10]` (q0 0.0021–0.040, q1 −0.040 to −0.0021). The default demo is the first one in the file.
 
 Replay:
 
@@ -94,7 +94,10 @@ Replay:
 Fields:
 
 - **Camera:** cap-x `get_observation()` after each replayed state — agentview RGB, metric depth, K, camera pose in the robot base frame. `--wrist` adds eye-in-hand.
-- **Proprio:** HDF5 `obs/ee_pos` (world grip site → base frame) and `gripper_states` (width = q0 − q1).
+- **Proprio:**
+  - EEF: HDF5 `obs/ee_pos` if present, else cap-x `robot_cartesian_pos` + bg_est2's TCP offset.
+  - Fingers: `obs/gripper_states`, else the replayed sim qpos[7:9] (= `states[:, 8:10]`). Width = |q0| + |q1| = q0 − q1, 0.0042–0.080 m.
+- **Success:** the BDDL goal's final relations evaluated on the last state (`goal_success`). The LIBERO-Mem subgoal tracker does not advance under state replay; its value is kept as `tracker_success`.
 - **Oracle:** `OracleEstimator` keys evaluated by `LiberoMemSource` (on / in / inhand), positions, subgoal tracker, `task_success`, grasp intervals.
 
 ### B1K: `behavior-1k/2025-challenge-demos`, task-0045 episode_00450010
@@ -130,7 +133,8 @@ Still ASSUMPTIONS (`prepare` / `check-episode` print a check for each):
 Oracle relations:
 
 - in / on / open / toggled_on come from the annotation timeline. They change at segment ends, so they are approximate.
-- inhand comes from task_info.
+- inhand: the task_info `in_gripper` flags are −1 throughout in the 2025 demos (kubectl 1b), so it comes from co-motion. An object within 12 cm of the EEF that moves with it holds; holding ends when they stop moving together (`comotion_inhand`). Doors are not covered.
+- Annotation ↔ task_info names: matched by when each object starts to move, during its pick segment.
 - Positions are world-frame from task_info. Annotation names (hotdog_207) are mapped to task_info names (hotdog.n.02_1) through in_gripper during each pick.
 
 ## Running
@@ -157,7 +161,14 @@ Models:
 
 ## Known limits
 
-- **Thresholds are guesses until step 1 dumps them.** Gripper-event widths (`configs.py` ASSUMPTION) and B1K SAM3 prompt candidates are unmeasured. B1K flat dz starts empty.
+- **Thresholds still unmeasured:**
+  - LIBERO-Mem fully-closed width: `closed_width=None`, so co-motion decides.
+  - B1K SAM3 prompt candidates.
+  - B1K flat dz (starts empty).
+- **Measured on kubectl:**
+  - B1K gripper events by width (right 3/3, left 2/2).
+  - Base debounce: stop ≥ 1 s, start-to-stop distance ≥ 0.05 m; `check-episode` prints raw vs debounced counts.
+- **Provisional grasps:** a `close` stays provisional until the hand has carried the object ≥ 2 cm from where it was. Articulated targets (fridge, microwave) are accepted without the test, because a door moves on an arc while the body stays.
 - **B1K hot dogs disappear inside closed doors.** The memory value is kept (? → mem).
 - **Detection on a moving head camera** uses 3D world association only (no appearance embedding yet). Objects out of view keep their last state.
 - **robot_rel is always computed.** The agent's choice covers observe / geometry / detect / look / hindsight.

@@ -61,12 +61,14 @@ def chat_url(url: str) -> str:
 class Usage:
     calls: int = 0
     failures: int = 0
-    prompt_tokens: int = 0
+    prompt_tokens: int = 0  # as the server reports (real APIs include image tokens; the fake server text only)
+    images: int = 0  # images sent (counted here, independent of the server)
     completion_tokens: int = 0
     seconds: float = 0.0
 
-    def add(self, usage: dict[str, Any] | None, seconds: float, ok: bool = True) -> None:
+    def add(self, usage: dict[str, Any] | None, seconds: float, ok: bool = True, images: int = 0) -> None:
         self.calls += 1
+        self.images += images
         self.failures += 0 if ok else 1
         self.seconds += seconds
         if usage:
@@ -75,6 +77,11 @@ class Usage:
 
     def to_dict(self) -> dict[str, Any]:
         return {**self.__dict__, "seconds": round(self.seconds, 1)}
+
+
+def count_images(messages: list[dict[str, Any]]) -> int:
+    return sum(1 for m in messages if isinstance(m.get("content"), list)
+               for p in m["content"] if isinstance(p, dict) and p.get("type") == "image_url")
 
 
 class ChatClient:
@@ -106,7 +113,7 @@ class ChatClient:
                 msg = body["choices"][0]["message"]
                 out = {"content": msg.get("content") or "", "usage": body.get("usage"),
                        "finish_reason": body["choices"][0].get("finish_reason"), "model": body.get("model", self.cfg.model)}
-                self.usage.add(out["usage"], time.time() - t0)
+                self.usage.add(out["usage"], time.time() - t0, images=count_images(messages))
                 return out
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
                 last = exc

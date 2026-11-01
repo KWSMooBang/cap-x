@@ -3,7 +3,7 @@
 #
 #   bash scripts/bggen/kubectl_runbook.sh <step>     step = 1a 1b 2 3 4 (in this order), or "all"
 #
-#   1a  data, LIBERO-Mem (CPU ok): download the swap HDF5 only, dump its structure, replay + render demo_0
+#   1a  data, LIBERO-Mem (CPU ok): download the swap HDF5 only, dump its structure, replay + render the first demo (DEMO=demo_k to choose)
 #       (agentview RGB-D, K, camera pose, proprio from the HDF5) and the simulator oracle. Needs the LIBERO-Mem venv.
 #       CHECKS: structure.json (datasets / attrs / gripper range), prep JSON (replay mode, eef drift HDF5 vs cap-x,
 #       success), check-episode (gripper events = 3 grasp + 3 release, depth range, camera height).
@@ -25,15 +25,22 @@ OUT=${OUT:-/workspace/cap-bg/outputs/agent-bg-gen}
 PY=${PY:-$REPO/.venv/bin/python}                       # main venv (uv sync): huggingface_hub, pandas, pyarrow, SAM3 client
 PY_LM=${PY_LM:-$REPO/.venv-libero-mem/bin/python}      # LIBERO-Mem venv (docs/memory-benchmarks.md)
 LM_H5=KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_plate_demo.hdf5
-LM_EP=$OUT/episodes/libero_mem_t06_demo0
 B1K_EP=$OUT/episodes/b1k_t45_e00450010
-DEMO=${DEMO:-demo_0}
 cd "$REPO"
 mkdir -p "$OUT"/{data,episodes,runs,logs}
+
+# DEMO: the first demo in the file unless set (LIBERO-Mem-Raw starts at demo_1); the episode folder carries its name
+lm_ep() {
+  if [ -z "${DEMO:-}" ]; then
+    DEMO=$($PY -m capx.bggen.cli first-demo --h5 "$OUT/data/libero_mem/$LM_H5")
+  fi
+  LM_EP=$OUT/episodes/libero_mem_t06_${DEMO}
+}
 
 step_1a() {
   $PY -m capx.bggen.cli download-libero --dest "$OUT/data/libero_mem"
   $PY -m capx.bggen.cli dump-libero --h5 "$OUT/data/libero_mem/$LM_H5" --out "$OUT/data/libero_mem/structure.json" | head -80
+  lm_ep
   # GPU node: EGL; CPU: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1
   MUJOCO_GL=${MUJOCO_GL:-egl} PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-egl} \
     $PY_LM -m capx.bggen.cli prep-libero --h5 "$OUT/data/libero_mem/$LM_H5" --demo "$DEMO" --root "$LM_EP" --task-id 6 --wrist \
@@ -49,6 +56,7 @@ step_1b() {
 }
 
 step_2() {
+  lm_ep
   $PY -m capx.bggen.cli run --root "$LM_EP" --out "$OUT/runs/smoke_libero" --benchmark libero_mem --mode A \
     --fake-models --detector format_fake | tee "$OUT/logs/smoke_libero.json"
   $PY -m capx.bggen.cli run --root "$B1K_EP" --out "$OUT/runs/smoke_b1k" --benchmark b1k --mode A \
@@ -70,6 +78,7 @@ sam3_up() {
 step_3() {
   : "${NEBIUS_SERVER_URL:?set NEBIUS_SERVER_URL (or BGGEN_<ROLE>_URL)}"
   sam3_up
+  lm_ep
   $PY -m capx.bggen.cli run --root "$LM_EP" --out "$OUT/runs/real_libero_A" --benchmark libero_mem --mode A \
     | tee "$OUT/logs/real_libero.json"
   $PY -m capx.bggen.cli run --root "$B1K_EP" --out "$OUT/runs/real_b1k_A" --benchmark b1k --mode A \
@@ -77,6 +86,7 @@ step_3() {
 }
 
 step_4() {
+  lm_ep
   $PY -m capx.bggen.cli eval --root "$LM_EP" --out "$OUT/runs/real_libero_A"
   $PY -m capx.bggen.cli eval --root "$B1K_EP" --out "$OUT/runs/real_b1k_A"
 }

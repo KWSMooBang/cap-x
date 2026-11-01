@@ -126,8 +126,9 @@ def segments(rows: Sequence[Any], categories: dict[str, str]) -> list[Segment]:
     out: list[Segment] = []
     open_seg: dict[Any, Segment] = {}
     for i, r in enumerate(rows):
-        if r.kind in ("grasp", "close_empty") and r.obj:
-            kind = "articulated" if categories.get(r.obj) in OPENABLE_KEYS or r.kind == "close_empty" else "object"
+        if r.kind in ("grasp", "close", "close_empty") and r.obj:
+            empty = r.kind == "close_empty" or "grasp_retracted" in r.notes
+            kind = "articulated" if categories.get(r.obj) in OPENABLE_KEYS or empty else "object"
             open_seg[r.arm] = Segment(r.t, r.t, r.arm, r.obj, kind, i, i)
         elif r.kind in ("release", "open") and r.arm in open_seg:
             s = open_seg.pop(r.arm)

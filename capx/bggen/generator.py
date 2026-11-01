@@ -64,7 +64,12 @@ class GenConfig:
     max_belief_items: int = 12
     lift_dz: float = 0.03  # m: EEF this much above its grasp height -> lifted
     touch_radius: float = 0.10  # m: objects this close to the EEF at a gripper event count as touched
-    agent_on: tuple[str, ...] = ("grasp", "release", "close_empty", "open", "keyframe", "base_stop", "end")
+    agent_on: tuple[str, ...] = ("grasp", "close", "release", "close_empty", "open", "keyframe", "base_stop", "end")
+    # ``close`` (grasp unknown from the gripper width): the nearest track is held provisionally and confirmed or
+    # retracted once the EEF has moved ``verify_move`` m: confirmed if it is detected at the hand, retracted if it
+    # is detected where it was (left behind).
+    verify_move: float = 0.03  # m of EEF motion before a provisional grasp is checked (LIBERO lifts: 0.03-0.07 m)
+    verify_sep: float = 0.02  # m: the "moved with the hand" and "stayed" positions must be this far apart
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
     init_retry: int = 1
     cook_s: float | None = None  # process model: in(X, C) and toggled_on(C) this long -> cooked(X) 0.7 mem
@@ -112,6 +117,8 @@ def _event_text(e: Event, held: dict[str, str | None]) -> str:
     arm = f" ({e.arm} arm)" if e.arm else ""
     if e.kind == "grasp":
         return f"the gripper{arm} closed on {e.obj or 'an unidentified object'}"
+    if e.kind == "close":
+        return f"the gripper{arm} closed, probably on {e.obj or 'an unidentified object'} (confirmed when it moves with the hand)"
     if e.kind == "release":
         return f"the gripper{arm} opened and let go of {e.obj or 'the held object'}"
     if e.kind == "close_empty":
@@ -150,6 +157,8 @@ class Generator:
         self.redetects: list[dict[str, Any]] = []
         self.touched_at: dict[str, int] = {}
         self.grasp_z: dict[str, float] = {}
+        self.pending_grasp: dict[str, dict[str, Any]] = {}  # arm -> provisional grasp of a ``close`` event
+        self.grasp_checks: list[dict[str, Any]] = []
         self.cook_since: dict[EdgeKey, tuple[str, int]] = {}  # cooked key -> (container, start)
         self.prev_image: dict[str, str] = {}  # cam -> last marked image (data URL)
         self.events: list[Event] = []
@@ -566,7 +575,7 @@ class Generator:
             self.tracker.follow(k, fr.eef_world(k))
         main = fr.cams.get(cfg.camera)
         # robot-state events first: grasp target needs the tracks as they were before this frame's detection
-        if e.kind == "grasp" and arm_key is not None:
+        if e.kind in ("grasp", "close") and arm_key is not None:
             px = self._eef_pixel(main, fr, arm_key) if main is not None else None
             target, dist = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, px)
             rec["grasp"] = {"target": target, "distance": dist}
@@ -575,11 +584,21 @@ class Generator:
                 self.tracker.hold(target, arm_key, fr.eef_world(arm_key))
                 self.grasp_z[arm_key] = float(fr.eef_world(arm_key)[2])
                 e.obj = target
-                self.graph.events.append(f"robot -grasp-> {target} @{e.t}" + (f" (from {frm})" if frm else ""))
+                self.graph.events.append(f"robot -grasp-> {target} @{e.t}" + (f" (from {frm})" if frm else "")
+                                         + (" (provisional)" if e.kind == "close" else ""))
+                if e.kind == "close":
+                    tr = self.tracker.tracks[target]
+                    self.pending_grasp[arm_key] = {"obj": target, "t": e.t, "row": len(self.rows),
+                                                   "eef0": np.asarray(fr.eef_world(arm_key), float),
+                                                   "pos0": None if tr.pos is None else tr.pos.copy()}
         elif e.kind in ("release", "open") and arm_key is not None:
             px = self._eef_pixel(main, fr, arm_key) if main is not None else None
             e.obj = self.tracker.release(arm_key, e.t, fr.eef_world(arm_key), px)
             self.grasp_z.pop(arm_key, None)
+            pend = self.pending_grasp.pop(arm_key, None)
+            if pend is not None:
+                self.grasp_checks.append({"arm": arm_key, "obj": pend["obj"], "t": pend["t"], "result": "unverified",
+                                          "decided_t": e.t})
             if e.obj:
                 self.graph.events.append(f"robot -release-> {e.obj} @{e.t}")
         elif e.kind == "close_empty" and arm_key is not None:
@@ -604,6 +623,11 @@ class Generator:
             self._trace(e, row, {"error": f"no image of camera {cfg.camera}"})
             return row
         dets = self._detect(main, self.categories, e.t)
+        checks = self._verify_grasps(fr, main, dets, e.t)
+        if checks:
+            rec["grasp_verify"] = checks
+            if any(c["result"] == "retracted" for c in checks):
+                robot_keys |= self._robot_state(fr, e.t)
         rec["track"] = self.tracker.update(e.t, main.name, dets, self._img_base(main), [c.key for c in self.categories])
         for a in self.tracker.tracks:
             self.marks.assign(a, self.tracker.tracks[a].category)
@@ -715,6 +739,54 @@ class Generator:
         self._trace(e, row, rec)
         return row
 
+    def _verify_grasps(self, fr: FrameRecord, cam: CameraFrame, dets: Sequence[Detection], t: int) -> list[dict[str, Any]]:
+        """Co-motion check of provisional grasps (``close`` events): after the EEF moved ``verify_move``, the object
+        detected at the hand -> confirmed; detected where it was and not at the hand -> retracted (it was not held)."""
+        out = []
+        base = self._img_base(cam)
+        for arm, pend in list(self.pending_grasp.items()):
+            eef = np.asarray(fr.eef_world(arm), float)
+            if np.linalg.norm(eef - pend["eef0"]) < self.cfg.verify_move:
+                continue
+            tr = self.tracker.tracks.get(pend["obj"])
+            if tr is None:
+                self.pending_grasp.pop(arm)
+                continue
+            r = self.cfg.tracks.assoc_radius
+            lifted = float(eef[2] - pend["eef0"][2]) >= self.cfg.lift_dz
+            if tr.category in OPENABLE_KEYS:
+                # a door / lid moves on an arc and the body does not move: co-motion of the body is no test
+                result = "articulated"
+            elif tr.pos is None or pend["pos0"] is None or np.linalg.norm(tr.pos - pend["pos0"]) < self.cfg.verify_sep:
+                continue  # the hand is still too close to where the object was: ambiguous
+            else:
+                ws = [w for d in dets if d.category == tr.category and (w := Tracker._world(d, base)) is not None]
+                d_hand = [float(np.linalg.norm(w - tr.pos)) for w in ws]
+                d_old = [float(np.linalg.norm(w - pend["pos0"])) for w in ws]
+                # each detection votes for the nearer hypothesis: moved with the hand, or still where it was
+                at_hand = any(h <= r and h < o for h, o in zip(d_hand, d_old, strict=True))
+                left = any(o <= r and o <= h for h, o in zip(d_hand, d_old, strict=True))
+                if at_hand:
+                    result = "confirmed"
+                elif not left and lifted:
+                    result = "confirmed_lifted"  # the hand rose and the old place is empty (object hidden in the hand)
+                elif not left:
+                    continue  # not detected: decide at a later event
+                else:
+                    result = "retracted"
+            if result == "retracted":
+                tr.held_by, tr.hold_offset, tr.pos = None, None, pend["pos0"]
+                self.grasp_z.pop(arm, None)
+                self.graph.events.append(f"robot -grasp-> {pend['obj']} @{pend['t']} retracted @{t} (not moved with the hand)")
+                if pend["row"] < len(self.rows):
+                    self.rows[pend["row"]].notes.append("grasp_retracted")  # backward: a close, not a grasp
+            self.pending_grasp.pop(arm)
+            c = {"arm": arm, "obj": pend["obj"], "t": pend["t"], "result": result, "decided_t": t,
+                 "eef_moved_m": round(float(np.linalg.norm(eef - pend["eef0"])), 3)}
+            self.grasp_checks.append(c)
+            out.append(c)
+        return out
+
     def _observe_apply(self, vals: dict[EdgeKey, str], t: int, touched: dict[str, int], geom: dict[EdgeKey, Any],
                        hidden: set[str]) -> set[EdgeKey]:
         # R7 needs "touched after this key's last observation": per key, the aliases touched since then
@@ -805,7 +877,13 @@ class Generator:
             for d in tline.get("decisions", []):
                 rules[d["rule"]] = rules.get(d["rule"], 0) + 1
         b = self.goal.best()
+        reasons: dict[str, int] = {}
+        for tline in self.trace:
+            r = (tline.get("plan") or {}).get("fallback_reason")
+            if r:
+                reasons[r] = reasons.get(r, 0) + 1
         return {"events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
+                "agent_fallback_reasons": reasons, "grasp_checks": self.grasp_checks,
                 "verifier_rules": rules, "redetects": self.redetects, "merges": self.tracker.merges,
                 "tracks": [t.to_dict() for t in self.tracker.tracks.values()],
                 "goal": {"branches": [[[statement_text(k) for k in s] for s in br] for br in self.goal.branches],

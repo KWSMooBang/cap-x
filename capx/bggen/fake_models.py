@@ -115,6 +115,13 @@ class FakeBrain:
         return getattr(self, role)(messages)
 
 
+def fake_usage(messages: list[dict[str, Any]], content: str) -> dict[str, Any]:
+    """Text-only token estimate (chars / 4). Images are NOT counted as text (their base64 would inflate the
+    count ~1000x); they are reported as ``images`` and their tokens are left to the real API's count."""
+    return {"prompt_tokens": len(_texts(messages)) // 4, "completion_tokens": len(content) // 4,
+            "images": len(_images(messages)), "fake": True}
+
+
 def make_handler(brain: FakeBrain) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:  # noqa: N802
@@ -122,7 +129,7 @@ def make_handler(brain: FakeBrain) -> type[BaseHTTPRequestHandler]:
             content = brain.reply(body.get("model", ""), body.get("messages", []))
             data = json.dumps({"model": body.get("model"), "choices": [{"message": {"role": "assistant", "content": content},
                                                                         "finish_reason": "stop"}],
-                               "usage": {"prompt_tokens": len(json.dumps(body)) // 4, "completion_tokens": len(content) // 4}})
+                               "usage": fake_usage(body.get("messages", []), content)})
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))

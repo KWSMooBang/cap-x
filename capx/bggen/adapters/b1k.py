@@ -19,7 +19,8 @@ see ``meta/episodes/.../episode_*.json`` ``scene_file.versions``):
   ``depth_to_pcd`` rotates it by 180 deg about x to OpenCV axes (done here).
   ASSUMPTION (order and quaternion convention): ``prepare`` checks that the head camera sits 1.0-2.0 m
   above the base and looks forward-down, and records the check in ``meta.json``.
-* ``observation.task_info`` (oracle only): per task object, in ``meta/episodes`` ``task_obs_keys`` order,
+* ``observation.task_info`` (oracle only; the in_gripper flags are -1 throughout in the 2025 demos, so inhand
+  comes from object / EEF co-motion -- ``comotion_inhand``): per task object, in ``meta/episodes`` ``task_obs_keys`` order,
   ``*_real`` (1), ``*_pos`` (3, world), ``*_ori_cos`` (3), ``*_ori_sin`` (3), ``*_in_gripper_left`` (1),
   ``*_in_gripper_right`` (1); the agent has no in_gripper fields. ASSUMPTION: sizes 1/3/3/3/1/1 -- checked
   against the vector length, the oracle positions are switched off on a mismatch.
@@ -320,6 +321,45 @@ def prepare(src: str | Path, root: str | Path, task: int = TASK_INDEX, episode: 
     return dump
 
 
+def comotion_inhand(obj_pos: dict[str, np.ndarray], eef_world: dict[str, np.ndarray], window: int = 15,
+                    near: float = 0.12, move: float = 0.02) -> dict[str, list[str | None]]:
+    """Per arm and frame, the object held by co-motion (the task_info in_gripper flags are not filled in the
+    2025 demos: all -1). An object starts being held when it is within ``near`` m of the EEF and moved more
+    than ``move`` m over ``window`` frames together with the EEF (displacements differ by less than ``move``);
+    it stays held while within 1.5 x ``near`` and the two keep moving together (a pause while holding keeps it;
+    the hand moving ``move`` m away from a still object over ``window`` frames ends it -- the release is seen up
+    to ``window`` frames late). Doors / fixed parts never move as a body: not covered."""
+    n = len(next(iter(eef_world.values())))
+    out: dict[str, list[str | None]] = {}
+    for arm, eef in eef_world.items():
+        held: str | None = None
+        seq: list[str | None] = []
+        for t in range(n):
+            if held is not None:
+                p = obj_pos[held]
+                apart = t >= window and np.linalg.norm((p[t] - p[t - window]) - (eef[t] - eef[t - window])) > move
+                if np.linalg.norm(p[t] - eef[t]) > 1.5 * near or apart:
+                    held = None
+            if held is None and t >= window:
+                for o, p in obj_pos.items():
+                    if any(len(v) > t and v[t] == o for a2, v in out.items() if a2 != arm):
+                        continue  # held by the other arm
+                    dp, de = p[t] - p[t - window], eef[t] - eef[t - window]
+                    if (np.linalg.norm(p[t] - eef[t]) <= near and np.linalg.norm(dp) > move
+                            and np.linalg.norm(dp - de) < move):
+                        held = o
+                        break
+            seq.append(held)
+        out[arm] = seq
+    return out
+
+
+def movement_onset(p: np.ndarray, dist: float = 0.05) -> int | None:
+    d = np.linalg.norm(p - p[0], axis=1)
+    i = np.flatnonzero(d > dist)
+    return int(i[0]) if len(i) else None
+
+
 def _write_b1k_oracle(src: Path, root: Path, df: Any, n: int, task: int, ep: str, dump: dict[str, Any]) -> None:
     from ..oracle import write_oracle
 
@@ -329,46 +369,72 @@ def _write_b1k_oracle(src: Path, root: Path, df: Any, n: int, task: int, ep: str
     keys = meta.get("task_obs_keys", [])
     lay = task_info_layout(keys)
     ok = dump["task_info"]["layout_ok"]
-    ti = np.stack(df["observation.task_info"].to_numpy()[:n]) if ok else None
+    ti = np.stack(df["observation.task_info"].to_numpy()[:n]).astype(np.float64) if ok else None
     bddl = sorted({re.sub(r"_(real|pos|ori_cos|ori_sin|in_gripper_left|in_gripper_right)$", "", k) for k in keys})
-    # annotation names (hotdog_207) <-> task_info names (hotdog.n.02_1): the one whose in_gripper flag
-    # turns on during the annotation's "pick up from" segment
+    bpos = {b: ti[:, r[0]:r[1]] for b in bddl if ti is not None and (r := lay.get(f"{b}_pos")) is not None}
+    flag_cols = [r for k, r in lay.items() if "_in_gripper_" in k]
+    flags_filled = ti is not None and any(ti[:, r[0]].max() > 0.5 for r in flag_cols)
+    # annotation names (hotdog_207) <-> task_info names (hotdog.n.02_1): the same-category object whose
+    # in_gripper flag turns on (flags filled) / whose position starts moving (flags empty) during the
+    # annotation's "pick up from" segment (nearest onset otherwise)
     ann_to_bddl: dict[str, str] = {}
     if ti is not None:
+        onset = {b: movement_onset(p) for b, p in bpos.items()}
         for s in segs:
-            if s["label"] != "pick up from" or not s["objects"]:
+            if s["label"] != "pick up from" or not s["objects"] or s["objects"][0] in ann_to_bddl:
                 continue
             a = s["objects"][0]
-            for b in bddl:
-                rng = [lay.get(f"{b}_in_gripper_left"), lay.get(f"{b}_in_gripper_right")]
-                if (any(r is not None and ti[s["start"]:s["end"] + 1, r[0]].max() > 0.5 for r in rng)
-                        and category_of(b) == category_of(a) and b not in ann_to_bddl.values()):
-                    ann_to_bddl[a] = b
-                    break
+            cands = [b for b in bddl if category_of(b) == category_of(a) and b not in ann_to_bddl.values()]
+            pick = None
+            if flags_filled:
+                for b in cands:
+                    rng = [lay.get(f"{b}_in_gripper_left"), lay.get(f"{b}_in_gripper_right")]
+                    if any(r is not None and ti[s["start"]:s["end"] + 1, r[0]].max() > 0.5 for r in rng):
+                        pick = b
+                        break
+            if pick is None:
+                timed = [(abs(onset[b] - (s["start"] + s["end"]) / 2), b) for b in cands if onset.get(b) is not None]
+                pick = min(timed)[1] if timed else None
+            if pick is not None:
+                ann_to_bddl[a] = pick
         for b in bddl:  # single-instance categories (fridge, microwave)
             cat = category_of(b)
             names = {o for s in segs for o in s["objects"] if category_of(o) == cat}
             if cat and len(names) == 1 and len([x for x in bddl if category_of(x) == cat]) == 1:
                 ann_to_bddl.setdefault(names.pop(), b)
     objects = {o: category_of(o) for s in segs for o in s["objects"] if category_of(o)}
+    inhand_seq: dict[str, list[str | None]] = {}
+    inhand_source = "none"
+    if ti is not None and flags_filled:
+        inhand_source = "task_info in_gripper flags"
+    elif ti is not None:
+        st = np.stack(df["observation.state"].to_numpy()[:n])
+        p = parse_state(st)
+        eef_w = {arm: np.einsum("tij,tj->ti", p["base_pose"], np.c_[p[f"eef_pos_{arm}"], np.ones(n)])[:, :3]
+                 for arm in ("left", "right")}
+        movable = {a: bpos[b] for a, b in ann_to_bddl.items() if b in bpos and category_of(a) not in ("fridge", "microwave")}
+        inhand_seq = comotion_inhand(movable, eef_w) if movable else {}
+        inhand_source = "co-motion of task_info positions with the EEF (in_gripper flags unfilled)"
     states = []
     for t in range(0, n, 3):
         pos, inhand = {}, {"left": None, "right": None}
         if ti is not None:
             for a, b in ann_to_bddl.items():
-                r = lay.get(f"{b}_pos")
-                if r is not None:
-                    pos[a] = ti[t, r[0]:r[1]].tolist()
+                if b in bpos:
+                    pos[a] = bpos[b][t].tolist()
                 for arm in ("left", "right"):
-                    g = lay.get(f"{b}_in_gripper_{arm}")
-                    if g is not None and ti[t, g[0]] > 0.5:
+                    if flags_filled:
+                        g = lay.get(f"{b}_in_gripper_{arm}")
+                        if g is not None and ti[t, g[0]] > 0.5:
+                            inhand[arm] = a
+                    elif inhand_seq.get(arm) and inhand_seq[arm][t] == a:
                         inhand[arm] = a
         true = [list(k) for k in relations_at(timeline, t)]
         states.append({"t": t, "pos": pos, "true": true, "inhand": inhand if ti is not None else {}})
     rels = ["in", "on", "open", "toggled_on"] + (["inhand", "handempty"] if ti is not None else [])
     write_oracle(root, {"source": "b1k annotations + task_info", "frame": "world", "objects": objects, "relations": rels,
-                        "arms": ["left", "right"], "annotation_to_task_info": ann_to_bddl,
+                        "arms": ["left", "right"], "annotation_to_task_info": ann_to_bddl, "inhand_source": inhand_source,
                         "notes": ["on/in/open/toggled_on from skill_annotation, changing at segment ends (approximate)",
-                                  "inhand from task_info in_gripper flags; positions world frame from task_info"
+                                  f"inhand: {inhand_source}; positions world frame from task_info"
                                   + ("" if ti is not None else " -- DISABLED: task_info layout mismatch")]},
                  states, segs, {"success": None})

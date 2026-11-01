@@ -84,11 +84,13 @@ def report(s: dict[str, Any], rows: list[Any], rename: dict[str, str]) -> str:
     lines = [f"# BG generator report — {s.get('benchmark')} (mode {s.get('mode')})", "",
              f"Instruction: {s.get('instruction')}", f"Frames: {s.get('n_frames')} at {s.get('fps')} fps; rows: {s['rows']}", "",
              "## Events", ", ".join(f"{k} {v}" for k, v in sorted(s["events"].items())), "",
-             "## Model calls", "| role | model | calls | failures | prompt tok | completion tok | s |", "|---|---|---|---|---|---|---|"]
+             "## Model calls", "prompt tok = as reported by the server (real APIs include images; the FAKE server counts text only)",
+             "| role | model | calls | failures | images sent | prompt tok | completion tok | s |", "|---|---|---|---|---|---|---|---|"]
     for r, u in m.items():
-        lines.append(f"| {r} | {u.get('model')} | {u.get('calls')} | {u.get('failures')} | {u.get('prompt_tokens')} | "
+        lines.append(f"| {r} | {u.get('model')} | {u.get('calls')} | {u.get('failures')} | {u.get('images')} | {u.get('prompt_tokens')} | "
                      f"{u.get('completion_tokens')} | {u.get('seconds')} |")
-    lines += ["", f"Agent format failures -> fallback plan: {s['agent_fallbacks']}",
+    lines += ["", f"Agent format failures -> fallback plan: {s['agent_fallbacks']} {s.get('agent_fallback_reasons', {})}",
+              f"Provisional grasps (close events): {s.get('grasp_checks', [])}",
               f"Detector: {s['detector']}; re-detections: {len(s['redetects'])}; track merges: {len(s['merges'])}", "",
               "## Verifier decisions by rule", ", ".join(f"{k} {v}" for k, v in sorted(s["verifier_rules"].items())), "",
               "## Goal", f"branches: {s['goal']['branches']}", f"done per branch: {s['goal']['done']} at frames {s['goal']['done_t']}",

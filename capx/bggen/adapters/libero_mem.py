@@ -13,12 +13,13 @@ is assumed to be LIBERO's (``data/demo_<i>/{actions, states, obs/{ee_pos, grippe
   EEF with the recorded one).
 
 Proprio comes from the HDF5: ``obs/ee_pos`` (world, robosuite grip site) moved into the robot base frame
-with the simulator's base pose, ``obs/gripper_states`` (two finger joints) -> width q0 - q1. If missing,
+with the simulator's base pose, ``obs/gripper_states`` (two finger joints) -> width |q0| + |q1|. If missing,
 cap-x's ``robot_cartesian_pos`` (+ bg_est2's TCP offset) is used and the meta notes say so.
 
 Oracle per sampled frame: ``OracleEstimator._candidates`` keys (on over objects / fixtures / table, in over
 contain regions, inhand) evaluated by ``LiberoMemSource`` (BDDL predicates + contacts), object positions
-(base frame), the LIBERO-Mem subgoal tracker, final ``task_success``. Grasp intervals (simulator grasp
+(base frame), the LIBERO-Mem subgoal tracker; success = the BDDL goal's final relations evaluated on the
+last state (``goal_success``; the tracker does not advance under state replay and is kept as ``tracker_success``). Grasp intervals (simulator grasp
 check) -> subtask boundary segments.
 
 Needs the LIBERO-Mem venv and a renderer (CPU: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1).
@@ -38,6 +39,7 @@ REPO = "libero-mem/LIBERO-Mem-Raw"
 # env_configs/libero_mem/franka_libero_mem_6_swap_bowls.yaml). ``prepare`` checks the instruction.
 SWAP_FILE = "KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_plate_demo.hdf5"
 SWAP_TASK_ID = 6
+FINGER_QPOS = slice(7, 9)  # Panda finger joints in sim.data.qpos (states[:, 8:10]); width = q0 - q1 = |q0| + |q1|
 SWAP_INSTRUCTION = "swap the 2 bowls on their plates using the empty plate"
 
 
@@ -51,30 +53,56 @@ def dump_structure(h5path: str | Path, max_attr: int = 400) -> dict[str, Any]:
     import h5py
 
     out: dict[str, Any] = {"file": str(h5path), "datasets": {}, "attrs": {}}
-
-    def visit(name: str, obj: Any) -> None:
-        if isinstance(obj, h5py.Dataset) and name.count("/") <= 3 and (
-                name.startswith("data/demo_0/") or not name.startswith("data/demo_")):
-            out["datasets"][name] = {"shape": list(obj.shape), "dtype": str(obj.dtype)}
-        for k, v in obj.attrs.items():
-            if name.startswith("data/demo_") and not name.startswith("data/demo_0"):
-                continue
-            s = v.decode() if isinstance(v, bytes) else str(v)
-            out["attrs"][f"{name}@{k}"] = s[:max_attr]
-
     with h5py.File(h5path, "r") as f:
+        demos = list_demos(f)
+        first = demos[0] if demos else None
+        out["demos"], out["first_demo"] = len(demos), first
+
+        def visit(name: str, obj: Any) -> None:
+            # every dataset outside data/, and those of the first demo (all demos share the layout)
+            other_demo = name.startswith("data/demo_") and (first is None or not (name == f"data/{first}"
+                                                                                  or name.startswith(f"data/{first}/")))
+            if other_demo:
+                return
+            if isinstance(obj, h5py.Dataset):
+                out["datasets"][name] = {"shape": list(obj.shape), "dtype": str(obj.dtype)}
+            for k, v in obj.attrs.items():
+                s = v.decode() if isinstance(v, bytes) else str(v)
+                out["attrs"][f"{name}@{k}"] = s[:max_attr]
+
         f.visititems(visit)
         for k, v in f.attrs.items():
             out["attrs"][f"/@{k}"] = str(v)[:max_attr]
-        demos = sorted(f["data"].keys(), key=lambda s: int(s.split("_")[-1])) if "data" in f else []
-        out["demos"] = len(demos)
         out["lengths"] = {d: int(f[f"data/{d}/actions"].shape[0]) for d in demos[:200] if f"data/{d}/actions" in f}
-        if demos and f"data/{demos[0]}/obs/gripper_states" in f:
-            g = np.asarray(f[f"data/{demos[0]}/obs/gripper_states"])
-            w = g[:, 0] - g[:, 1] if g.shape[1] >= 2 else g[:, 0]
-            out["gripper_width_demo0"] = {"min": float(w.min()), "max": float(w.max()),
-                                          "p10": float(np.percentile(w, 10)), "p50": float(np.median(w))}
+        g = None
+        if first and f"data/{first}/obs/gripper_states" in f:
+            g, out["gripper_source"] = np.asarray(f[f"data/{first}/obs/gripper_states"], np.float64), "obs/gripper_states"
+        elif first and f"data/{first}/states" in f:  # robosuite flattened state [time, qpos...]: fingers qpos[7:9]
+            g, out["gripper_source"] = np.asarray(f[f"data/{first}/states"], np.float64)[:, 8:10], "states[:, 8:10]"
+        if g is not None:
+            w = gripper_width(g)
+            out["gripper_first_demo"] = {
+                "fingers": [{"min": float(g[:, i].min()), "max": float(g[:, i].max())} for i in range(g.shape[1])],
+                "width_abs_sum": {"min": float(w.min()), "max": float(w.max()), "p10": float(np.percentile(w, 10)),
+                                  "p50": float(np.median(w))}}
     return out
+
+
+def list_demos(f: Any) -> list[str]:
+    """Demo groups in numeric order (LIBERO-Mem-Raw starts at demo_1)."""
+    if "data" not in f:
+        return []
+    return sorted((k for k in f["data"] if k.startswith("demo_")), key=lambda s: int(s.split("_")[-1]))
+
+
+def first_demo(h5path: str | Path) -> str:
+    import h5py
+
+    with h5py.File(h5path, "r") as f:
+        demos = list_demos(f)
+    if not demos:
+        raise RuntimeError(f"no demo_* group in {h5path}")
+    return demos[0]
 
 
 def instruction_of(h5path: str | Path) -> str | None:
@@ -91,15 +119,46 @@ def instruction_of(h5path: str | Path) -> str | None:
 
 
 def gripper_width(gs: np.ndarray) -> np.ndarray:
+    """Finger opening = |q0| + |q1|: right for both sign conventions of the second finger joint
+    (robosuite Panda: q1 negative when open; some exports store both positive)."""
     gs = np.asarray(gs, np.float64)
-    return gs[:, 0] - gs[:, 1] if gs.ndim == 2 and gs.shape[1] >= 2 else gs.reshape(-1)
+    return np.abs(gs[:, 0]) + np.abs(gs[:, 1]) if gs.ndim == 2 and gs.shape[1] >= 2 else np.abs(gs.reshape(-1))
+
+
+def final_goal_preds(branches: Any) -> list[list[tuple]]:
+    """Per goal branch, the relations that must hold at the end: steps applied in order, a later on / in of
+    the same object replaces the earlier one (swap: A->plate_A, B->plate_B, A->plate_C => A on plate_C, B on
+    plate_B). Repeats ("3 times") collapse to the final arrangement (the count is not checked)."""
+    out = []
+    for b in branches:
+        loc: dict[str, tuple] = {}
+        other: list[tuple] = []
+        for step in b:
+            for pr in step:
+                if pr[0] in ("on", "in") and len(pr) == 3:
+                    loc[pr[1]] = tuple(pr)
+                elif tuple(pr) not in other:
+                    other.append(tuple(pr))
+        out.append(list(loc.values()) + other)
+    return out
+
+
+def goal_success(src: Any) -> dict[str, Any]:
+    """Success from the final simulator state: some branch's final relations all hold (``eval_predicate``)."""
+    from capx.belief.progress import goal_branches
+
+    res = []
+    for preds in final_goal_preds(goal_branches(src.goal_state())):
+        vals = {" ".join(p): bool(src.eval_predicate(p)) for p in preds}
+        res.append(vals)
+    return {"success": any(all(v.values()) for v in res if v), "branches": res}
 
 
 def world_to_base(p_world: np.ndarray, base_pos: np.ndarray, base_rot: np.ndarray) -> np.ndarray:
     return (np.asarray(p_world) - base_pos) @ base_rot  # rot.T @ (p - base) for row vectors
 
 
-def prepare(h5path: str | Path, root: str | Path, demo: str = "demo_0", task_id: int = SWAP_TASK_ID,
+def prepare(h5path: str | Path, root: str | Path, demo: str | None = None, task_id: int = SWAP_TASK_ID,
             image_stride: int = 2, oracle_stride: int = 2, wrist: bool = False, max_frames: int | None = None) -> dict[str, Any]:
     import h5py
 
@@ -111,6 +170,7 @@ def prepare(h5path: str | Path, root: str | Path, demo: str = "demo_0", task_id:
     from ..records import write_episode, write_image
 
     root = Path(root)
+    demo = demo or first_demo(h5path)
     with h5py.File(h5path, "r") as f:
         g = f[f"data/{demo}"]
         actions = np.asarray(g["actions"])
@@ -161,8 +221,10 @@ def prepare(h5path: str | Path, root: str | Path, demo: str = "demo_0", task_id:
         pr = proprio_from_obs(ob)
         capx_eef.append(pr[0] if pr else np.zeros(3))
         eef_b.append(world_to_base(ee_pos[t], bpos, brot) if ee_pos is not None else capx_eef[-1])
-        width.append(float(gripper_width(grip[t:t + 1])[0]) if grip is not None
-                     else float(ob["robot_cartesian_pos"][-1]) * float(getattr(low, "gripper_metric_length", 0.08)))
+        # finger joints: HDF5 obs/gripper_states if present, else the replayed simulator qpos[7:9] (= states[:, 8:10],
+        # robosuite flattened state [time, qpos...]; kubectl 1a: q0 0.0021..0.040, q1 -0.040..-0.0021)
+        fingers = grip[t:t + 1] if grip is not None else np.asarray(sim.data.qpos[FINGER_QPOS], np.float64)[None]
+        width.append(float(gripper_width(fingers)[0]))
         if t in keep:
             for c in cams:
                 im = ob[c]["images"]
@@ -185,7 +247,9 @@ def prepare(h5path: str | Path, root: str | Path, demo: str = "demo_0", task_id:
                     segs.append({"start": seg_start, "end": t, "label": "place", "objects": [grasped_prev]})
                     last_end, seg_start = t, None
                 grasped_prev = inh
-    success = bool(low.handle.task_success())
+    tracker_success = bool(low.handle.task_success())  # the subgoal tracker does not advance under state replay
+    goal = goal_success(src)
+    success = goal["success"]
     proprio = {"t": np.arange(n), "eef_pos_main": np.stack(eef_b), "gripper_main": np.asarray(width),
                "action": actions[:n]}
     meta = {"benchmark": "libero_mem", "episode_id": f"{Path(h5path).stem}/{demo}", "task_id": task_id,
@@ -193,7 +257,7 @@ def prepare(h5path: str | Path, root: str | Path, demo: str = "demo_0", task_id:
             "cameras": {c: {"depth": True} for c in cams}, "image_stride": image_stride, "replay": mode,
             "notes": ["eef: HDF5 obs/ee_pos (grip site) in the robot base frame" if ee_pos is not None else
                       "eef: cap-x robot_cartesian_pos + TCP offset (no obs/ee_pos in the file)",
-                      "gripper: HDF5 obs/gripper_states q0 - q1 (m)" if grip is not None else "gripper: cap-x fraction x metric length",
+                      "gripper: HDF5 obs/gripper_states |q0| + |q1| (m)" if grip is not None else "gripper: replayed sim qpos[7:9] (= states[:, 8:10]) |q0| + |q1| (m)",
                       "camera pose / K / depth: cap-x get_observation() after the replayed state"]}
     write_episode(root, meta, proprio, {c: {"t": cam_t[c], "K": cam_K.get(c), "T": np.stack(cam_T[c])} for c in cams})
     objects = {}
@@ -204,8 +268,10 @@ def prepare(h5path: str | Path, root: str | Path, demo: str = "demo_0", task_id:
                 break
     write_oracle(root, {"source": "libero_mem simulator", "frame": "base", "objects": objects,
                         "relations": ["on", "in", "inhand", "handempty"], "arms": ["main"], "replay": mode},
-                 ostates, segs, {"success": success})
+                 ostates, segs, {"success": success, "source": "final goal predicates (BDDL) on the last state",
+                                 "branches": goal["branches"], "tracker_success": tracker_success})
     drift = float(np.linalg.norm(np.stack(eef_b) - np.stack(capx_eef), axis=1).mean())
-    return {"frames": n, "replay": mode, "images": len(keep), "success": success, "instruction_file": instr_file,
+    return {"demo": demo, "frames": n, "replay": mode, "images": len(keep), "success": success,
+            "tracker_success": tracker_success, "goal_final": goal["branches"], "instruction_file": instr_file,
             "instruction_env": instr_env, "eef_hdf5_vs_capx_mean_m": round(drift, 4),
             "oracle_segments": len(segs)}

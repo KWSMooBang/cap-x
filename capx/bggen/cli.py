@@ -2,7 +2,8 @@
 
     python -m capx.bggen.cli download-libero --dest D
     python -m capx.bggen.cli dump-libero --h5 FILE --out structure.json
-    python -m capx.bggen.cli prep-libero --h5 FILE --demo demo_0 --root EP          (LIBERO-Mem venv, renderer)
+    python -m capx.bggen.cli first-demo --h5 FILE                                   (prints e.g. demo_1)
+    python -m capx.bggen.cli prep-libero --h5 FILE [--demo demo_1] --root EP        (LIBERO-Mem venv, renderer; default: first demo)
     python -m capx.bggen.cli download-b1k --dest D [--wrist]
     python -m capx.bggen.cli dump-b1k --src D --out structure.json
     python -m capx.bggen.cli prep-b1k --src D --root EP [--wrist] [--image-stride 6]
@@ -32,7 +33,8 @@ def main(argv: list[str] | None = None) -> int:
     specs: dict[str, list[tuple[str, dict]]] = {
         "download-libero": [("--dest", req)],
         "dump-libero": [("--h5", req), ("--out", opt)],
-        "prep-libero": [("--h5", req), ("--demo", {"default": "demo_0"}), ("--root", req), ("--task-id", {"type": int, "default": 6}),
+        "first-demo": [("--h5", req)],
+        "prep-libero": [("--h5", req), ("--demo", {"default": None, "help": "default: the first demo in the file"}), ("--root", req), ("--task-id", {"type": int, "default": 6}),
                         ("--image-stride", {"type": int, "default": 2}), ("--wrist", flag), ("--max-frames", {"type": int})],
         "download-b1k": [("--dest", req), ("--wrist", flag), ep],
         "dump-b1k": [("--src", req), ("--out", opt), ep],
@@ -61,6 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         if a.out:
             Path(a.out).write_text(json.dumps(d, indent=1))
         _print(d)
+    elif a.cmd == "first-demo":
+        from .adapters import libero_mem
+        print(libero_mem.first_demo(a.h5))
     elif a.cmd == "prep-libero":
         from .adapters import libero_mem
         _print(libero_mem.prepare(a.h5, a.root, a.demo, a.task_id, a.image_stride, wrist=a.wrist, max_frames=a.max_frames))
@@ -109,6 +114,25 @@ def check_episode(root: str) -> dict:
     cfg = preset(bench if bench in ("libero_mem", "b1k") else "libero_mem")
     ev = detect_events(ep, cfg.events)
     out["events"] = [e.label() for e in ev if e.kind != "keyframe"]
+    out["event_counts"] = {k: sum(e.kind == k for e in ev) for k in sorted({e.kind for e in ev})}
+    # per gripper close: plateau width and EEF rise over the next second (lift = a grasp candidate)
+    closes = []
+    for e in ev:
+        if e.kind in ("grasp", "close", "close_empty"):
+            arm = e.arm or ep.arms[0]
+            z = ep.eef(arm)[:, 2]
+            t1 = min(e.t + int(ep.fps), ep.n_frames - 1)
+            closes.append({"t": e.t, "arm": e.arm, "kind": e.kind, "plateau_width": e.info.get("plateau_width"),
+                           "eef_rise_1s": round(float(z[t1] - z[e.t]), 3)})
+    out["closes"] = closes
+    if ep.mobile:
+        from dataclasses import replace
+
+        from .events import base_events
+
+        raw = base_events(ep.base_poses(), ep.fps, replace(cfg.events, base_min_stop_s=0.0, base_min_move_m=0.0))
+        out["base_events"] = {"raw": len(raw), "debounced": sum(e.kind.startswith("base_") for e in ev),
+                              "min_stop_s": cfg.events.base_min_stop_s, "min_move_m": cfg.events.base_min_move_m}
     for c in ep.cameras:
         cam = ep.camera(c, 0)
         info = {"images": int(len(ep.camera_frames(c))), "shape": list(cam.rgb.shape) if cam else None}
