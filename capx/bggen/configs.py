@@ -53,21 +53,27 @@ def b1k(mode: str = "A") -> GenConfig:
         # The countertop is exempt: the one countertop of the scene is several slabs (an L-shaped counter), a far slab is
         # still it.
         # bggen-fix5 (batch3 d401b65 kubectl traces):
-        # A4 held_reacquire_radius 0.30 m (030: the hot dog in the left hand was named hotdog_A, then hotdog_B by the
-        # expected-name binding): a detection this close to a held hot dog is it. Why 0.30: reacquire_radius 0.25 (the
-        # same unmoved object again) + a margin for a name bound at the EEF (offset 0) whose mask centre is half a hot dog
-        # (~0.075 m) off the fingers. ASSUMPTION: re-measure from the trace ('reacquired at the hand' distances).
+        # A4 held_reacquire_radius 0.15 m from the EEF (030: the hot dog in the left hand was named hotdog_A, then
+        # hotdog_B by the expected-name binding): a detection this close to the hand holding a hot dog is it, unless
+        # another not-held hot dog track is nearer to it; held tracks are then not re-acquired by the 0.25 m reacquire
+        # radius (lead review of 15d2f65: a second hot dog lying 15-20 cm beside the held one was taken). Why 0.15:
+        # batch3 EEF-to-held-hot-dog centres 0.07 / 0.03 m + half a hot dog (0.075 m) = grasp_radius level (0.10) plus
+        # head-camera depth noise; = assoc_radius. ASSUMPTION: re-measure from 'reacquired at the hand' distances.
         # B bind_confirm: microwave_A was bound to the built-in oven door (010 t746, 020 t1135; 4.8 m from the microwave)
         # and the cap of 1 dropped the real microwave 38 / 49 times: the first binding of a capped-at-1 name (fridge,
         # microwave) asks the VDM. The countertop is exempt (never an expected name: extra category; and its far slabs
         # are still it, as for cap_assign_exempt).
-        # C relocate 3 events within 0.3 m (spec): the track moves to a place it keeps being dropped at.
+        # At most 5 identity calls per category and episode (a false detector that wanders defeats the place cache;
+        # batch3 010/020 had one oven place): beyond -> not bound, recorded (identity_limit_skipped).
+        # C relocate 3 events within 0.3 m (spec): the track moves to a place it keeps being dropped at; evidence
+        # accumulates per place and a place must beat the current one; at most 2 moves per track (the first + one
+        # correction; two false appliances winning in turn cannot ping-pong).
         tracks=TrackConfig(assoc_radius=0.15, assoc_px=60.0, merge_radius=0.15, grasp_radius=0.10, fixed_categories=(),
                            reacquire_radius=0.25, max_instances={"countertop": 1, "fridge": 1, "microwave": 1},
                            large_extent=0.4, cap_from_init=True, cap_assign_radius=1.0,
                            cap_assign_exempt=("countertop",),
-                           held_reacquire_radius=0.30, bind_confirm=True, bind_confirm_exempt=("countertop",),
-                           relocate_min_events=3, relocate_radius=0.3),
+                           held_reacquire_radius=0.15, bind_confirm=True, bind_confirm_exempt=("countertop",),
+                           bind_confirm_max_calls=5, relocate_min_events=3, relocate_radius=0.3, relocate_max=2),
         verifier=VerifierConfig(flat_dz={}),  # LIBERO table does not apply; first accepted Observe 1 per pair
         cook_s=10.0, navigation_subtask=True,
         # bggen-fix5 A (030: both hot dogs came out of the closed fridge never detected; the grasps at t2057 / t2720 had no

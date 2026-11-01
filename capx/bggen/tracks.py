@@ -98,10 +98,14 @@ class TrackConfig:
     # B: the first binding of an expected name of a category capped at 1 is checked by the ``confirm`` callback
     bind_confirm: bool = False
     bind_confirm_exempt: tuple[str, ...] = ()
+    # at most this many identity calls per category and episode; beyond -> not bound, recorded (0 = no limit)
+    bind_confirm_max_calls: int = 0
     # C: relocation of a capped-at-1 track to a repeated far place (>= relocate_min_events distinct events, pairwise
-    # within relocate_radius); 0 = off
+    # within relocate_radius); 0 = off. Evidence accumulates per place over the episode; a place wins only with more
+    # events than the track's current place; at most relocate_max relocations per track (0 = no limit)
     relocate_min_events: int = 0
     relocate_radius: float = 0.3
+    relocate_max: int = 0
 
 
 @dataclass
@@ -163,6 +167,8 @@ class Tracker:
         self.relocations: list[dict[str, Any]] = []
         self.grasp_binds: list[dict[str, Any]] = []  # A: expected names bound to a hand at a grasp
         self._confirm: Any = None
+        self.eef: dict[str, np.ndarray] = {}  # arm -> last EEF (world) given to hold / follow (fix5 A4: held reacquire)
+        self.identity_calls_per_cat: dict[str, int] = {}  # fix5 B: VDM identity calls per category (limit)
 
     def _count(self, key: str, n: int = 1) -> None:
         self.counts[key] = self.counts.get(key, 0) + n
@@ -431,7 +437,9 @@ class Tracker:
         for cat in cats:
             idx = [i for i in left if dets[i].category == cat]
             # 2. reacquire: joint assignment within the reacquire radius
-            free = [a for a in self._known(cat) if a not in used]
+            # (with the fix5 held rule on, a held track is re-acquired only by 2b, measured from its hand)
+            free = [a for a in self._known(cat) if a not in used
+                    and not (cfg.held_reacquire_radius > 0 and self.tracks[a].held_by is not None)]
             cost = np.full((len(idx), len(free)), np.inf)
             for r, i in enumerate(idx):
                 for c, a in enumerate(free):
@@ -443,18 +451,24 @@ class Tracker:
                 used.add(free[c])
                 out.append((idx[r], free[c], f"reacquired: unmatched track within the reacquire radius ({cost[r, c]:.2f})"))
             idx = [i for i in idx if all(i != o[0] for o in out)]
-            # 2b. (bggen-fix5 A4) a held track of the category: a detection near its hand is it, not an expected name
+            # 2b. (bggen-fix5 A4) a held track of the category: a detection at its hand (within held_reacquire_radius of
+            # the EEF) is it, not an expected name -- unless another, not held track of the category is nearer to the
+            # detection than the hand (a second hot dog lying next to the held one is that one)
             if cfg.held_reacquire_radius > 0 and idx:
                 held = [a for a in self._known(cat) if a not in used and self.tracks[a].held_by is not None
                         and self.tracks[a].pos is not None]
+                others = [tr.pos for tr in self.tracks.values() if tr.category == cat and tr.held_by is None
+                          and not tr.expected and tr.pos is not None]
                 cost = np.full((len(idx), len(held)), np.inf)
                 for r, i in enumerate(idx):
                     w = self._world(dets[i], base_pose)
+                    if w is None:
+                        continue
                     for c, a in enumerate(held):
-                        if w is not None:
-                            x = float(np.linalg.norm(w - self.tracks[a].pos)) / cfg.held_reacquire_radius
-                            if x <= 1.0:
-                                cost[r, c] = x
+                        hand = self.eef.get(self.tracks[a].held_by, self.tracks[a].pos)
+                        dh = float(np.linalg.norm(w - hand))
+                        if dh <= cfg.held_reacquire_radius and all(float(np.linalg.norm(w - p)) >= dh for p in others):
+                            cost[r, c] = dh / cfg.held_reacquire_radius
                 for r, c in self._joint(cost):
                     self._count("reacquired_held")
                     used.add(held[c])
@@ -583,18 +597,30 @@ class Tracker:
 
     def _check_identity(self, alias: str, d: Detection, t: int, cam: str, base_pose: np.ndarray | None) -> str:
         """"1" / "0" / "?" for "the marked detection is a <category>". A detection at a place already rejected (within
-        ``assoc_radius`` of it, box gap for large objects) is rejected again without a call."""
-        rec: dict[str, Any] = {"t": t, "alias": alias, "category": d.category, "pixel": [round(x, 1) for x in d.pixel]}
+        ``assoc_radius`` of it, box gap for large objects; without 3D: the same camera, pixel within ``assoc_px``) is
+        rejected again without a call. Beyond ``bind_confirm_max_calls`` calls of the category: not bound, no call."""
+        cfg = self.cfg
+        rec: dict[str, Any] = {"t": t, "alias": alias, "category": d.category, "camera": cam,
+                               "pixel": [round(x, 1) for x in d.pixel]}
         w = self._world(d, base_pose)
         if w is not None:
             rec["world"] = [round(float(x), 3) for x in w]
-            for spot in self.rejected_spots:
-                m = self._metric(spot, d, cam, base_pose)
-                if m is not None and m[0] == "m" and m[1] <= self.cfg.assoc_radius:
-                    rec.update(answer="0", cached=True, spot_t=spot.created)
-                    self.identity_checks.append(rec)
-                    self._count("rejected_identity_cached")
-                    return "0"
+        for spot in self.rejected_spots:
+            # 3D detection vs 3D place; a detection without 3D vs the place's pixel in this camera
+            m = self._metric(spot, d, cam, base_pose)
+            if m is not None and (m[0] == "m") == (w is not None) and \
+                    m[1] <= (cfg.assoc_radius if m[0] == "m" else cfg.assoc_px):
+                rec.update(answer="0", cached=True, spot_t=spot.created, unit=m[0])
+                self.identity_checks.append(rec)
+                self._count("rejected_identity_cached")
+                return "0"
+        n = self.identity_calls_per_cat.get(d.category, 0)
+        if cfg.bind_confirm_max_calls > 0 and n >= cfg.bind_confirm_max_calls:
+            rec.update(answer="0", limit=cfg.bind_confirm_max_calls)
+            self.identity_checks.append(rec)
+            self._count("identity_limit_skipped")
+            return "0"
+        self.identity_calls_per_cat[d.category] = n + 1
         try:
             ans = str(self._confirm(alias, d, t)).strip()
         except Exception as exc:  # noqa: BLE001 -- a failed call cannot tell
@@ -605,18 +631,21 @@ class Tracker:
         self._count("identity_checks")
         if ans == "0":
             self._count("rejected_identity")
-            if w is not None:
-                self.rejected_spots.append(Track(f"rejected:{alias}", d.category, w, self._world_size(d, base_pose)
-                                                 if d.size is not None else None, created=t))
+            spot = Track(f"rejected:{alias}", d.category, w, None if (w is None or d.size is None)
+                         else self._world_size(d, base_pose), created=t)
+            spot.pixel[cam], spot.box[cam] = d.pixel, d.box  # the camera place too (detections without 3D)
+            self.rejected_spots.append(spot)
         elif ans == "?":
             self._count("bound_identity_unknown")
         return ans
 
     # --- bggen-fix5 C: relocation of a capped-at-1 track --------------------------------------------------------------
     def _relocate(self, alias: str, d: Detection, t: int, base_pose: np.ndarray | None, far: dict[str, Any]) -> str | None:
-        """Record a dropped far detection of a capped-at-1 category; when they repeat at one place (>=
-        ``relocate_min_events`` distinct events, pairwise within ``relocate_radius``) more often than ``alias`` was
-        re-detected since its binding, the track moves there: returns the reason (the caller assigns ``d`` to it)."""
+        """Record a dropped far detection of a capped-at-1 category. Evidence accumulates per place over the episode
+        (``far_spots``: every dropped far detection, plus a left place's re-detections when a track moves away). When
+        this detection's place has >= ``relocate_min_events`` distinct events (pairwise within ``relocate_radius``) and
+        more than the track's current place (its re-detections since binding + accumulated events there), and the
+        track has moved fewer than ``relocate_max`` times, it moves here: returns the reason (the caller assigns ``d``)."""
         cfg = self.cfg
         tr = self.tracks[alias]
         w = self._world(d, base_pose)
@@ -625,30 +654,39 @@ class Tracker:
             return None
         spots = self.far_spots.setdefault(tr.category, [])
         spots.append({"t": t, "w": w})
+        r = cfg.relocate_radius
         # the cluster around this detection: nearest first, each member within the radius of every other one
         members: list[dict[str, Any]] = []
         for s in sorted(spots, key=lambda s: float(np.linalg.norm(s["w"] - w))):
-            if all(float(np.linalg.norm(s["w"] - m["w"])) <= cfg.relocate_radius for m in members) and \
-                    float(np.linalg.norm(s["w"] - w)) <= cfg.relocate_radius:
+            if float(np.linalg.norm(s["w"] - w)) <= r and all(float(np.linalg.norm(s["w"] - m["w"])) <= r for m in members):
                 members.append(s)
         events = sorted({m["t"] for m in members})
         b = tr.bound_t if tr.bound_t is not None else tr.created
-        redet = len([s for s in tr.seen_ts if s > b])
-        if len(events) < cfg.relocate_min_events or redet >= len(events):
+        redet = sorted({s for s in tr.seen_ts if s > b})
+        here = sorted({s["t"] for s in spots if tr.pos is not None and float(np.linalg.norm(s["w"] - tr.pos)) <= r})
+        cur = len(set(redet) | set(here))  # the current place's evidence
+        if len(events) < cfg.relocate_min_events or len(events) <= cur:
+            return None
+        n_moved = sum(1 for x in self.relocations if x["alias"] == alias)
+        if cfg.relocate_max > 0 and n_moved >= cfg.relocate_max:
+            self._count("relocate_blocked")
+            self.log.append({"kind": "relocate_blocked", "t": t, "alias": alias, "events": events, "current": cur})
             return None
         old = None if tr.pos is None else [round(float(x), 3) for x in tr.pos]
         rec = {"t": t, "alias": alias, "category": tr.category, "from": old, "to": [round(float(x), 3) for x in w],
-               "events": events, "redetections_since_bound": redet, "bound_t": b, "distance": far.get("distance")}
+               "events": events, "redetections_since_bound": len(redet), "current_place_events": cur, "bound_t": b,
+               "distance": far.get("distance")}
         self.relocations.append(rec)
         self._count("relocated")
         self.log.append({"kind": "relocated", **rec})
-        self.far_spots[tr.category] = [s for s in spots if all(s is not m for m in members)]
+        if tr.pos is not None:  # the left place keeps its evidence: moving back needs more events than it had
+            spots += [{"t": s, "w": tr.pos.copy(), "track": True} for s in redet]
         tr.pos, tr.size, tr.zlim = None, None, None  # the caller's fill puts it at this detection
         tr.pixel, tr.box, tr.mask = {}, {}, {}
         tr.bound_t, tr.released_at = t, None
         tr.bind_note = (tr.bind_note + "; " if tr.bind_note else "") + f"relocated @{t}"
-        return (f"relocated: {len(events)} events at this place (within {cfg.relocate_radius} m) vs {redet} re-detections "
-                f"of {alias} since its binding at t={b}")
+        return (f"relocated: {len(events)} events at this place (within {r} m) vs {cur} at the current place "
+                f"({len(redet)} re-detections of {alias} since t={b})")
 
     # --- bggen-fix5 A: binding at a grasp -------------------------------------------------------------------------
     def unplaced(self, cat: str | None = None) -> list[str]:
@@ -748,6 +786,7 @@ class Tracker:
         in the hand, so it is where the hand is (bggen-fix3 B1: a held B1K hot dog was left behind)."""
         tr = self.tracks[alias]
         tr.held_by = arm
+        self.eef[arm] = np.asarray(eef_world, dtype=np.float64).copy()
         if tr.pos is None:
             tr.pos = np.asarray(eef_world, dtype=np.float64).copy()
         tr.hold_offset = tr.pos - np.asarray(eef_world, dtype=np.float64)
@@ -765,6 +804,7 @@ class Tracker:
         return None
 
     def follow(self, arm: str, eef_world: np.ndarray) -> None:
+        self.eef[arm] = np.asarray(eef_world, dtype=np.float64).copy()
         for tr in self.tracks.values():
             if tr.held_by == arm and tr.hold_offset is not None:
                 tr.pos = eef_world + tr.hold_offset

@@ -223,26 +223,62 @@ def test_countertop_at_the_hand_does_not_block_and_a_known_stale_track_wins():
 
 
 def test_a_detection_near_a_held_track_is_it_before_an_expected_name():
-    """A4: hotdog_A held (follows the hand), hotdog_B expected; a detection 0.28 m from the hand (beyond reacquire 0.25)."""
+    """A4: hotdog_A held with its track 0.25 m off the fingers (grasped with a stale offset), hotdog_B expected; a
+    detection 0.12 m from the hand (0.31 m from hotdog_A's track: beyond the 0.25 m reacquire radius)."""
     for on in (True, False):
         cfg = b1k_cfg().tracks
         if not on:
             cfg.held_reacquire_radius = 0.0
-        tr = Tracker(cfg)
-        tr.initialize(0, "head", [FRIDGE])
-        tr.expect("hotdog", "hotdog_A")
-        tr.expect("hotdog", "hotdog_B")
-        tr.set_caps({"hotdog": 2})
-        tr.bind_at_grasp("hotdog_A", 100, "unverified")
-        tr.hold("hotdog_A", "left", L0)
-        tr.follow("left", L1)
-        rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + [0.28, 0.0, 0.0]), HOT)])
+        tr = _held_a(cfg, offset=np.array([-0.25, 0.0, 0.0]))
+        rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + [0.12, 0.0, 0.0]), HOT)])
         ident = rep.get("identified", [])
         if on:
             assert ident and ident[0]["into"] == "hotdog_A" and "at the hand" in ident[0]["why"]
             assert tr.expected() == ["hotdog_B"] and tr.counts["reacquired_held"] == 1
         else:  # the fix4 behaviour: the expected name took it
             assert ident and ident[0]["into"] == "hotdog_B"
+
+
+def _held_a(cfg=None, offset=np.zeros(3), b_at=None):
+    """hotdog_A in the left hand at L1 (track at L1 + offset); hotdog_B expected, or known at ``b_at``."""
+    tr = Tracker(cfg or b1k_cfg().tracks)
+    tr.initialize(0, "head", [FRIDGE])
+    tr.expect("hotdog", "hotdog_A")
+    tr.expect("hotdog", "hotdog_B")
+    tr.set_caps({"hotdog": 2})
+    tr.bind_at_grasp("hotdog_A", 100, "unverified")
+    tr.tracks["hotdog_A"].pos = L0 + offset
+    tr.hold("hotdog_A", "left", L0)
+    if b_at is not None:  # hotdog_B seen (bound) while the hand is still at L0, far from it
+        tr.update(150, "head", [FRIDGE, _det("hotdog", *b_at, HOT)])
+        assert tr.expected() == []
+    tr.follow("left", L1)
+    for a in tr.tracks:
+        tr.tracks[a].seen_now = False
+    return tr
+
+
+def test_a_second_hot_dog_beside_the_held_one_is_not_taken_by_the_hand():
+    """Lead review P1: a second hot dog 15-20 cm beside the held one goes to its own track (known or expected)."""
+    side = np.array([0.0, 0.17, 0.0])
+    # hotdog_B known at 17 cm from the hand: its detection is hotdog_B
+    tr = _held_a(b_at=L1 + side)
+    rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + side + [0.01, 0.0, 0.0]), HOT)])
+    into = {r["into"] for r in rep.get("identified", [])} | set(rep["matched"])
+    assert "hotdog_B" in into and "hotdog_A" not in into and tr.held("left") == "hotdog_A"
+    # a detection 0.12 m from the hand but nearer to hotdog_B (5 cm): hotdog_B, not the held one
+    tr = _held_a(b_at=L1 + side)
+    rep = tr.update(310, "head", [FRIDGE, _det("hotdog", *(L1 + [0.0, 0.12, 0.0]), HOT)])
+    into = {r["into"] for r in rep.get("identified", [])} | set(rep["matched"])
+    assert into == {"hotdog_B"} | ({"fridge_A"} & into) and tr.counts.get("reacquired_held", 0) == 0
+    # hotdog_B expected: a detection 18 cm beside the hand binds hotdog_B (fix5 first version: taken by the hand)
+    tr = _held_a()
+    rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + [0.0, 0.18, 0.0]), HOT)])
+    assert [r["into"] for r in rep.get("identified", [])] == ["hotdog_B"] and tr.expected() == []
+    # the held hot dog itself, 6 cm off the fingers: still the held track
+    tr = _held_a()
+    rep = tr.update(300, "head", [FRIDGE, _det("hotdog", *(L1 + [0.06, 0.0, 0.0]), HOT)])
+    assert "hotdog_A" in rep["matched"] and tr.expected() == ["hotdog_B"]
 
 
 def test_retracted_provisional_grasp_unbinds_the_name():
@@ -296,6 +332,26 @@ def test_identity_unknown_binds_and_marks():
     tr.tracks["microwave_A"].seen_now = False
     tr.update(800, "head", [OVEN], confirm=confirm)
     assert len(asked) == 1
+
+
+def test_rejection_without_3d_is_cached_by_camera_pixel_and_calls_are_limited():
+    """Lead review P2: a detection without a world point is cached by its pixel in that camera; at most 5 identity
+    calls per category and episode, then not bound (recorded)."""
+    tr, confirm, asked = _mw_tracker(lambda d: "0")
+    flat = Detection("microwave", 0.9, (20.0, 30.0), (10, 20, 30, 40))  # no depth
+    tr.update(100, "head", [flat], confirm=confirm)
+    tr.update(200, "head", [Detection("microwave", 0.9, (25.0, 32.0), (15, 22, 35, 42))], confirm=confirm)
+    assert len(asked) == 1 and tr.counts["rejected_identity_cached"] == 1
+    assert tr.identity_checks[-1]["cached"] and tr.identity_checks[-1]["unit"] == "px"
+    # another camera: not the cached place
+    tr.update(210, "left_wrist", [flat], confirm=confirm)
+    assert len(asked) == 2
+    # five calls per category: the sixth distinct place is not asked and not bound
+    for k in range(6):
+        tr.update(300 + k, "head", [_det("microwave", 1.0, 3.0 + k, 0.6, MW)], confirm=confirm)
+    assert tr.cfg.bind_confirm_max_calls == 5 and len(asked) == 5
+    assert tr.counts["identity_limit_skipped"] == 3 and tr.identity_checks[-1]["limit"] == 5
+    assert tr.expected() == ["microwave_A"]
 
 
 def test_hotdog_binding_is_not_checked_and_countertop_is_exempt():
@@ -386,6 +442,29 @@ def test_no_relocation_while_the_track_is_redetected_as_often():
     tr.tracks["microwave_A"].seen_now = False
     tr.update(1300, "head", [_micro_at(0.0)], confirm=confirm)  # 4 events > 3 re-detections
     assert tr.counts["relocated"] == 1
+
+
+def _far(tr, confirm, t, x, y):
+    tr.tracks["microwave_A"].seen_now = False
+    return tr.update(t, "head", [_det("microwave", x, y, 1.2, MW)], confirm=confirm)
+
+
+def test_relocation_keeps_per_place_evidence_and_is_limited():
+    """Lead review P2: two false places cannot win in turn -- a place must beat the current one's accumulated
+    evidence, and a track moves at most twice."""
+    tr, confirm = _bound_at_oven()  # microwave_A at the oven (1.0, 2.0)
+    for k in range(3):  # place X (1.0, -2.8): 3 events > 0 at the oven -> moved to X
+        _far(tr, confirm, 1000 + k, 1.0, -2.8)
+    assert tr.counts["relocated"] == 1
+    for k in range(3):  # place Y (4.0, 0.0): 3 events, not more than X's 3 -> stays
+        _far(tr, confirm, 1100 + k, 4.0, 0.0)
+    assert tr.counts["relocated"] == 1 and np.allclose(tr.tracks["microwave_A"].pos[:2], [1.0, -2.8])
+    _far(tr, confirm, 1103, 4.0, 0.0)  # 4 > 3: moved to Y (second move)
+    assert tr.counts["relocated"] == 2 and tr.relocations[-1]["current_place_events"] == 3
+    for k in range(6):  # X again, 3 + 6 events > Y's 4, but the track moved twice already
+        _far(tr, confirm, 1200 + k, 1.0, -2.8)
+    assert tr.counts["relocated"] == 2 and tr.counts["relocate_blocked"] >= 1
+    assert np.allclose(tr.tracks["microwave_A"].pos[:2], [4.0, 0.0])
 
 
 def test_scattered_far_detections_do_not_relocate():
