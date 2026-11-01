@@ -122,7 +122,7 @@
   vdm_history 는 none 대비 유의한 차이 없음.
 - next: (1) bg_est (정답 없음) smoke → 10×5 로 같은 seed 비교. (2) bg_oracle ablation: 좌표 제거(관계만), 목표를 LLM 파싱으로 교체, 신호 끄기 —
   정답 지각·정답 목표·기억 구조 효과 분리. (3) 영상 프레임 디스크 스트리밍(1i) 으로 worker 수 회복.
-- 뷰어: https://claude.ai/artifact/6KRnzgXKgwfBZHsw8kiZVd 의 '조건 비교' (trial 별 표, baccus trial_table.py 기준). bg_est2 10×5 진행 현황도 같은 페이지.
+- 뷰어: https://claude.ai/artifact/PQSeEs3r6pdYwcpyJwcdgd 의 '조건 비교' (trial 별 표, baccus trial_table.py 기준). bg_est2 10×5 진행 현황도 같은 페이지.
 - 산출물(kubectl PVC): outputs/capbg_baseline/20261030_memcond_COMPARE_{orig,reflected}.md, logs/20261030_memcond_final/{orig,reflected}/,
   outputs/capbg_baseline/20261030_mem10x5_{none_v2,vdmhist,bgoracle}{,_infra_rerun}/, 중단분 _aborted_podkill, _aborted_podkill_vla, _aborted_oom.
 
@@ -151,7 +151,7 @@
     하위 목표 수 × 중앙값이 8000 을 넘는 것은 task 5(7회, 약 12,448)뿐. step_cap 34건 중 23건은 하위 목표 0, 마지막 1000 step 안 진전 4건.
     → 8000 은 task 5 외에는 병목 아님.
   - unclosed_fence 17건: SyntaxError 후 다음 턴 12 · 잘린 코드가 오류 없이 실행 3 · 무한 루프 timeout 1 · 그 블록에서 turn_limit 1.
-  - 뷰어: https://claude.ai/artifact/6KRnzgXKgwfBZHsw8kiZVd (사람 계정 private)
+  - 뷰어: https://claude.ai/artifact/PQSeEs3r6pdYwcpyJwcdgd (사람 계정 private)
 - next: 잘림 처리 수정 → task 5 step 예산 → 조작 실패가 지배적인 상황에서 BG 효과를 볼 평가 설계 결정 → Oracle BG 구현.
 - 산출물(kubectl PVC): /workspace/cap-bg/outputs/capbg_baseline/20261030_mem10x5_capx/{RESULTS.md,ANALYSIS.md},
   로그 /workspace/cap-bg/logs/20261030_mem10x5_capx/, 영상 .../moonshotai_Kimi-K3/<task>/trial_*/video_combined.mp4 (49/50)
