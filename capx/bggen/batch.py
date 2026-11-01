@@ -88,10 +88,18 @@ def load_episodes(path: str | Path = DEFAULT_LIST, only: Sequence[str] = ()) -> 
     return out
 
 
+PREPARING = "PREPARING"  # marker in an episode folder while (re)preparing: removed only after prepare + check succeed
+
+
 def is_prepared(root: str | Path) -> bool:
-    """Episode + oracle written (the adapters write the oracle last)."""
+    """Episode + oracle written (the adapters write the oracle last) and no unfinished (re)prepare: a FORCE re-prepare that
+    fails leaves the marker, so the old files are never run."""
     r = Path(root)
-    return all((r / f).exists() for f in ("episode/meta.json", "episode/proprio.npz", "oracle/meta.json", "oracle/states.jsonl"))
+    return not (r / PREPARING).exists() and all(
+        (r / f).exists() for f in ("episode/meta.json", "episode/proprio.npz", "oracle/meta.json", "oracle/states.jsonl"))
+
+
+RUN_OUTPUTS = ("summary.json", "eval.json", "eval.md")  # removed before a (re)run: a failed rerun leaves no old result
 
 
 def is_run(run_dir: str | Path) -> bool:
@@ -205,6 +213,8 @@ class Batch:
         root = self.root(s)
         if is_prepared(root) and not force:
             return {"status": "skipped", "reason": "already prepared", "root": str(root)}
+        root.mkdir(parents=True, exist_ok=True)
+        (root / PREPARING).write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))  # until prepare + check succeed
         r = self._download(s)
         if r.rc != 0:
             return {"status": "failed", "step": "download", "rc": r.rc, "log": _tail(r.out)}
@@ -229,6 +239,8 @@ class Batch:
         if "task_info" in prep:
             checks["task_info_layout_ok"] = bool(prep["task_info"].get("layout_ok"))
         r2 = self._cmd("check", s, self.cli("check-episode", "--root", str(root)))
+        if r2.rc != 0:  # the episode files do not load / check: a failed prepare (the marker stays)
+            return {"status": "failed", "step": "check", "rc": r2.rc, "log": _tail(r2.out)}
         chk = _json_out(r2.out) or {}
         rec = {"status": "ok", "root": str(root), "checks": checks, "prep": {k: prep.get(k) for k in (
             "demo", "frames", "replay", "success", "goal_final", "instruction_file", "instruction_env", "task_check",
@@ -237,6 +249,7 @@ class Batch:
         bad = [k for k, v in checks.items() if v is False]
         if bad:
             rec.update(status="check_failed", failed_checks=bad)
+        (root / PREPARING).unlink(missing_ok=True)
         return rec
 
     def prep(self, specs: Sequence[EpisodeSpec], force: bool = False) -> dict[str, Any]:
@@ -280,6 +293,8 @@ class Batch:
             rec: dict[str, Any] = {"status": "skipped", "reason": "summary.json exists"}
         else:
             d.mkdir(parents=True, exist_ok=True)
+            for f in RUN_OUTPUTS:  # a failed (re)run must not leave an old summary to skip / aggregate
+                (d / f).unlink(missing_ok=True)
             (d / "batch_episode.json").write_text(json.dumps(asdict(s) | {"group": s.group}, indent=1))
             r = self._cmd(f"run_{tag}", s, self.cli("run", "--root", str(self.root(s)), "--out", str(d), "--benchmark",
                                                     s.benchmark, "--mode", mode, *extra))
@@ -320,8 +335,10 @@ class Batch:
         return st.data
 
     def eval(self, tag: str, specs: Sequence[EpisodeSpec]) -> dict[str, Any]:
-        """Re-evaluate every finished run (e.g. after an evaluate.py change); runs nothing new."""
+        """Re-evaluate every finished run (e.g. after an evaluate.py change); runs nothing new. A failed re-evaluation
+        marks the episode failed in batch_status.json (the aggregate then leaves it out)."""
         out = {}
+        st = Status(self.out / "runs" / tag / "batch_status.json")
         for s in specs:
             d = self.run_dir(tag, s)
             if not is_run(d):
@@ -329,6 +346,9 @@ class Batch:
                 continue
             r = self._cmd(f"eval_{tag}", s, self.cli("eval", "--root", str(self.root(s)), "--out", str(d)))
             out[s.id] = "ok" if r.rc == 0 else f"failed rc {r.rc}"
+            if r.rc != 0:
+                (d / "eval.json").unlink(missing_ok=True)
+                st.set(s.id, {**st.data.get(s.id, {}), "status": "failed", "step": "eval", "rc": r.rc, "log": _tail(r.out)})
             print(f"[batch eval {tag}] {s.id}: {out[s.id]}", flush=True)
         return out
 

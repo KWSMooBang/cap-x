@@ -237,6 +237,7 @@ def prepare(h5path: str | Path, root: str | Path, demo: str | None = None, task_
 
     from capx.belief.oracle import LiberoMemSource, OracleEstimator, _quat_wxyz_to_mat
     from capx.belief.perception import proprio_from_obs
+    from capx.belief.progress import goal_branches
     from capx.envs.simulators.libero_mem import FrankaLiberoMemEnv
 
     from ..oracle import write_oracle
@@ -340,7 +341,9 @@ def prepare(h5path: str | Path, root: str | Path, demo: str | None = None, task_
                 break
     write_oracle(root, {"source": "libero_mem simulator", "frame": "base", "objects": objects,
                         "relations": ["on", "in", "inhand", "handempty"], "arms": ["main"], "replay": mode,
-                        "regions": regions_of(src.on_targets(), src.movable_objects())},
+                        "regions": regions_of(list(src.on_targets()) + [p[2] for b in final_goal_preds(goal_branches(src.goal_state()))
+                                                                          for p in b if p[0] == "on" and len(p) == 3],
+                                              src.movable_objects())},
                  ostates, segs, {"success": success, "source": "final goal predicates (BDDL) on the last state",
                                  "branches": goal["branches"], "tracker_success": tracker_success})
     drift = float(np.linalg.norm(np.stack(eef_b) - np.stack(capx_eef), axis=1).mean())

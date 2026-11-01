@@ -205,8 +205,10 @@ def test_aggregate_tables(tmp_path):
     (runs / "libero_mem_t08_demo_2").mkdir()  # a run that crashed before writing anything: ignored as a folder
     (runs / "b1k_t45_e00450010").mkdir()
     (runs / "b1k_t45_e00450010" / "summary.json").write_text(json.dumps({"init_failed": None, "goal": {}, "models": {}}))
+    ok = {"status": "ok"}
     (runs / "batch_status.json").write_text(json.dumps({"libero_mem_t08_demo_2": {"status": "failed", "step": "run"},
-                                                        "libero_mem_t06_demo_1": {"status": "ok"}}))
+                                                        "libero_mem_t06_demo_1": ok, "libero_mem_t06_demo_2": {"status": "skipped"},
+                                                        "libero_mem_t08_demo_1": ok, "b1k_t45_e00450010": ok}))
     res = agg.aggregate(runs)
     g6, g8 = res["groups"]["libero_mem t06"], res["groups"]["libero_mem t08"]
     assert g6["episodes"] == 2 and g6["forward"]["acc"] == {"mean": 0.8, "min": 0.7, "max": 0.9, "n": 2}
@@ -300,14 +302,17 @@ def test_region_check_flags_missing_goal_step():
     assert not region_check("swap the 2 bowls", [[["(on bowl_A plate_B)"]]], ("on",))["region_missing"]
 
 
-def _oracle(regions: dict | None, true_at: bool) -> Oracle:
+def _oracle(regions: dict | None, true_at: bool, goal: bool = True) -> Oracle:
     meta = {"objects": {"basket_1": "basket", "cream_cheese_1": "cream_cheese"}, "relations": ["on", "in", "inhand", "handempty"]}
     if regions is not None:
         meta["regions"] = regions
     st = [{"t": 0, "pos": {}, "true": [["in", "cream_cheese_1", "basket_1_contain_region"]], "inhand": {"main": None}},
           {"t": 10, "pos": {}, "true": [["in", "cream_cheese_1", "basket_1_contain_region"]]
            + ([["on", "basket_1", "kitchen_table_the_center"]] if true_at else []), "inhand": {"main": None}}]
-    return Oracle(meta, st)
+    # final.json "branches" = the BDDL goal's final relations (LIBERO-Mem prepare, goal_success)
+    final = {"success": true_at, "branches": [{"in cream_cheese_1 basket_1_contain_region": True,
+                                               "on basket_1 kitchen_table_the_center": true_at}] if goal else []}
+    return Oracle(meta, st, [], final)
 
 
 def test_eval_scores_at_center_against_the_oracle_region():
@@ -317,12 +322,91 @@ def test_eval_scores_at_center_against_the_oracle_region():
     reg = oracle_regions(o)
     assert _truth(key, o.states[0], amap, reg) is False and _truth(key, o.states[1], amap, reg) is True
     assert _truth(key, o.states[1], amap, {}) is None  # no region map: not scored
-    # region map recovered from the states when meta.json has none (episodes prepared before this change)
-    assert oracle_regions(_oracle(None, true_at=True)) == {"center": "kitchen_table_the_center"}
-    assert oracle_regions(_oracle(None, true_at=False)) == {}
     rows = [{"t": 0, "belief": {"(at basket_A center)": (0.1, "obs"), "(in cream_cheese_A basket_A)": (0.9, "obs")}},
             {"t": 10, "belief": {"(at basket_A center)": (0.9, "obs")}}]
     res = relation_accuracy(rows, o, amap, ["basket_A", "cream_cheese_A"], [None])
     assert res["per_pred"]["at"]["right"] == 2 and res["per_pred"]["in"]["right"] == 1 and res["accuracy"] == 1.0
-    res = relation_accuracy(rows, _oracle(None, true_at=False), amap, ["basket_A", "cream_cheese_A"], [None])
-    assert "at" not in res["per_pred"]  # nothing to score against
+
+
+def test_region_from_task_definition_not_from_reaching_it():
+    """review a0800ae #5: an episode whose basket never reaches the center still has its at predictions scored."""
+    amap = {"basket_A": "basket_1", "cream_cheese_A": "cream_cheese_1"}
+    never = _oracle(None, true_at=False)  # prepared before meta "regions"; the goal names the region
+    assert oracle_regions(never) == {"center": "kitchen_table_the_center"}
+    rows = [{"t": 10, "belief": {"(at basket_A center)": (0.9, "obs")}},
+            {"t": 0, "belief": {"(at basket_A center)": (0.1, "obs")}}]
+    res = relation_accuracy(rows, never, amap, ["basket_A", "cream_cheese_A"], [None])
+    assert res["per_pred"]["at"] == {"right": 1, "wrong": 1, "undecided": 0, "unmappable": 0, "accuracy": 0.5}
+    assert oracle_regions(_oracle(None, true_at=False, goal=False)) == {}  # no region in the task: at not scored
+    assert "at" not in relation_accuracy(rows, _oracle(None, False, goal=False), amap, ["basket_A"], [None])["per_pred"]
+    assert lm.regions_of(["basket_1", "table"] + ["kitchen_table_the_center"], ["basket_1"]) == \
+        {"center": "kitchen_table_the_center"}  # prepare: On targets + the goal's final relations
+
+
+# --- review a0800ae: failures never leave old results to run / aggregate ---------------------------------
+
+def test_check_episode_failure_is_a_failed_prepare(tmp_path):
+    eps = bt.load_episodes(LIST, ["libero_mem_t00_demo_1"])
+    b = bt.Batch(tmp_path, py="PY", runner=FakeRunner(fail={("check-episode", "libero_mem_t00_demo_1")}))
+    st = b.prep(eps)
+    assert st[eps[0].id]["status"] == "failed" and st[eps[0].id]["step"] == "check"
+    assert not bt.is_prepared(b.root(eps[0]))  # files written, but the marker stays
+    assert b.run("t", eps)[eps[0].id]["status"] == "not_prepared"
+
+
+def test_failed_force_reprepare_is_not_run(tmp_path):
+    eps = bt.load_episodes(LIST, ["libero_mem_t00_demo_1"])
+    runner = FakeRunner()
+    b = bt.Batch(tmp_path, py="PY", runner=runner)
+    assert b.prep(eps)[eps[0].id]["status"] == "ok" and bt.is_prepared(b.root(eps[0]))
+    runner.fail = {("prep-libero", eps[0].id)}
+    st = b.prep(eps, force=True)
+    assert st[eps[0].id]["status"] == "failed"
+    assert (b.root(eps[0]) / "oracle/states.jsonl").exists() and not bt.is_prepared(b.root(eps[0]))  # old files kept, not used
+    assert b.run("t", eps)[eps[0].id]["status"] == "not_prepared"
+    runner.fail = set()
+    assert b.prep(eps)[eps[0].id]["status"] == "ok"  # the next plain prep redoes it
+
+
+def test_failed_force_rerun_leaves_no_old_result(tmp_path):
+    eps = bt.load_episodes(LIST, ["libero_mem_t00_demo_1"])
+    runner = FakeRunner()
+    b = bt.Batch(tmp_path, py="PY", runner=runner)
+    b.prep(eps)
+    assert b.run("t", eps)[eps[0].id]["status"] == "ok"
+    d = b.run_dir("t", eps[0])
+    (d / "eval.json").write_text("{}")
+    runner.fail = {("run", eps[0].id)}
+    st = b.run("t", eps, force=True)
+    assert st[eps[0].id]["status"] == "failed"
+    assert not (d / "summary.json").exists() and not (d / "eval.json").exists()
+    runner.fail = set()
+    assert b.run("t", eps)[eps[0].id]["status"] == "ok"  # not skipped: there is no old summary
+
+
+def test_aggregate_uses_only_ok_batch_episodes(tmp_path):
+    runs = tmp_path / "runs" / "t"
+    _fake_run(runs / "libero_mem_t06_demo_1", (0.9, 0.9), {"on": (9, 1, 0)}, 10, True)
+    _fake_run(runs / "libero_mem_t06_demo_2", (0.1, 0.1), {"on": (1, 9, 0)}, 10, False)  # stale: its rerun failed
+    _fake_run(runs / "libero_mem_t06_demo_3", (0.2, 0.2), {"on": (2, 8, 0)}, 10, False)  # not in the status file
+    (runs / "batch_status.json").write_text(json.dumps({"libero_mem_t06_demo_1": {"status": "ok"},
+                                                        "libero_mem_t06_demo_2": {"status": "failed", "step": "eval"}}))
+    res = agg.aggregate(runs)
+    assert [r["id"] for r in res["episodes"]] == ["libero_mem_t06_demo_1"]
+    assert res["all"]["forward"]["acc"]["mean"] == 0.9
+    assert set(res["failed"]) == {"libero_mem_t06_demo_2", "libero_mem_t06_demo_3"}
+    assert "Failed / excluded" in agg.to_markdown(res)
+    (runs / "batch_status.json").unlink()  # no batch (hand-made runs): every folder counts
+    assert agg.aggregate(runs)["all"]["episodes"] == 3
+
+
+def test_failed_reeval_marks_episode_failed(tmp_path):
+    eps = bt.load_episodes(LIST, ["libero_mem_t00_demo_1"])
+    runner = FakeRunner()
+    b = bt.Batch(tmp_path, py="PY", runner=runner)
+    b.prep(eps)
+    b.run("t", eps)
+    runner.fail = {("eval", eps[0].id)}
+    assert b.eval("t", eps)[eps[0].id].startswith("failed")
+    st = json.loads((tmp_path / "runs/t/batch_status.json").read_text())
+    assert st[eps[0].id]["status"] == "failed" and st[eps[0].id]["step"] == "eval"

@@ -25,7 +25,8 @@ from pathlib import Path
 from typing import Any
 
 PASSES = ("forward", "forward+backward")
-PRICE = (0.45, 3.0)  # $ per 1M prompt / completion tokens (Qwen/Qwen3.8-27B)
+PRICE = (0.45, 3.0)
+USABLE = ("ok", "skipped")  # batch_status.json states whose run folder is aggregated  # $ per 1M prompt / completion tokens (Qwen/Qwen3.8-27B)
 
 
 def group_of(name: str) -> str:
@@ -128,9 +129,17 @@ def aggregate(runs_dir: str | Path, price: tuple[float, float] = PRICE) -> dict[
     runs = Path(runs_dir)
     dirs = sorted(d for d in runs.iterdir() if d.is_dir() and ((d / "summary.json").exists() or (d / "eval.json").exists()
                                                              or (d / "batch_episode.json").exists()))
+    status = _load(runs / "batch_status.json")
+    # with a batch_status.json only episodes whose last batch step succeeded are aggregated: an output folder of a
+    # failed (re)run / re-evaluation / not-run episode is listed as failed / excluded, never averaged
+    excluded = {}
+    if status is not None:
+        excluded = {d.name: status.get(d.name, {"status": "not in batch_status.json"}) for d in dirs
+                    if status.get(d.name, {}).get("status") not in USABLE}
+        dirs = [d for d in dirs if d.name not in excluded]
     recs = [episode_record(d, price) for d in dirs]
-    status = _load(runs / "batch_status.json") or {}
-    failed = {k: v for k, v in status.items() if v.get("status") in ("failed", "not_prepared")}
+    status = status or {}
+    failed = {k: v for k, v in status.items() if v.get("status") not in USABLE} | excluded
     groups: dict[str, list[dict[str, Any]]] = {}
     for r in recs:
         groups.setdefault(r["group"], []).append(r)
@@ -198,7 +207,7 @@ def to_markdown(res: dict[str, Any]) -> str:
                  f"{r['usage']['calls']} | {r['cost_usd']} |")
     a = res["all"]
     L += ["", f"Init failed: {a['init_failed'] or 'none'}", f"Region (at center) missing from the goal: {a['region_missing'] or 'none'}",
-          "Failed / not run (batch_status.json): " + (", ".join(f"{k} ({v.get('status')}: {v.get('step') or v.get('reason')})"
+          "Failed / excluded (batch_status.json, not averaged): " + (", ".join(f"{k} ({v.get('status')}: {v.get('step') or v.get('reason')})"
                                                                for k, v in res["failed"].items()) or "none"),
           f"Prices: {res['price_per_1m']} $ per 1M tokens; total ${a['cost_usd']} over {a['usage'].get('calls')} calls"]
     return "\n".join(L) + "\n"

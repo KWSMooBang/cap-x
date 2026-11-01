@@ -175,7 +175,7 @@ Table regions (task 8 "... place that basket in the center"):
 
 - `at(X, center)` is a goal / observe relation. `statement_key` accepts the region name, and `(on X center)` becomes
   `(at X center)`.
-- The oracle meta `regions` maps `center` → `kitchen_table_the_center`. Eval scores `at` against the oracle's `on X
+- The region comes from the task definition (oracle meta `regions` from the BDDL On targets + goal, else the goal's final relations in `final.json`), never from whether it was reached. Eval scores `at` against the oracle's `on X
   kitchen_table_the_center`.
 - If the init goal has no `at` step while the instruction names the region, `report.md` and `eval.md` say
   REGION MISSING FROM THE GOAL.

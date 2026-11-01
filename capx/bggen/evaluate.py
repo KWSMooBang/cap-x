@@ -200,17 +200,26 @@ def alias_map(trace0: dict[str, Any], oracle: Oracle, t: int = 0, radius: float 
 
 # --- relations ---------------------------------------------------------------------------------------
 
+def region_names(names: object) -> dict[str, str]:
+    """Region word -> oracle region name among relation targets (``kitchen_table_the_center`` -> "center")."""
+    out: dict[str, str] = {}
+    for n in names:  # type: ignore[attr-defined]
+        m = re.search(r"_the_([a-z]+)$", str(n))
+        if m and m.group(1) in REGIONS:
+            out.setdefault(m.group(1), str(n))
+    return out
+
+
 def oracle_regions(oracle: Oracle) -> dict[str, str]:
-    """Region word -> oracle region name (``at(X, center)`` is scored as the oracle's ``on X <region name>``).
-    From ``meta.json`` "regions" (LIBERO-Mem prepare writes it); else from region targets that hold somewhere in
-    the states (``kitchen_table_the_center`` -> "center"). Empty: ``at`` is not scored."""
+    """Region word -> oracle region name (``at(X, center)`` is scored as the oracle's ``on X <region name>``), from the
+    TASK definition only, never from whether a region was reached: ``meta.json`` "regions" (LIBERO-Mem prepare: BDDL On
+    targets + goal) and the BDDL goal's final relations in ``final.json`` "branches" ("on basket_1
+    kitchen_table_the_center"). Empty: the task has no region and ``at`` is not scored."""
     reg = dict(oracle.meta.get("regions") or {})
-    if not reg:
-        for s in oracle.states:
-            for p in s.get("true", []):
-                m = re.search(r"_the_([a-z]+)$", str(p[2])) if len(p) > 2 and p[0] == "on" and p[2] else None
-                if m and m.group(1) in REGIONS:
-                    reg.setdefault(m.group(1), str(p[2]))
+    goal_targets = [k.split()[-1] for b in oracle.final.get("branches") or [] if isinstance(b, dict)
+                    for k in b if k.split()[:1] == ["on"]]
+    for w, n in region_names(goal_targets).items():
+        reg.setdefault(w, n)
     return reg
 
 
