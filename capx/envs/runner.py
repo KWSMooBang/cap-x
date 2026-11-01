@@ -374,6 +374,20 @@ def _save_timeout_videos(
         print(f"Trial {trial}: could not save timeout video ({e!r})")
 
 
+def _take_pending_model_calls() -> dict[str, Any]:
+    """Ensemble calls and VDM usage recorded since the last all_responses.json entry (none: {})."""
+    from capx.envs import trial as trial_mod
+
+    out: dict[str, Any] = {}
+    calls = trial_mod._take_ensemble_calls()
+    vdm = trial_mod._take_vdm_usage()
+    if calls:
+        out["ensemble_calls"] = calls
+    if vdm:
+        out["vdm_usage"] = vdm
+    return out
+
+
 def _build_timeout_summary(
     trial: int,
     timeout_seconds: int,
@@ -407,6 +421,12 @@ def _build_timeout_summary(
         prefix=f"Trial {trial} timed out after {timeout_seconds} seconds.",
     )
 
+    # Model calls of the query the trial was aborted in (e.g. ensemble candidates before a synthesis timeout).
+    all_responses = pa.get("all_responses", [])
+    pending = _take_pending_model_calls()
+    if pending:
+        all_responses = [*all_responses, {"decision": "aborted", "error": repr(exc), **pending}]
+
     code_path = _save_trial_artifacts(
         config, trial,
         sandbox_rc=1,
@@ -414,7 +434,7 @@ def _build_timeout_summary(
         task_completed=info_step.get("task_completed", False),
         final_code=final_code,
         raw_code=raw_code,
-        all_responses=pa.get("all_responses", []),
+        all_responses=all_responses,
         log_lines=log_lines,
         visual_feedback_imgs=pa.get("visual_feedback_imgs", []),
         ensemble_data=pa.get("ensemble_data"),

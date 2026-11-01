@@ -20,7 +20,7 @@ a VDM description (`condition_video_mode: auto` → `vdm_text`, below).
 | `condition_video_mode`: `images` \| `vdm_text` \| `auto` | `--condition-video-mode` | `images` |
 
 - The candidates and synthesis model are used by the multimodel ensemble only (`use_parallel_ensemble: true`,
-  `use_multimodel: true`). Setting them without `use_multimodel` is an error, not ignored.
+  `use_multimodel: true`). Setting them without both is an error, not ignored.
 - Unset, everything is as before: the requests are byte for byte the upstream ones (checked against the base branch
   with a fake server; candidate order in the synthesis prompt is completion order, as upstream), the baseline configs
   resolve to `ensemble_candidates: None`, `ensemble_synthesis_model: None`, `condition_video_mode: images`.
@@ -37,7 +37,7 @@ a VDM description (`condition_video_mode: auto` → `vdm_text`, below).
 ### Text-only models
 
 `TEXT_ONLY_MODELS` in `capx/llm/client.py` lists the four models above. `query_model` raises `TextOnlyModelError`
-when a prompt with images is about to go to one of them, and `query_model_ensemble` checks every candidate before
+when a prompt with images is about to go to one of them (`query_model_streaming`, used by the web UI, too), and `query_model_ensemble` checks every candidate before
 sending anything, so images are never dropped silently and a text-only candidate never "fails" quietly on an image
 prompt. Unknown models are assumed to take images (as before). Images reach the coding prompts only through
 `use_visual_feedback` (off in all cap-bg configs) and the RoboMME conditioning video.
@@ -129,6 +129,12 @@ decision) has `ensemble_calls`, one record per ensemble query, including cut-off
                "finish_reason": "stop", "usage": {...}, "tokens": {...}, "format_issue": null},
  "candidates_s": 41.2, "wall_s": 76.3}
 ```
+
+If the synthesis call raises (HTTP error, timeout), the exception (type unchanged) carries `ensemble_log` with the
+finished candidates and `synthesis.ok: false`; the trial keeps it, and if the trial ends there (wall timeout) the
+timeout summary adds an `{"decision": "aborted", "ensemble_calls": [...], "vdm_usage": [...]}` entry so the calls
+are still costed. If all candidates fail, `synthesis` is null. Mean VDM latency in the cost table counts the timed
+calls only (the conditioning-video calls; turn VDM calls log usage without latency).
 
 `format_issue` checks the synthesis reply against the synthesis prompt's OUTPUT FORMAT: initial code needs exactly
 one closed fenced block (`no_fence`, `multiple_fences`, `unclosed_fence`, `empty`); decisions need a `REGENERATE`

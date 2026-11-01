@@ -518,3 +518,83 @@ def test_ensemble_pilot_commands():
     rm = ens_pilot.task_configs(ens_pilot.Args(bench="robomme", run_name="r"))
     assert len(rm) == 8 and "robomme_videounmaskswap" in rm
     assert ens_pilot.ensemble_settings(rm["robomme_movecube"])["condition_video_mode"] == "auto"
+
+
+# --------------------------------------------------------------------------------------------------
+# Review fixes (7eef7ff)
+# --------------------------------------------------------------------------------------------------
+
+def test_streaming_refuses_images_for_text_only_models(server):
+    prompt = [{"role": "user", "content": [{"type": "text", "text": "Goal"}, IMAGE]}]
+    gen = client.query_model_streaming(ModelQueryArgs(model=SYNTH, server_url=server.url), prompt)
+    with pytest.raises(TextOnlyModelError):
+        next(gen)
+    assert server.requests == []
+
+
+def test_synthesis_failure_keeps_candidate_log(server):
+    import requests
+
+    server.fail = {SYNTH}
+    with pytest.raises(requests.HTTPError) as info:  # exception type unchanged (timeouts stay timeouts)
+        query_model_ensemble(_args(server.url), PROMPT, synthesis_model=SYNTH, candidates=NEBIUS)
+    log = info.value.ensemble_log
+    assert (log["n_candidates"], log["n_failed"]) == (9, 0)
+    assert all(c["tokens"]["prompt"] == 1000 for c in log["candidates"])
+    assert log["synthesis"]["ok"] is False and log["synthesis"]["format_issue"] == "failed"
+    assert "error" in log["synthesis"]
+    u = model_costs.trial_usage([{"ensemble_calls": [log]}], "x", "y")
+    assert u["by_model"]["openai/gpt-oss-120b"]["prompt"] == 3000
+    assert u["ensemble"]["synthesis_failed"] == 1 and u["ensemble"]["synthesis_format_errors"] == 0
+    assert u["by_model"][SYNTH]["failed"] == 1
+
+
+def test_all_candidates_failed_log(server):
+    server.fail = {m for m, _ in NEBIUS}
+    with pytest.raises(RuntimeError) as info:
+        query_model_ensemble(_args(server.url), PROMPT, synthesis_model=SYNTH, candidates=NEBIUS)
+    log = info.value.ensemble_log
+    assert log["n_failed"] == 9 and log["synthesis"] is None
+
+
+def test_failed_query_log_reaches_timeout_summary(monkeypatch, tmp_path):
+    import capx.envs.runner as runner_mod
+    from test_truncation import make_config
+
+    err = RuntimeError("synthesis timed out")
+    err.ensemble_log = {"kind": "multimodel", "n_candidates": 9, "n_failed": 0, "candidates": [], "synthesis": None}
+
+    def boom(*a, **k):
+        raise err
+
+    monkeypatch.setattr(trial_mod, "_query_model_ensemble", boom)
+    trial_mod._take_ensemble_calls()
+    trial_mod._take_vdm_usage()
+    with pytest.raises(RuntimeError):
+        trial_mod._query_ensemble(SimpleNamespace(model="m"), {"use_multimodel": True,
+                                  "ensemble_candidates": [["a", [0.1]]]}, PROMPT, False)
+    trial_mod._VDM_USAGE.append({"prompt_tokens": 5})
+    pa = {"all_responses": [{"decision": "initial"}], "trial_start_time": time.time()}
+    runner_mod._build_timeout_summary(1, 10, pa, make_config(tmp_path), TimeoutError("t"))
+    responses = json.loads(next(tmp_path.glob("trial_01_*/all_responses.json")).read_text())
+    assert responses[-1]["decision"] == "aborted"
+    assert responses[-1]["ensemble_calls"] == [err.ensemble_log]
+    assert responses[-1]["vdm_usage"] == [{"prompt_tokens": 5}]
+    assert trial_mod._take_ensemble_calls() == []
+
+
+def test_ensemble_settings_need_parallel_ensemble():
+    path = ENS_DIR / "robomme" / "robomme_movecube.yaml"
+    with pytest.raises(ValueError, match="use_parallel_ensemble"):
+        _load_config(LaunchArgs(config_path=str(path), use_parallel_ensemble=False))
+
+
+def test_condition_video_latency_in_costs():
+    responses = [{"decision": "initial", "vdm_usage": [_usage(10, 2), _usage(10, 2)],
+                  "condition_video": {"mode": "vdm_text", "vdm_model": "Qwen/Qwen3.8-27B",
+                                      "vdm_calls": [{"latency_s": 12.5, "usage": _usage(10, 2)}]}}]
+    u = model_costs.trial_usage(responses, "x", "Qwen/Qwen3.8-27B")
+    q = u["by_model"]["Qwen/Qwen3.8-27B"]
+    assert (q["calls"], q["prompt"], q["latency_s"], q["timed_calls"]) == (2, 20, 12.5, 1)  # tokens not doubled
+    table = "\n".join(model_costs.cost_table(u["by_model"], model_costs.load_prices(), 1))
+    assert "| Qwen/Qwen3.8-27B | 2 | 0 | 20 | 4 | 10 | 12.5 |" in table

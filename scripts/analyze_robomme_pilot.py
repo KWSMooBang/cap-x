@@ -155,11 +155,13 @@ def cost_and_ensemble_sections(done: list[dict[str, Any]], prices: dict[str, tup
         wall = sum(e.get("ensemble_wall_s", 0.0) for e in ens)
         cut = sum(e.get("cut_off_candidates", 0) for e in ens)
         synth_cut = sum(e.get("synthesis_cut_off", 0) for e in ens)
+        synth_failed = sum(e.get("synthesis_failed", 0) for e in ens)
         lines += [
             "## Ensemble", "",
             f"- ensemble queries: {queries} ({queries / len(done):.1f} per trial), mean wall {wall / queries:.1f} s",
             f"- failed candidates: {failed} / {cands} ({failed / cands:.1%})" if cands else "- failed candidates: 0 / 0",
-            f"- candidates cut off at max_tokens (still synthesized): {cut}; synthesis replies cut off: {synth_cut}",
+            f"- candidates cut off at max_tokens (still synthesized): {cut}; synthesis replies cut off: {synth_cut}; "
+            f"synthesis calls failed (error): {synth_failed}",
             f"- synthesis format errors: {ferr} / {synth} ({ferr / synth:.1%})"
             + (f": {', '.join(f'{k} {v}' for k, v in issues.most_common())}" if issues else "") if synth else
             "- synthesis format errors: 0 / 0",

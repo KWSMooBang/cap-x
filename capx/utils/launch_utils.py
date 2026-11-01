@@ -139,7 +139,9 @@ def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, 
 CONDITION_VIDEO_MODES = ("images", "vdm_text", "auto")
 
 
-def _ensemble_config(args: LaunchArgs, configs_dict: dict[str, Any], use_multimodel: bool) -> dict[str, Any]:
+def _ensemble_config(
+    args: LaunchArgs, configs_dict: dict[str, Any], use_multimodel: bool, use_parallel_ensemble: bool = True
+) -> dict[str, Any]:
     """Ensemble and conditioning-video keys: CLI > YAML. Unset: upstream ensemble, images.
 
     YAML::
@@ -161,9 +163,12 @@ def _ensemble_config(args: LaunchArgs, configs_dict: dict[str, Any], use_multimo
     cli_cands = getattr(args, "ensemble_candidates", None)
     candidates = parse_ensemble_candidates(cli_cands if cli_cands is not None else yaml_ens.get("candidates"))
     synth = getattr(args, "ensemble_synthesis_model", None) or yaml_ens.get("synthesis_model")
-    if (candidates is not None or synth is not None) and not use_multimodel:
-        # Only the multimodel ensemble reads them; refuse rather than ignore them.
-        raise ValueError("ensemble candidates / synthesis_model need use_multimodel: true (and use_parallel_ensemble)")
+    if (candidates is not None or synth is not None) and not (use_multimodel and use_parallel_ensemble):
+        # Only the multimodel parallel ensemble reads them; refuse rather than ignore them.
+        raise ValueError(
+            "ensemble candidates / synthesis_model need use_parallel_ensemble: true and use_multimodel: true "
+            f"(got use_parallel_ensemble={use_parallel_ensemble}, use_multimodel={use_multimodel})"
+        )
     mode = getattr(args, "condition_video_mode", None) or configs_dict.get("condition_video_mode", "images")
     if mode not in CONDITION_VIDEO_MODES:
         raise ValueError(f"condition_video_mode must be one of {CONDITION_VIDEO_MODES}, got {mode!r}")
@@ -267,7 +272,9 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
         **_memory_config(args, configs_dict),
     }
-    merged_config.update(_ensemble_config(args, configs_dict, bool(merged_config["use_multimodel"])))
+    merged_config.update(_ensemble_config(
+        args, configs_dict, bool(merged_config["use_multimodel"]), bool(merged_config["use_parallel_ensemble"])
+    ))
 
     return env_factory, merged_config, api_servers
 

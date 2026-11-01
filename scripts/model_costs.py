@@ -47,7 +47,8 @@ def _tokens(usage: Any) -> tuple[int, int, int]:
 class _Acc:
     def __init__(self) -> None:
         def zero() -> dict[str, float]:
-            return {"calls": 0, "prompt": 0, "completion": 0, "reasoning": 0, "latency_s": 0.0, "failed": 0}
+            return {"calls": 0, "prompt": 0, "completion": 0, "reasoning": 0, "latency_s": 0.0, "timed_calls": 0,
+                    "failed": 0}
 
         self.by_model: dict[str, dict[str, float]] = defaultdict(zero)
         self.by_role: dict[str, dict[str, float]] = {"coding": zero(), "vdm": zero()}
@@ -60,14 +61,21 @@ class _Acc:
             m["completion"] += c
             m["reasoning"] += r
             m["latency_s"] += float(latency_s or 0.0)
+            m["timed_calls"] += int(latency_s is not None)
             m["failed"] += int(failed)
+
+    def add_latency(self, role: str, model: str, latency_s: float) -> None:
+        """Latency of a call whose tokens are counted elsewhere (no extra call or tokens)."""
+        for m in (self.by_model[model], self.by_role[role]):
+            m["latency_s"] += float(latency_s)
+            m["timed_calls"] += 1
 
 
 def trial_usage(responses: list[dict[str, Any]], coding_model: str, vdm_model: str) -> dict[str, Any]:
     """Per-model and per-role (coding / vdm) calls, tokens and latency, and ensemble statistics, for one trial."""
     acc = _Acc()
     ens = {"ensemble_queries": 0, "candidate_calls": 0, "failed_candidates": 0, "cut_off_candidates": 0,
-           "synthesis_calls": 0, "synthesis_cut_off": 0,
+           "synthesis_calls": 0, "synthesis_cut_off": 0, "synthesis_failed": 0,
            "synthesis_format_errors": 0, "format_issues": defaultdict(int), "ensemble_wall_s": 0.0}
 
     def add_single(entry: dict[str, Any]) -> None:
@@ -90,8 +98,10 @@ def trial_usage(responses: list[dict[str, Any]], coding_model: str, vdm_model: s
                 if synth:
                     ens["synthesis_calls"] += 1
                     ens["synthesis_cut_off"] += int(synth.get("finish_reason") == "length")
-                    acc.add("coding", synth["model"], synth.get("usage"), synth.get("latency_s"))
-                    issue = synth.get("format_issue")
+                    ok = synth.get("ok", True)
+                    ens["synthesis_failed"] += int(not ok)
+                    acc.add("coding", synth["model"], synth.get("usage"), synth.get("latency_s"), failed=not ok)
+                    issue = synth.get("format_issue") if ok else None
                     if issue:
                         ens["synthesis_format_errors"] += 1
                         ens["format_issues"][issue] += 1
@@ -101,6 +111,11 @@ def trial_usage(responses: list[dict[str, Any]], coding_model: str, vdm_model: s
                 add_single(r["s5_first_reply"])
         for u in r.get("vdm_usage") or []:
             acc.add("vdm", vdm_model, u)
+        # Conditioning-video VDM calls: tokens are in vdm_usage above; their latency is only logged here.
+        cv = r.get("condition_video") if isinstance(r.get("condition_video"), dict) else {}
+        for call in cv.get("vdm_calls") or []:
+            if call.get("latency_s") is not None:
+                acc.add_latency("vdm", cv.get("vdm_model") or vdm_model, call["latency_s"])
     ens["format_issues"] = dict(ens["format_issues"])
     return {"by_model": {m: dict(v) for m, v in acc.by_model.items()}, "by_role": acc.by_role, "ensemble": ens}
 
@@ -143,7 +158,8 @@ def cost_table(by_model: dict[str, dict[str, float]], prices: dict[str, tuple[fl
     for model in sorted(by_model, key=lambda m: -(costs.get(m) or 0)):
         t = by_model[model]
         c = costs.get(model)
-        lat = t["latency_s"] / t["calls"] if t["calls"] and t["latency_s"] else None
+        timed = t.get("timed_calls", t["calls"])
+        lat = t["latency_s"] / timed if timed and t["latency_s"] else None
         lines.append(
             f"| {model} | {int(t['calls'])} | {int(t['failed'])} | {int(t['prompt']):,} | {int(t['completion']):,} | "
             f"{int(t['reasoning']):,} | {'-' if lat is None else f'{lat:.1f}'} | "

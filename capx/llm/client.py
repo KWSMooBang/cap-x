@@ -7,6 +7,7 @@ from launch/config utilities.
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import copy
 import json
 import os
@@ -452,6 +453,8 @@ def query_model_streaming(
     Yields:
         Partial response chunks as they arrive
     """
+    check_prompt_images(args.model, prompt)
+
     if args.model in GPT_MODELS:
         payload = {
             "model": args.model,
@@ -677,7 +680,12 @@ def query_model_ensemble(
         print("\n=== All ensemble queries failed. Errors: ===")
         for r in responses:
             print(f"  {r['model']} temp={r['temp']}: {r['content']}")
-        raise RuntimeError("All ensemble queries failed")
+        exc = RuntimeError("All ensemble queries failed")
+        exc.ensemble_log = _ensemble_log(  # type: ignore[attr-defined]
+            "multimodel", responses, synthesis_model, None, 0.0, is_multiturn,
+            candidates_s=candidates_s, wall_s=time.time() - ensemble_start,
+        )
+        raise exc
 
     # Build synthesis prompt
     original_text = ""
@@ -765,7 +773,10 @@ def query_model_ensemble(
         temperature=0.2,
         max_tokens=args.max_tokens,
     )
-    final, synthesis_s = _timed_query(synth_args, synthesis_prompt)
+    final, synthesis_s = _synthesize(
+        synth_args, synthesis_prompt, "multimodel", responses,
+        is_multiturn, candidates_s, ensemble_start,
+    )
 
     # Build text content for saving
     candidates_txt = "\n\n".join(
@@ -793,20 +804,55 @@ def query_model_ensemble(
     return out
 
 
+def _synthesize(
+    synth_args: ModelQueryArgs,
+    synthesis_prompt: list[dict],
+    kind: str,
+    responses: list[dict],
+    is_multiturn: bool,
+    candidates_s: float,
+    ensemble_start: float,
+) -> tuple[dict[str, Any], float]:
+    """Run the synthesis query. If it raises, the exception carries ``ensemble_log`` (the finished candidates'
+    usage and the failed synthesis) so the caller can still log and cost them; the exception type is kept."""
+    start = time.time()
+    try:
+        return _timed_query(synth_args, synthesis_prompt)
+    except Exception as exc:
+        log = _ensemble_log(
+            kind, responses, synth_args.model, None, time.time() - start, is_multiturn,
+            candidates_s=candidates_s, wall_s=time.time() - ensemble_start, synthesis_error=str(exc),
+        )
+        with contextlib.suppress(AttributeError):  # exceptions with __slots__
+            exc.ensemble_log = log  # type: ignore[attr-defined]
+        raise
+
+
 def _ensemble_log(
     kind: str,
     responses: list[dict],
     synthesis_model: str,
-    final: dict,
+    final: dict | None,
     synthesis_s: float,
     is_multiturn: bool,
     *,
     candidates_s: float,
     wall_s: float,
+    synthesis_error: str | None = None,
 ) -> dict[str, Any]:
-    """Per-call record of one ensemble query for all_responses.json (``ensemble_calls``)."""
-    synth = _call_log(synthesis_model, 0.2, True, synthesis_s, final, None)
-    synth["format_issue"] = synthesis_format_issue(final.get("content"), is_multiturn)
+    """Per-call record of one ensemble query for all_responses.json (``ensemble_calls``).
+
+    ``final`` None: the synthesis failed (``synthesis_error``) or was never sent (all candidates failed;
+    ``synthesis`` is then None).
+    """
+    if final is not None:
+        synth = _call_log(synthesis_model, 0.2, True, synthesis_s, final, None)
+        synth["format_issue"] = synthesis_format_issue(final.get("content"), is_multiturn)
+    elif synthesis_error is not None:
+        synth = _call_log(synthesis_model, 0.2, False, synthesis_s, None, synthesis_error)
+        synth["format_issue"] = "failed"
+    else:
+        synth = None
     return {
         "kind": kind,
         "is_multiturn": bool(is_multiturn),
@@ -876,7 +922,12 @@ def query_single_model_ensemble(
         print("\n=== All single model ensemble queries failed. Errors: ===")
         for r in responses:
             print(f"  {r['model']} temp={r['temp']}: {r['content']}")
-        raise RuntimeError("All single model ensemble queries failed")
+        exc = RuntimeError("All single model ensemble queries failed")
+        exc.ensemble_log = _ensemble_log(  # type: ignore[attr-defined]
+            "single_model", responses, model, None, 0.0, is_multiturn,
+            candidates_s=candidates_s, wall_s=time.time() - ensemble_start,
+        )
+        raise exc
 
     # Build synthesis prompt
     original_text = ""
@@ -965,7 +1016,10 @@ def query_single_model_ensemble(
         temperature=0.2,
         max_tokens=args.max_tokens,
     )
-    final, synthesis_s = _timed_query(synth_args, synthesis_prompt)
+    final, synthesis_s = _synthesize(
+        synth_args, synthesis_prompt, "single_model", responses,
+        is_multiturn, candidates_s, ensemble_start,
+    )
 
     # Build text content for saving
     candidates_txt = "\n\n".join(

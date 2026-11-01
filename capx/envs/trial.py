@@ -103,6 +103,20 @@ def _ensemble_calls_log(config: dict[str, Any]) -> dict[str, Any]:
 
 def _query_ensemble(args: Any, config: dict[str, Any], prompt: list[dict[str, Any]], is_multiturn: bool) -> dict:
     """One parallel-ensemble query (multimodel or single model) with the configured candidates / synthesis."""
+    try:
+        out = _query_ensemble_once(args, config, prompt, is_multiturn)
+    except Exception as exc:
+        # Finished candidates were paid for: keep their log (flushed into all_responses.json by the next
+        # entry, or by the timeout summary if the trial ends here).
+        if getattr(exc, "ensemble_log", None) is not None:
+            _ENSEMBLE_CALLS.append(exc.ensemble_log)
+        raise
+    if out.get("ensemble_log") is not None:
+        _ENSEMBLE_CALLS.append(out["ensemble_log"])
+    return out
+
+
+def _query_ensemble_once(args: Any, config: dict[str, Any], prompt: list[dict[str, Any]], is_multiturn: bool) -> dict:
     turn = "MULTITURN " if is_multiturn else ""
     if config.get("use_multimodel", False):
         print(f"RUNNING {turn}MULTIMODEL ENSEMBLE QUERY")
@@ -118,8 +132,6 @@ def _query_ensemble(args: Any, config: dict[str, Any], prompt: list[dict[str, An
     else:
         print(f"RUNNING {turn}SINGLE MODEL ENSEMBLE QUERY")
         out = _query_single_model_ensemble(args, prompt, args.model, is_multiturn=is_multiturn)
-    if out.get("ensemble_log") is not None:
-        _ENSEMBLE_CALLS.append(out["ensemble_log"])
     return out
 
 
