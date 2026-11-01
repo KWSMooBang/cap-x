@@ -1,5 +1,25 @@
 # cap-bg EXPERIMENTS
 
+## 20261101_mem10x5_bgest2_r2 (2026-11-01) — keep (추정 BG v2 정식 비교): 메모리 없음보다 높은 쪽이나 유의하지 않음, 정답 BG 보다 낮음
+- 실행: kubectl baccus_cap-bg, bg f9508fb (= 7dccdad: 원시 코드 파서 수정 + flat_dz bowl 0.028·bottle 0.063), 11/01 03:03–09:04 UTC, pod 2 (A100, worker 1, 30Gi), 크래시·OOM 0. 약 12 GPU-h.
+- 설정: run 1 과 같음 (memory_mode bg_est2, 같은 seed, step 8000 / wall 3600 / retries 1, max_tokens 32768, Kimi-K3 + Qwen3.8-27B, 영상 on).
+- 결과 (baccus 보고 원문): 성공 2/50 (t00 tr4, t01 tr3). step_cap 40, finish_but_fail 5, turn_limit 2, misparsed_finish 1 (t02 tr1).
+  진행률 0.28 (upstream init 1/20 0.28, 생성 init 1/30 0.28).
+  task별 진행률 (none | vdm | oracle | run1 | r2): t0 .20|.60|.60|.60|.60 · t1 .20|.20|1.00|.00|.40 · t2 .40|.60|.40|.60|.40 · t3 .00|.07|.80|.20|.33 · t4 .48|.48|.48|.36|.48 ·
+    t5 .14|.14|.14|.03|.09 · t6 .07|.13|.20|.27|.33 · t7 .00|.00|.55|.05|.10 · t8 .10|.10|.00|.10|.10 · t9 .10|.20|.00|.10|.00.
+  짝 비교 (L1 계산, 부호검정): 대 none_v2 성공 2/0 (p≈0.50), 진행률 높음 13 · 같음 28 · 낮음 9 (p≈0.52). 대 bg_oracle 성공 2/7 (p≈0.18), 진행률 10 · 19 · 21 (p≈0.071).
+    대 vdm_history 16 · 23 · 11 (p≈0.44). 대 run 1 12 · 29 · 9 (p≈0.66).
+  추정 품질 (belief_trace): 원시 Observe 1460/1589 = 0.919 (run 1 0.905), 융합 후 belief 6887/7032 = 0.979 (미결정 86).
+    veto [80, 65] 정답률 81% (run 1 50%); 오답 15 는 전부 why=d_xy (t03 tr3 bottle d_xy 0.104 4건, bowl 4 관계 11건 d_xy 0.061–0.067 · r 0.051–0.056 = r 과소 추정). bowl dz 오답 0.
+    S4 [110, 79] 오발동 31 (run 1 60), S5b [6, 4]. raw_code 판정 7회, misparsed 1 (run 1 7).
+    t08·t09 융합 후 0.889·0.904 < 원시 0.973·0.979: at(center) 정확도 0.676 (mem) · 0.667 (obs), 같은 과제 on 0.975 · in 0.984.
+- 토큰·비용: coding Kimi-K3 335 calls 입력 2.84M · 출력 2.92M, goal parse 21k/65k, Observe Qwen 332 calls 0.38M/0.90M. 약 $56.3.
+- 판단: keep. 추정 BG v2 는 메모리 없음 대비 진행률이 높은 쪽(0.28 대 0.17)이지만 50 trial 짝 비교로 유의하지 않고, 정답 BG(0.42)와의 격차가 큼.
+  정답 BG 가 크게 앞선 t03(병 반복)·t07(회전)은 일부만 따라감 → 정답 BG 이득이 정답 좌표·정답 목표 순서에서 왔다는 가설과 맞음. t06(교환)은 r2 가 가장 높음(0.33).
+  추정 자체는 수정 후 안정 (거부권 81%, S4 오발동 절반). 남은 약점: 접시 반경 추정, at(center) 판정, 빈 펜스 파서 구멍(백로그 1n).
+- next: 정답 BG ablation (좌표 제거, LLM 목표, 신호 끔)으로 이득의 원인 분리. 추정 BG 약점 3건 수정 여부는 ablation 결과 후 결정.
+- 산출물(kubectl PVC): outputs/capbg_baseline/20261101_mem10x5_bgest2_r2/, 스크립트 /workspace/cap-bg/{trial_table.py, bgest2_quality.py, fused_by_pred.py, group_wrong_vetoes.py}
+
 ## 20261101_mem10x5_bgest2 (2026-11-01) — discard (비교 제외: 하네스 버그 2건), 추정 품질 자료로는 keep
 - 실행: kubectl baccus_cap-bg, bg d471268, 10/31 22:08 – 11/01 03:03 UTC, pod 2 (A100, worker 1, 30Gi), 크래시·OOM·재실행 0. 약 9.8 GPU-h.
 - 설정: memory_mode bg_est2, 메모리 조건 파일럿과 같은 설정·seed (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 32768, Kimi-K3 + Qwen3.8-27B, 영상 on, seg off).
