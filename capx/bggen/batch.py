@@ -215,6 +215,7 @@ class Batch:
             return {"status": "skipped", "reason": "already prepared", "root": str(root)}
         root.mkdir(parents=True, exist_ok=True)
         (root / PREPARING).write_text(time.strftime("%Y-%m-%dT%H:%M:%S"))  # until prepare + check succeed
+        self.invalidate_runs(s, "re-prepared")  # runs of the old episode files are stale under every RUN_TAG
         r = self._download(s)
         if r.rc != 0:
             return {"status": "failed", "step": "download", "rc": r.rc, "log": _tail(r.out)}
@@ -251,6 +252,24 @@ class Batch:
             rec.update(status="check_failed", failed_checks=bad)
         (root / PREPARING).unlink(missing_ok=True)
         return rec
+
+    def invalidate_runs(self, s: EpisodeSpec, why: str) -> list[str]:
+        """Every RUN_TAG's run of this episode: outputs removed (not skipped by run, not aggregated) and its
+        batch_status.json record marked stale. Returns the tags touched."""
+        tags = []
+        runs = self.out / "runs"
+        for tag_dir in sorted(runs.iterdir()) if runs.exists() else []:
+            d = tag_dir / s.id
+            stp = tag_dir / "batch_status.json"
+            st = Status(stp) if stp.exists() else None
+            if not d.is_dir() and not (st and s.id in st.data):
+                continue
+            for f in RUN_OUTPUTS:
+                (d / f).unlink(missing_ok=True)
+            if st is not None and s.id in st.data:
+                st.set(s.id, {**st.data[s.id], "status": "stale", "reason": why})
+            tags.append(tag_dir.name)
+        return tags
 
     def prep(self, specs: Sequence[EpisodeSpec], force: bool = False) -> dict[str, Any]:
         st = Status(self.out / "episodes" / "prep_status.json")
@@ -349,6 +368,11 @@ class Batch:
             if r.rc != 0:
                 (d / "eval.json").unlink(missing_ok=True)
                 st.set(s.id, {**st.data.get(s.id, {}), "status": "failed", "step": "eval", "rc": r.rc, "log": _tail(r.out)})
+            else:
+                prev = st.data.get(s.id, {})
+                if prev.get("status") != "ok":  # a successful re-evaluation of a finished run: usable again
+                    st.set(s.id, {k: v for k, v in prev.items() if k not in ("step", "rc", "log", "reason")}
+                           | {"status": "ok", "reevaluated": True})
             print(f"[batch eval {tag}] {s.id}: {out[s.id]}", flush=True)
         return out
 

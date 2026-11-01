@@ -410,3 +410,39 @@ def test_failed_reeval_marks_episode_failed(tmp_path):
     assert b.eval("t", eps)[eps[0].id].startswith("failed")
     st = json.loads((tmp_path / "runs/t/batch_status.json").read_text())
     assert st[eps[0].id]["status"] == "failed" and st[eps[0].id]["step"] == "eval"
+
+
+def test_force_reprepare_makes_every_run_stale(tmp_path):
+    """review 46c5a91 #1: runs of the old episode files are neither skipped nor aggregated after a re-prepare."""
+    eps = bt.load_episodes(LIST, ["libero_mem_t00_demo_1", "libero_mem_t00_demo_2"])
+    runner = FakeRunner()
+    b = bt.Batch(tmp_path, py="PY", runner=runner)
+    b.prep(eps)
+    for tag in ("a", "b"):
+        b.run(tag, eps)
+    b.prep(eps[:1], force=True)
+    for tag in ("a", "b"):
+        st = json.loads((tmp_path / f"runs/{tag}/batch_status.json").read_text())
+        assert st[eps[0].id]["status"] == "stale" and st[eps[1].id]["status"] == "ok"
+        assert not bt.is_run(b.run_dir(tag, eps[0])) and bt.is_run(b.run_dir(tag, eps[1]))
+        assert [r["id"] for r in agg.aggregate(tmp_path / "runs" / tag)["episodes"]] == [eps[1].id]
+        assert eps[0].id in agg.aggregate(tmp_path / "runs" / tag)["failed"]
+    runner.calls.clear()
+    st = b.run("a", eps)
+    assert st[eps[0].id]["status"] == "ok" and st[eps[1].id]["status"] == "skipped"
+    assert [c[c.index("--out") + 1] for c in runner.calls if c[3] == "run"] == [str(b.run_dir("a", eps[0]))]
+
+
+def test_successful_reeval_restores_ok(tmp_path):
+    """review 46c5a91 #2."""
+    eps = bt.load_episodes(LIST, ["libero_mem_t00_demo_1"])
+    runner = FakeRunner()
+    b = bt.Batch(tmp_path, py="PY", runner=runner)
+    b.prep(eps)
+    b.run("t", eps)
+    runner.fail = {("eval", eps[0].id)}
+    b.eval("t", eps)
+    runner.fail = set()
+    assert b.eval("t", eps)[eps[0].id] == "ok"
+    st = json.loads((tmp_path / "runs/t/batch_status.json").read_text())[eps[0].id]
+    assert st["status"] == "ok" and "step" not in st and "log" not in st
