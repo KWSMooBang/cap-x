@@ -75,9 +75,13 @@ class RoboMMEHandle:
     reset_obs: dict[str, list] = field(default_factory=dict)
     last_obs: dict[str, list] = field(default_factory=dict)
     last_info: dict[str, Any] = field(default_factory=dict)
+    # RoboMME env.reset() calls on this env. A second reset of the same env keeps the previous episode's
+    # success state (DemonstrationWrapper), so RoboMMEEnv reloads the env instead (see RoboMMEEnv.reset).
+    reset_count: int = 0
 
     def reset(self) -> tuple[dict[str, list], dict[str, Any]]:
         obs, info = self.env.reset()
+        self.reset_count += 1
         self.reset_obs = _lists_to_numpy(obs)
         self.last_obs, self.last_info = self.reset_obs, info
         return self.reset_obs, info

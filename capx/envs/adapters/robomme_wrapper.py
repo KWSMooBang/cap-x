@@ -14,13 +14,16 @@ class RoboMMEWrapper:
     def __init__(
         self, task_id: str, episode_idx: int = 0, dataset: str = "test", action_space: str = "joint_angle"
     ) -> None:
-        self.handle: RoboMMEHandle = load_robomme_task(
-            task_id=task_id, episode_idx=episode_idx, dataset=dataset, action_space=action_space
-        )
+        self._load_kw = dict(task_id=task_id, episode_idx=episode_idx, dataset=dataset, action_space=action_space)
+        self.handle: RoboMMEHandle = load_robomme_task(**self._load_kw)
         self._success = False
 
     def reset(self, seed: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         self._success = False
+        if self.handle.reset_count > 0:
+            # A second RoboMME reset of one env keeps the previous success state: load the episode again.
+            self.handle.env.close()
+            self.handle = load_robomme_task(**self._load_kw)
         return self.handle.reset()
 
     def step_action(self, action: Any) -> tuple[dict[str, Any], float, bool, dict[str, Any]]:

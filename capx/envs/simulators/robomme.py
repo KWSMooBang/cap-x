@@ -10,6 +10,7 @@ Camera ``pose_mat`` is camera -> base with OpenCV camera axes, depth is in metre
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -46,6 +47,13 @@ CAMERAS = {"front": "agentview", "wrist": "robot0_eye_in_hand"}
 # RoboMME status values that end an episode (DemonstrationWrapper._step_batch); "error" is a failed step.
 TERMINAL_STATUSES = ("success", "fail", "timeout", "error")
 
+logger = logging.getLogger(__name__)
+
+
+class RoboMMEResetError(RuntimeError):
+    """RoboMME reported a finished episode right after reset (stale state from an earlier episode)."""
+
+
 # ManiSkill Panda finger joint range (metres per finger); 0.04 = fully open.
 GRIPPER_OPEN_WIDTH = 0.04
 
@@ -69,6 +77,12 @@ class RoboMMEEnv(BaseEnv):
 
     ``reset(seed=k)`` selects episode ``(k - 1) % episodes`` of the split, so trial ``k`` always plays the
     same test episode (trials 1-5 -> episodes 0-4).
+
+    Every ``reset`` runs on an env on which RoboMME ``env.reset()`` has not been called yet: if the current
+    env was already reset (e.g. at construction), it is closed and the episode is loaded again. RoboMME's
+    second reset of the same env keeps the previous success state (``status == "success"`` right after
+    reset), which ended trial 1 of the ensemble pilot after one control step. ``reset`` also raises
+    :class:`RoboMMEResetError` if the reset info is not ``status == "ongoing"`` with ``success`` false.
     """
 
     def __init__(
@@ -142,10 +156,14 @@ class RoboMMEEnv(BaseEnv):
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         if seed is not None:
             episode_idx = (seed - 1) % EPISODES_PER_SPLIT[self.dataset]
-            if episode_idx != self.handle.episode_idx:
-                self.handle.env.close()
-                self.handle = self._load(episode_idx)
-        self.handle.reset()
+        else:
+            episode_idx = self.handle.episode_idx
+        if episode_idx != self.handle.episode_idx or self.handle.reset_count > 0:
+            # Fresh env for every reset: RoboMME env.reset() exactly once per episode env.
+            self.handle.env.close()
+            self.handle = self._load(episode_idx)
+        _, reset_info = self.handle.reset()
+        self._check_reset_info(reset_info)
         self._init_episode_state()
         self.home_joint_position = self._current_joints()
         self._target_joints = self.home_joint_position.copy()
@@ -163,6 +181,19 @@ class RoboMMEEnv(BaseEnv):
             "memory": self.memory_state(),
         }
         return obs, info
+
+    def _check_reset_info(self, info: dict[str, Any]) -> None:
+        status = info.get("status")
+        status = status[0] if isinstance(status, (list, tuple)) and status else status
+        success = info.get("success", False)
+        success = bool(np.any(np.asarray(success.detach().cpu() if hasattr(success, "detach") else success)))
+        if (status is not None and status != "ongoing") or success:
+            msg = (
+                f"RoboMME {self.task_id} episode {self.handle.episode_idx}: reset returned status={status!r} "
+                f"success={success} (expected ongoing/False; stale state from an earlier reset?)"
+            )
+            logger.error(msg)
+            raise RoboMMEResetError(msg)
 
     @property
     def episode_over(self) -> bool:
@@ -353,4 +384,4 @@ def _red_border(frame: np.ndarray, width: int = 4) -> np.ndarray:
     return out
 
 
-__all__ = ["RoboMMEEnv", "CAMERAS", "TERMINAL_STATUSES"]
+__all__ = ["RoboMMEEnv", "RoboMMEResetError", "CAMERAS", "TERMINAL_STATUSES"]
