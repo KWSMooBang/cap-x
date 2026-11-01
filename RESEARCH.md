@@ -89,6 +89,7 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     텍스트 전용 모델이라 RoboMME 조건 영상은 VDM 서술(vdm_text)로. L2 exp_cap-bg_ensemble-nebius. 예상 API 약 $40–60, 4–6 h (GPU 3장). Kimi-K3 단일 RoboMME pilot 은 중단 상태(1/80).
     2026-11-01 사람 지시: pod 3개 (각 CPU 16, A100 1, 32Gi) — LIBERO-Mem pilot, RoboMME pilot, bggen 검증. GPU 3장(노드 빈 GPU 전부) 사용을 사람이 명시적으로 허용 (일회성).
     bggen pod 는 즉시 (reaper 회피), pilot pod 2개는 앙상블 코드 준비 후.
+1p. [결정 2026-11-01] RoboMME step 예산은 논문 표준 1300 유지 (CaP-X 는 코드 블록당 150–720 step 이라 2–3턴이 한계). 예산 3000 비교는 백로그.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
