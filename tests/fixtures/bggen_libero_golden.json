@@ -1,0 +1,21 @@
+{
+ "swap_A": {
+  "rows_forward.jsonl": "025e2d67dc069118",
+  "rows_backward.jsonl": "1e7876d57a6d2ba1",
+  "cot_rows_forward.jsonl": "a454b195347ad952",
+  "cot_rows.jsonl": "9236bc586e10a8c7",
+  "trace": "c02086d9d266dbd7",
+  "agent_replies": "6ef76dcfc6ae96cf",
+  "prompts": "55c284fc950b3798",
+  "n_prompts": "48"
+ },
+ "swap_B_hidden": {
+  "rows_forward.jsonl": "03eee01bb1d18287",
+  "cot_rows_forward.jsonl": "ad7435520346ffc1",
+  "cot_rows.jsonl": "ad7435520346ffc1",
+  "trace": "b92352ef0c7043e1",
+  "agent_replies": "e4816dc3e0418fa6",
+  "prompts": "338e9cfa543cb935",
+  "n_prompts": "48"
+ }
+}

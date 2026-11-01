@@ -135,6 +135,32 @@ def observe_prompt(instruction: str, image_before: str | None, image_now: str, m
     return [{"role": "system", "content": OBSERVE_SYSTEM}, {"role": "user", "content": content}]
 
 
+# --- identity check of a first binding (bggen-fix5 B) --------------------------------------------------------------
+
+IDENTITY_SYSTEM = "You check one object detection in a robot's camera image. Answer with one character."
+
+
+def identity_prompt(category_text: str, image: str, view: str) -> list[dict[str, Any]]:
+    """Is the object inside the red box (mark 1) a ``category_text``? -> one line ``Answer: 1 | 0 | ?``."""
+    head = f"{VIEWS.get(view, view)} A red box with the mark 1 surrounds one detected object."
+    tail = (f"Is the object in the red box (mark 1) a {category_text}? Look at the object itself, not at what is near it "
+            f"(another appliance or a cabinet door that only resembles a {category_text} is not one).\n"
+            "Answer 1 if it is, 0 if it is not, ? if you cannot tell. Output exactly one line: Answer: <1|0|?>")
+    return [{"role": "system", "content": IDENTITY_SYSTEM},
+            {"role": "user", "content": [_text(head), _image(image), _text(tail)]}]
+
+
+def parse_identity(text: str) -> str:
+    """The answer of ``identity_prompt``: the value after the last ``Answer:``, else the last 1 / 0 / ? token; ? if none."""
+    import re
+
+    m = re.findall(r"answer\s*[:=]\s*\**\s*([01?])", text or "", re.I)
+    if m:
+        return m[-1]
+    m = re.findall(r"(?<![\w.])([01?])(?![\w.])", text or "")
+    return m[-1] if m else "?"
+
+
 def text_only(messages: Sequence[dict[str, Any]]) -> str:
     out = []
     for m in messages:

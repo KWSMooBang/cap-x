@@ -33,7 +33,14 @@ from .events import Event, EventConfig, detect_events
 from .geometry import GeoMemory, Geometry
 from .graph import BeliefGraph, GoalTracker, Step, decided
 from .perception import Detection, Detector
-from .prompts import agent_prompt, init_prompt, observe_prompt, text_only
+from .prompts import (
+    agent_prompt,
+    identity_prompt,
+    init_prompt,
+    observe_prompt,
+    parse_identity,
+    text_only,
+)
 from .records import CameraFrame, Episode, FrameRecord
 from .tracks import TrackConfig, Tracker, box_distance
 from .verifier import Verifier, VerifierConfig
@@ -104,6 +111,16 @@ class GenConfig:
     settle_eef_m: float = 0.05
     settle_still_m: float = 0.015
     settle_still_px: float = 4.0
+    # bggen-fix5 A (off by default; B1K on): a grasp / close with no target that has a position binds a position-less
+    # expected name to the hand. ``arm_cameras``: arm -> its wrist camera (detected at the grasp frame, mode A also up to
+    # ``unseen_grasp_settle_s`` later before the next gripper event); a detection whose box is within
+    # ``wrist_grasp_radius`` of the EEF names the category. Without one, the expected names of the categories the goal's
+    # remaining steps name (else the instruction's): one -> bound, several -> the first letter, 'grasp_bound_unverified'
+    unseen_grasp: bool = False
+    arm_cameras: dict[str, str] = field(default_factory=dict)
+    wrist_grasp_radius: float = 0.10
+    unseen_grasp_settle_s: float = 0.5
+    unseen_grasp_step_s: float = 0.25
     cam_still_m: float = 0.01  # 2D path: the camera counts as unmoved since the close within 1 cm and 1 deg
     cam_still_deg: float = 1.0
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
@@ -215,6 +232,7 @@ class Generator:
         self.events: list[Event] = []
         self.agent_failures = 0
         self.init_info: dict[str, Any] = {}
+        self.identity_calls: list[dict[str, Any]] = []  # fix5 B: VDM identity checks of first bindings
 
     # --- helpers ---------------------------------------------------------------------------------
     def _arm_name(self, arm: str | None) -> str:
@@ -905,7 +923,10 @@ class Generator:
             rec["grasp_verify"] = checks
             if any(c["result"] == "retracted" for c in checks):
                 robot_keys |= self._robot_state(fr, e.t)
-        rec["track"] = self.tracker.update(e.t, main.name, dets, self._img_base(main), [c.key for c in self.categories])
+        # fix5 B: the identity check of a first binding (only passed when on: the fix4 call is unchanged otherwise)
+        ckw = {"confirm": self._identity_fn(main)} if cfg.tracks.bind_confirm else {}
+        n_id0 = len(self.identity_calls)
+        rec["track"] = self.tracker.update(e.t, main.name, dets, self._img_base(main), [c.key for c in self.categories], **ckw)
         if e.kind in ("grasp", "close") and arm_key is not None and e.obj is None:
             # B1: nothing tracked within reach before this frame's detection (stale / no position): try again with
             # the positions just detected, so the held object follows the hand instead of staying behind
@@ -919,6 +940,17 @@ class Generator:
                 self.touched_at[target] = e.t
                 robot_keys |= self._robot_state(fr, e.t)
                 self.verifier.held_off_supports(target, e.t)
+            elif cfg.unseen_grasp:
+                # bggen-fix5 A: still nothing with a position at the hand -> an expected (never seen) object was taken
+                target, rec["grasp_unseen"] = self._grasp_unseen(e, arm_key, fr, next_gripper_t)
+                if target is not None:
+                    self._take(e, arm_key, fr, main, target, px)
+                    if arm_key in self.pending_grasp and rec["grasp_unseen"]["result"].startswith("bound"):
+                        self.pending_grasp[arm_key]["bound_at_grasp"] = True
+                    touched_now.add(target)
+                    self.touched_at[target] = e.t
+                    robot_keys |= self._robot_state(fr, e.t)
+                    self.verifier.held_off_supports(target, e.t)
         for a in self.tracker.tracks:
             self.marks.assign(a, self.tracker.tracks[a].category)
         self.geo.observe_sizes()
@@ -984,7 +1016,8 @@ class Generator:
                     extra += got
             if extra:
                 # B2: only the new detections; tracks matched by this frame's first pass keep that match
-                tool["detect"] = self.tracker.update(e.t, main.name, extra, self._img_base(main), plan.detect, keep_seen=True)
+                tool["detect"] = self.tracker.update(e.t, main.name, extra, self._img_base(main), plan.detect, keep_seen=True,
+                                                     **ckw)
                 for a in self.tracker.tracks:
                     self.marks.assign(a, self.tracker.tracks[a].category)
                 img, marks_text, shown = self._marked(main, fr)
@@ -1076,6 +1109,8 @@ class Generator:
         self.prev_image[main.name] = now_url
         row = self._row(e, observed, touched_now, hind, kf)
         row.rechecked, row.rejected = rechecked, rejected
+        if len(self.identity_calls) > n_id0:
+            rec["identity"] = self.identity_calls[n_id0:]
         rec.update(agent=agent_rec, plan=plan.to_dict(), tools=tool, marks=marks_text,
                    decisions=[d.to_dict() for d in self.verifier.decisions], goal_confirmed=confirmed,
                    tracks=[t.to_dict() for t in self.tracker.tracks.values()],
@@ -1106,6 +1141,137 @@ class Generator:
                 # relations before the close, restored if the grasp is retracted
                 "loc0": {k: (ed.p, ed.source) for k, ed in self.graph.edges.items()
                          if k[1] == target and k[0] in ("on", "in", "at")}}
+
+    # --- bggen-fix5 -------------------------------------------------------------------------------------------------
+    def _identity_fn(self, cam: CameraFrame) -> Any:
+        """B: ``confirm(alias, detection, t)`` for the tracker: the VDM is asked whether the boxed detection in this
+        camera image is the expected name's category (one call per binding attempt)."""
+
+        def confirm(alias: str, d: Detection, t: int) -> str:
+            from PIL import Image, ImageDraw
+
+            cat = self._cat(alias)
+            text = next((c.prompt for c in self.categories if c.key == cat), cat)
+            img = Image.fromarray(np.asarray(draw_marks(cam.rgb, [("1", d.pixel)]), dtype=np.uint8))
+            lw = max(int(round(min(img.height, img.width) / 160)), 2)
+            ImageDraw.Draw(img).rectangle(tuple(float(x) for x in d.box), outline=(255, 0, 0), width=lw)
+            msgs = identity_prompt(text, encode_png(np.asarray(img)), self.cfg.view)
+            reply, usage, err, meta = self._query("vdm", msgs)
+            ans = "?" if err else parse_identity(reply)
+            self.identity_calls.append({"t": t, "alias": alias, "camera": cam.name, "image_t": cam.t, "reply": reply,
+                                        "error": err, "usage": usage, "answer": ans, "box": [round(x, 1) for x in d.box]})
+            return ans
+
+        return confirm
+
+    def _pointed_categories(self) -> tuple[list[str], str]:
+        """A2: movable categories the plan points at: the args of the best branch's remaining goal steps (init / agent
+        goal), else the instruction's movable categories."""
+        b = self.goal.best()
+        cats: list[str] = []
+        if b is not None:
+            for s in self.goal.branches[b][self.goal.done[b]:]:
+                for k in s:
+                    for x in k[1:]:
+                        if x is not None and x in self.tracker.tracks and not is_support(self._cat(x)):
+                            cats.append(self._cat(x))
+        if cats:
+            return list(dict.fromkeys(cats)), "goal remaining steps"
+        return [c.key for c in self.categories if not is_support(c.key)], "instruction"
+
+    def _grasp_unseen(self, e: Event, arm: str, fr: FrameRecord, next_gripper_t: int) -> tuple[str | None, dict[str, Any]]:
+        """A: the hand closed and no track with a position is within reach. Which expected (never detected) name did it
+        take? 1. the arm's wrist camera at the grasp frame (mode A: also later frames before the next gripper event): the
+        detection nearest to the EEF by point-to-box distance within ``wrist_grasp_radius`` (movable objects first; a
+        door / lid there -- a handle -- binds nothing; other supports are ignored) names the category -> its first
+        position-less expected name. 2. no such detection: the position-less expected names of the categories the plan
+        points at -- one -> it, several -> the first letter (``unverified``). Before either binding, a known track of the
+        category within ``reacquire_radius`` of the EEF (a stale position just beyond ``grasp_radius``) is taken
+        instead (A4: a track with a position wins over an expected name)."""
+        cfg = self.cfg
+        info: dict[str, Any] = {"arm": arm}
+        if not self.tracker.unplaced():
+            info["result"] = "no position-less expected name"
+            return None, info
+        cam_name = cfg.arm_cameras.get(arm)
+        checks: list[dict[str, Any]] = []
+        near: tuple[Detection, float, int] | None = None
+        if cam_name is not None and cam_name in self.ep.cameras:
+            ts = [e.t]
+            if cfg.offline and cfg.unseen_grasp_settle_s > 0:
+                step = max(int(round(cfg.unseen_grasp_step_s * self.ep.fps)), 1)
+                tmax = min(e.t + int(round(cfg.unseen_grasp_settle_s * self.ep.fps)), next_gripper_t - 1, self.ep.n_frames - 1)
+                ts += list(range(e.t + step, tmax + 1, step))
+            last = None
+            for t in ts:
+                wc = self.ep.frame(t, [cam_name], causal=True).cams.get(cam_name)
+                if wc is None or wc.t == last:
+                    continue
+                last = wc.t
+                eef = np.asarray(self.ep.robot(wc.t).eef_world(arm), float)
+                base = self._img_base(wc)
+                cands = []
+                for d in self.det.detect(wc, self.categories):
+                    w = Tracker._world(d, base)
+                    if w is not None:
+                        dist = box_distance(eef, w, Tracker._world_size(d, base) if d.size is not None else None)
+                    elif (p := self._eef_pixel(wc, self.ep.robot(wc.t), arm)) is not None and \
+                            d.box[0] <= p[0] <= d.box[2] and d.box[1] <= p[1] <= d.box[3]:
+                        dist = 0.0  # 2D: the fingertip pixel lies in the detection's box
+                    else:
+                        continue
+                    if is_support(d.category) and d.category not in OPENABLE_KEYS:
+                        continue  # a counter / plate under the object says nothing about what the fingers hold
+                    cands.append((is_support(d.category), dist, -d.score, d))
+                ok = sorted((c for c in cands if c[1] <= cfg.wrist_grasp_radius), key=lambda c: c[:3])
+                checks.append({"t": wc.t, "detections": len(cands),
+                               "near": [[c[3].category, round(c[1], 3)] for c in ok[:4]]})
+                if ok:
+                    near = (ok[0][3], ok[0][1], wc.t)
+                    break
+            info.update(camera=cam_name, checks=checks)
+        else:
+            info["camera"] = None
+        if near is not None:
+            d, dist, wt = near
+            info["wrist"] = {"category": d.category, "distance": round(dist, 3), "t": wt}
+            if is_support(d.category):
+                info["result"] = f"closed on a {d.category} (door / lid handle): nothing bound"
+                return None, info
+            if (known := self._known_near(arm, fr, [d.category])) is not None:
+                info.update(result="known track near the hand (stale position)", alias=known)
+                return known, info
+            names = self.tracker.unplaced(d.category)
+            if not names:
+                info["result"] = f"wrist sees a {d.category}, no position-less expected name of it"
+                return None, info
+            self.tracker.bind_at_grasp(names[0], e.t, "wrist", {"arm": arm, "wrist": info["wrist"]})
+            self.tracker.tracks[names[0]].seen_ts.append(e.t)  # detected (wrist camera) at this event
+            info.update(result="bound (wrist)", alias=names[0])
+            return names[0], info
+        cats, src = self._pointed_categories()
+        if (known := self._known_near(arm, fr, cats)) is not None:
+            info.update(result="known track near the hand (stale position)", alias=known)
+            return known, info
+        names = sorted(a for a in self.tracker.unplaced() if self._cat(a) in cats)
+        info["pointed"] = {"categories": cats, "from": src, "names": names}
+        if not names:
+            info["result"] = "no wrist detection and no position-less expected name of the pointed categories"
+            return None, info
+        how = "only" if len(names) == 1 else "unverified"
+        self.tracker.bind_at_grasp(names[0], e.t, how, {"arm": arm, "candidates": names})
+        info.update(result=f"bound ({how})", alias=names[0])
+        return names[0], info
+
+    def _known_near(self, arm: str, fr: FrameRecord, cats: Sequence[str]) -> str | None:
+        """A known (detected before), not held track of these categories within ``reacquire_radius`` of the EEF (box
+        distance): the grasp took it although its last position was beyond ``grasp_radius`` -- it, not a new name."""
+        r = self.cfg.tracks.reacquire_radius
+        eef = np.asarray(fr.eef_world(arm), float)
+        best = min(((box_distance(eef, tr.pos, tr.size), a) for a, tr in self.tracker.tracks.items()
+                    if tr.category in cats and not tr.expected and tr.held_by is None and tr.pos is not None
+                    and not is_support(tr.category)), default=None)
+        return best[1] if best is not None and r > 0 and best[0] <= r else None
 
     def _update_lift(self, t: int) -> None:
         """Highest EEF rise of each provisional grasp since its close, over every robot frame up to ``t``."""
@@ -1263,7 +1429,9 @@ class Generator:
     def _retract(self, arm: str, pend: dict[str, Any], t: int, why: str) -> None:
         """The close did not hold the object: back where it was, its relations as remembered before the close."""
         tr = self.tracker.tracks.get(pend["obj"])
-        if tr is not None:
+        if tr is not None and pend.get("bound_at_grasp"):
+            self.tracker.unbind(pend["obj"])  # fix5 A: the name was bound by this close only -> expected again
+        elif tr is not None:
             tr.held_by, tr.hold_offset, tr.released_at = None, None, None
             if pend.get("pos0") is not None:
                 tr.pos = pend["pos0"]
@@ -1466,7 +1634,10 @@ class Generator:
             cats[tr.category] = cats.get(tr.category, 0) + 1
         identity = {**self.tracker.counts, "tracks_per_category": cats, "expected_unbound": self.tracker.expected(),
                     "late_merges": len(self.tracker.merges), "caps": dict(self.tracker.caps),
-                    "capped": self.tracker.capped[:50], "capped_dropped": self.tracker.capped_dropped[:50]}
+                    "capped": self.tracker.capped[:50], "capped_dropped": self.tracker.capped_dropped[:50],
+                    # bggen-fix5
+                    "grasp_binds": self.tracker.grasp_binds, "identity_checks": self.tracker.identity_checks[:50],
+                    "identity_calls": len(self.identity_calls), "relocations": self.tracker.relocations}
         return {"init_failed": self.init_info.get("failed"), "track_identity": identity,
                 "events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
                 "agent_fallback_reasons": reasons, "grasp_checks": self.grasp_checks,

@@ -52,12 +52,30 @@ def b1k(mode: str = "A") -> GenConfig:
         # measured from the hand / release place. ASSUMPTION: re-measure from summary ``capped`` / ``capped_dropped``.
         # The countertop is exempt: the one countertop of the scene is several slabs (an L-shaped counter), a far slab is
         # still it.
+        # bggen-fix5 (batch3 d401b65 kubectl traces):
+        # A4 held_reacquire_radius 0.30 m (030: the hot dog in the left hand was named hotdog_A, then hotdog_B by the
+        # expected-name binding): a detection this close to a held hot dog is it. Why 0.30: reacquire_radius 0.25 (the
+        # same unmoved object again) + a margin for a name bound at the EEF (offset 0) whose mask centre is half a hot dog
+        # (~0.075 m) off the fingers. ASSUMPTION: re-measure from the trace ('reacquired at the hand' distances).
+        # B bind_confirm: microwave_A was bound to the built-in oven door (010 t746, 020 t1135; 4.8 m from the microwave)
+        # and the cap of 1 dropped the real microwave 38 / 49 times: the first binding of a capped-at-1 name (fridge,
+        # microwave) asks the VDM. The countertop is exempt (never an expected name: extra category; and its far slabs
+        # are still it, as for cap_assign_exempt).
+        # C relocate 3 events within 0.3 m (spec): the track moves to a place it keeps being dropped at.
         tracks=TrackConfig(assoc_radius=0.15, assoc_px=60.0, merge_radius=0.15, grasp_radius=0.10, fixed_categories=(),
                            reacquire_radius=0.25, max_instances={"countertop": 1, "fridge": 1, "microwave": 1},
                            large_extent=0.4, cap_from_init=True, cap_assign_radius=1.0,
-                           cap_assign_exempt=("countertop",)),
+                           cap_assign_exempt=("countertop",),
+                           held_reacquire_radius=0.30, bind_confirm=True, bind_confirm_exempt=("countertop",),
+                           relocate_min_events=3, relocate_radius=0.3),
         verifier=VerifierConfig(flat_dz={}),  # LIBERO table does not apply; first accepted Observe 1 per pair
         cook_s=10.0, navigation_subtask=True,
+        # bggen-fix5 A (030: both hot dogs came out of the closed fridge never detected; the grasps at t2057 / t2720 had no
+        # candidate and the hot dogs stayed behind): the arm's wrist camera at the grasp names the category; a detection
+        # box within 0.10 m of the EEF (= grasp_radius; batch3 EEF-to-hot-dog centres 0.07 / 0.03 m) counts. Mode A also
+        # looks up to 0.5 s later (the fingers / arm may cover the object at the closing frame).
+        unseen_grasp=True, arm_cameras={"left": "left_wrist", "right": "right_wrist"}, wrist_grasp_radius=0.10,
+        unseen_grasp_settle_s=0.5,
     )
 
 

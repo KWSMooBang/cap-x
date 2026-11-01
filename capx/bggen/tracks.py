@@ -27,6 +27,18 @@
 * Large tracks (``large_extent``; countertop / fridge on a moving head camera) associate by box gap.
 * Grasp target: the track nearest to the EEF by point-to-box distance (``grasp_radius``); movable
   objects win over supports / containers at the same distance (a door handle grasp -> the fridge).
+* bggen-fix5 (all off by default; the B1K preset turns them on, LIBERO keeps the fix4 decisions):
+  - A4 ``held_reacquire_radius``: an unmatched detection near a held track (its hand) is that track, before an
+    expected name is bound to it (B1K 030: hotdog_B was bound to the hot dog already in the left hand).
+  - A1-3 ``bind_at_grasp``: the generator binds a position-less expected name to the hand when a grasp has no
+    target with a position (B1K 030: both hot dogs came out of the fridge unseen); see ``Generator._grasp_unseen``.
+  - B ``bind_confirm``: the first binding of an expected name of a category capped at 1 (fridge / microwave) asks
+    the VDM whether the marked detection is that category (``confirm`` callback of ``update``); 0 -> not bound
+    (``rejected_identity``; the place is remembered and later detections there are rejected without a call), ? ->
+    bound and marked (``bind_note``).
+  - C ``relocate_min_events``: a capped-at-1 track whose dropped far detections (``capped_dropped``) repeat at one
+    place (>= that many distinct events, pairwise within ``relocate_radius``) more often than the track was re-detected
+    since its binding is moved there (``relocations``; earlier rows keep the old place).
 """
 
 from __future__ import annotations
@@ -79,6 +91,17 @@ class TrackConfig:
     # categories without that limit: an extended surface made of several slabs (a kitchen counter) is one object whose
     # far parts are still it (its track moves to the part seen now, where the objects on it are)
     cap_assign_exempt: tuple[str, ...] = ()
+    # --- bggen-fix5 (0 / False = off: the fix4 behaviour) ---
+    # A4: an unmatched detection within this distance (3D m) of a HELD track of its category (the track follows the
+    # hand) is that track, before any expected name of the category is bound to it
+    held_reacquire_radius: float = 0.0
+    # B: the first binding of an expected name of a category capped at 1 is checked by the ``confirm`` callback
+    bind_confirm: bool = False
+    bind_confirm_exempt: tuple[str, ...] = ()
+    # C: relocation of a capped-at-1 track to a repeated far place (>= relocate_min_events distinct events, pairwise
+    # within relocate_radius); 0 = off
+    relocate_min_events: int = 0
+    relocate_radius: float = 0.3
 
 
 @dataclass
@@ -101,13 +124,16 @@ class Track:
     expected: bool = False
     seen_ts: list[int] = field(default_factory=list, repr=False)  # frames with a detection (bggen-fix3 B4)
     zlim: tuple[float, float] | None = None  # world z of the mask's lowest / highest depth points (5 / 95 %)
+    bound_t: int | None = None  # frame the name got its object (created / expected name bound / relocated)
+    bind_note: str | None = None  # bggen-fix5: how the name was bound when not by a plain detection
 
     def to_dict(self) -> dict[str, Any]:
         return {"alias": self.alias, "category": self.category,
                 "pos": None if self.pos is None else [round(float(x), 3) for x in self.pos],
                 "size": None if self.size is None else [round(float(x), 3) for x in self.size],
                 "last_seen": self.last_seen, "seen_now": self.seen_now, "held_by": self.held_by,
-                **({"expected": True} if self.expected else {})}
+                **({"expected": True} if self.expected else {}),
+                **({"bind_note": self.bind_note} if self.bind_note else {})}
 
 
 def box_distance(p: np.ndarray, center: np.ndarray, size: np.ndarray | None) -> float:
@@ -130,6 +156,16 @@ class Tracker:
         self.caps: dict[str, int] = dict(self.cfg.max_instances)  # category -> max tracks (config + init)
         self.capped: list[dict[str, Any]] = []  # detections of a full category given to an existing track
         self.capped_dropped: list[dict[str, Any]] = []  # detections of a full category beyond cap_assign_radius
+        # bggen-fix5 (their counters are added to ``counts`` only when they happen: fix4 summaries keep their keys)
+        self.identity_checks: list[dict[str, Any]] = []  # B: every confirm call / cached rejection
+        self.rejected_spots: list[Track] = []  # B: places whose detection the VDM said is not the category
+        self.far_spots: dict[str, list[dict[str, Any]]] = {}  # C: dropped far detections of capped-at-1 categories
+        self.relocations: list[dict[str, Any]] = []
+        self.grasp_binds: list[dict[str, Any]] = []  # A: expected names bound to a hand at a grasp
+        self._confirm: Any = None
+
+    def _count(self, key: str, n: int = 1) -> None:
+        self.counts[key] = self.counts.get(key, 0) + n
 
     # --- names -----------------------------------------------------------------------------------
     def _next_alias(self, cat: str) -> str:
@@ -183,7 +219,7 @@ class Tracker:
         return [a for a, tr in self.tracks.items() if tr.expected]
 
     def _new(self, t: int, cam: str, d: Detection, base_pose: np.ndarray | None) -> Track:
-        tr = Track(self._next_alias(d.category), d.category, created=t)
+        tr = Track(self._next_alias(d.category), d.category, created=t, bound_t=t)
         self._fill(tr, t, cam, d, base_pose)
         self.tracks[tr.alias] = tr
         return tr
@@ -237,6 +273,8 @@ class Tracker:
         if d.mask is not None:
             tr.mask[cam] = d.mask
         tr.last_seen, tr.seen_now = t, True
+        if tr.expected:
+            tr.bound_t = t
         tr.expected = False
         if tr.released_at is not None and t > tr.released_at[0]:
             tr.released_at = None
@@ -269,12 +307,17 @@ class Tracker:
         return m[1] / r if r > 0 else None
 
     def update(self, t: int, cam: str, dets: Sequence[Detection], base_pose: np.ndarray | None = None,
-               detected_categories: Sequence[str] | None = None, keep_seen: bool = False) -> dict[str, Any]:
+               detected_categories: Sequence[str] | None = None, keep_seen: bool = False, confirm: Any = None,
+               ) -> dict[str, Any]:
         """Associate this frame's detections; returns {"matched", "new", "merged", "dropped"}.
 
         ``keep_seen``: a second pass over the SAME frame (the agent's ``detect`` tool adds detections of another
         prompt): tracks already detected in this frame keep that match and count as taken -- a detection of the same
-        object is a duplicate, never a second name for it (bggen-fix3 B2)."""
+        object is a duplicate, never a second name for it (bggen-fix3 B2).
+
+        ``confirm(alias, detection, t) -> "1" | "0" | "?"`` (bggen-fix5 B, only with ``bind_confirm``): asked before an
+        expected name of a category capped at 1 is first bound to a detection."""
+        self._confirm = confirm
         cats = set(detected_categories) if detected_categories is not None else {d.category for d in dets}
         taken: set[str] = set()
         for a, tr in self.tracks.items():
@@ -400,12 +443,48 @@ class Tracker:
                 used.add(free[c])
                 out.append((idx[r], free[c], f"reacquired: unmatched track within the reacquire radius ({cost[r, c]:.2f})"))
             idx = [i for i in idx if all(i != o[0] for o in out)]
+            # 2b. (bggen-fix5 A4) a held track of the category: a detection near its hand is it, not an expected name
+            if cfg.held_reacquire_radius > 0 and idx:
+                held = [a for a in self._known(cat) if a not in used and self.tracks[a].held_by is not None
+                        and self.tracks[a].pos is not None]
+                cost = np.full((len(idx), len(held)), np.inf)
+                for r, i in enumerate(idx):
+                    w = self._world(dets[i], base_pose)
+                    for c, a in enumerate(held):
+                        if w is not None:
+                            x = float(np.linalg.norm(w - self.tracks[a].pos)) / cfg.held_reacquire_radius
+                            if x <= 1.0:
+                                cost[r, c] = x
+                for r, c in self._joint(cost):
+                    self._count("reacquired_held")
+                    used.add(held[c])
+                    out.append((idx[r], held[c], f"reacquired at the hand: held track within the held reacquire radius "
+                                                 f"({cost[r, c]:.2f})"))
+                idx = [i for i in idx if all(i != o[0] for o in out)]
             # 3. expected names (alphabetical), highest-score detections first
-            for i, a in zip(list(idx), sorted(a for a in self.expected() if self.tracks[a].category == cat and a not in used), strict=False):
-                self.counts["bound_expected"] += 1
-                used.add(a)
-                out.append((i, a, "bound to the expected object named by the task / init"))
-                idx.remove(i)
+            exp = sorted(a for a in self.expected() if self.tracks[a].category == cat and a not in used)
+            confirm = self._confirms(cat)
+            if confirm and exp:
+                for a in exp:
+                    for i in list(idx):
+                        ans = self._check_identity(a, dets[i], t, cam, base_pose)
+                        if ans == "0":
+                            idx.remove(i)
+                            out.append((i, None, "drop"))
+                            continue
+                        self.counts["bound_expected"] += 1
+                        used.add(a)
+                        if ans != "1":
+                            self.tracks[a].bind_note = "identity ?"
+                        out.append((i, a, f"bound to the expected object named by the task / init (identity {ans})"))
+                        idx.remove(i)
+                        break
+            else:
+                for i, a in zip(list(idx), exp, strict=False):
+                    self.counts["bound_expected"] += 1
+                    used.add(a)
+                    out.append((i, a, "bound to the expected object named by the task / init"))
+                    idx.remove(i)
             if not idx:
                 continue
             # 4. closed world / caps. A cap counts every name of the category (expected names, bound in this frame
@@ -425,6 +504,8 @@ class Tracker:
             if room < len(idx) and (not fixed or cap is not None):
                 # a capped category: every name (an expected one too) can take the detection
                 free = [a for a in (named if cap is not None else known) if a not in used]
+                if confirm:  # B: an expected name is bound only through the identity check above
+                    free = [a for a in free if not self.tracks[a].expected]
                 cost = np.full((len(idx), len(free)), np.inf)
                 unit: dict[tuple[int, str], str] = {}
                 for r, i in enumerate(idx):
@@ -439,6 +520,10 @@ class Tracker:
             for x, i, a in assigned:
                 if full:
                     far = self._cap_far(self.tracks[a], dets[i], cam, base_pose, x, unit[(i, a)])
+                    if far is not None and cap == 1 and (rel := self._relocate(a, dets[i], t, base_pose, far)):
+                        used.add(a)
+                        out.append((i, a, rel))
+                        continue
                     if far is not None:
                         self.counts["capped_dropped"] += 1
                         self.capped_dropped.append({"t": t, "category": cat, "nearest": a, **far})
@@ -488,6 +573,107 @@ class Tracker:
             return None
         return {"distance": round(dist, 3), "unit": unit, "limit": lim, "from": ref,
                 "why": f"cap full: nearest track {tr.alias} {dist:.2f} {unit} away ({ref}) > {lim} {unit}"}
+
+    # --- bggen-fix5 B: identity check of a first binding ----------------------------------------------------------
+    def _confirms(self, cat: str) -> bool:
+        """The first binding of this category's expected names is checked (B): ``bind_confirm``, cap 1, not exempt and
+        a ``confirm`` callback given for this update."""
+        return (self.cfg.bind_confirm and self._confirm is not None and self.caps.get(cat) == 1
+                and cat not in self.cfg.bind_confirm_exempt)
+
+    def _check_identity(self, alias: str, d: Detection, t: int, cam: str, base_pose: np.ndarray | None) -> str:
+        """"1" / "0" / "?" for "the marked detection is a <category>". A detection at a place already rejected (within
+        ``assoc_radius`` of it, box gap for large objects) is rejected again without a call."""
+        rec: dict[str, Any] = {"t": t, "alias": alias, "category": d.category, "pixel": [round(x, 1) for x in d.pixel]}
+        w = self._world(d, base_pose)
+        if w is not None:
+            rec["world"] = [round(float(x), 3) for x in w]
+            for spot in self.rejected_spots:
+                m = self._metric(spot, d, cam, base_pose)
+                if m is not None and m[0] == "m" and m[1] <= self.cfg.assoc_radius:
+                    rec.update(answer="0", cached=True, spot_t=spot.created)
+                    self.identity_checks.append(rec)
+                    self._count("rejected_identity_cached")
+                    return "0"
+        try:
+            ans = str(self._confirm(alias, d, t)).strip()
+        except Exception as exc:  # noqa: BLE001 -- a failed call cannot tell
+            ans, rec["error"] = "?", str(exc)
+        ans = ans if ans in ("1", "0", "?") else "?"
+        rec["answer"] = ans
+        self.identity_checks.append(rec)
+        self._count("identity_checks")
+        if ans == "0":
+            self._count("rejected_identity")
+            if w is not None:
+                self.rejected_spots.append(Track(f"rejected:{alias}", d.category, w, self._world_size(d, base_pose)
+                                                 if d.size is not None else None, created=t))
+        elif ans == "?":
+            self._count("bound_identity_unknown")
+        return ans
+
+    # --- bggen-fix5 C: relocation of a capped-at-1 track --------------------------------------------------------------
+    def _relocate(self, alias: str, d: Detection, t: int, base_pose: np.ndarray | None, far: dict[str, Any]) -> str | None:
+        """Record a dropped far detection of a capped-at-1 category; when they repeat at one place (>=
+        ``relocate_min_events`` distinct events, pairwise within ``relocate_radius``) more often than ``alias`` was
+        re-detected since its binding, the track moves there: returns the reason (the caller assigns ``d`` to it)."""
+        cfg = self.cfg
+        tr = self.tracks[alias]
+        w = self._world(d, base_pose)
+        if cfg.relocate_min_events <= 0 or w is None or far.get("unit") != "m" or tr.held_by is not None \
+                or tr.category in cfg.cap_assign_exempt:
+            return None
+        spots = self.far_spots.setdefault(tr.category, [])
+        spots.append({"t": t, "w": w})
+        # the cluster around this detection: nearest first, each member within the radius of every other one
+        members: list[dict[str, Any]] = []
+        for s in sorted(spots, key=lambda s: float(np.linalg.norm(s["w"] - w))):
+            if all(float(np.linalg.norm(s["w"] - m["w"])) <= cfg.relocate_radius for m in members) and \
+                    float(np.linalg.norm(s["w"] - w)) <= cfg.relocate_radius:
+                members.append(s)
+        events = sorted({m["t"] for m in members})
+        b = tr.bound_t if tr.bound_t is not None else tr.created
+        redet = len([s for s in tr.seen_ts if s > b])
+        if len(events) < cfg.relocate_min_events or redet >= len(events):
+            return None
+        old = None if tr.pos is None else [round(float(x), 3) for x in tr.pos]
+        rec = {"t": t, "alias": alias, "category": tr.category, "from": old, "to": [round(float(x), 3) for x in w],
+               "events": events, "redetections_since_bound": redet, "bound_t": b, "distance": far.get("distance")}
+        self.relocations.append(rec)
+        self._count("relocated")
+        self.log.append({"kind": "relocated", **rec})
+        self.far_spots[tr.category] = [s for s in spots if all(s is not m for m in members)]
+        tr.pos, tr.size, tr.zlim = None, None, None  # the caller's fill puts it at this detection
+        tr.pixel, tr.box, tr.mask = {}, {}, {}
+        tr.bound_t, tr.released_at = t, None
+        tr.bind_note = (tr.bind_note + "; " if tr.bind_note else "") + f"relocated @{t}"
+        return (f"relocated: {len(events)} events at this place (within {cfg.relocate_radius} m) vs {redet} re-detections "
+                f"of {alias} since its binding at t={b}")
+
+    # --- bggen-fix5 A: binding at a grasp -------------------------------------------------------------------------
+    def unplaced(self, cat: str | None = None) -> list[str]:
+        """Expected names (no position, no detection) of the category, alphabetical."""
+        return sorted(a for a, tr in self.tracks.items() if tr.expected and tr.pos is None
+                      and (cat is None or tr.category == cat))
+
+    def bind_at_grasp(self, alias: str, t: int, how: str, info: dict[str, Any] | None = None) -> None:
+        """An expected name gets the object a hand closed on (the caller then holds it at the EEF)."""
+        tr = self.tracks[alias]
+        tr.expected, tr.bound_t = False, t
+        tr.bind_note = f"grasp {how}"
+        rec = {"t": t, "alias": alias, "how": how, **(info or {})}
+        self.grasp_binds.append(rec)
+        self._count({"wrist": "grasp_bound_wrist", "only": "grasp_bound_only",
+                     "unverified": "grasp_bound_unverified"}.get(how, f"grasp_bound_{how}"))
+        self.log.append({"kind": "grasp_bound", **rec})
+
+    def unbind(self, alias: str) -> None:
+        """Undo ``bind_at_grasp`` (a retracted provisional grasp): the name is expected again, without a position."""
+        tr = self.tracks[alias]
+        tr.expected, tr.pos, tr.size, tr.zlim, tr.bound_t, tr.bind_note = True, None, None, None, None, None
+        tr.held_by, tr.hold_offset, tr.released_at = None, None, None
+        self._count("grasp_unbound")
+        self.log.append({"kind": "grasp_unbound", "alias": alias})
 
     def _released_near(self, d: Detection, cam: str, base_pose: np.ndarray | None, exclude: set[str]) -> str | None:
         """The released, not-yet-re-seen object of this category whose release place is near ``d``."""
