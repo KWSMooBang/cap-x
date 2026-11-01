@@ -305,3 +305,64 @@ def test_runbook_propagates_failures():
     assert not any("| head" in ln or "| tail" in ln for ln in body)  # SIGPIPE under pipefail
     assert "SAM3 server not up" in sh and "exit 3" in sh
     subprocess.run(["bash", "-n", str(REPO / "scripts/bggen/kubectl_runbook.sh")], check=True)
+
+
+# --- review of 19453b8 (lead_cap-bg, 4 major) -----------------------------------------------------------
+
+def test_articulated_exclusion_covers_only_the_arm_on_the_door(tmp_path):
+    o = _oracle(tmp_path)
+    trace = [{"t": 0, "tracks": [_trk("bowl_A", "bowl", [0, 0, 0]), _trk("bowl_B", "bowl", [0.5, 0, 0]),
+                                 _trk("plate_A", "plate", [0, 0, -0.02]), _trk("fridge_A", "fridge", None, False)]}]
+    tm = TrackMap(trace, o, 0.15)
+    rows = [{"t": 25, "belief": {"(inhand_left fridge_A)": [0.97, "robot"], "(handempty_left)": [0.03, "robot"],
+                                 # the right arm is wrong (it holds nothing in the oracle): still scored
+                                 "(handempty_right)": [0.03, "robot"], "(inhand_right bowl_A)": [0.97, "robot"]}}]
+    r = relation_accuracy(rows, o, tm, ["bowl_A", "bowl_B", "plate_A", "fridge_A"], ["left", "right"], tol=5)
+    assert r["articulated"]["excluded_robot_keys"] == {"inhand=1": 1, "handempty=0": 1}
+    assert r["per_pred"]["handempty"]["wrong"] == 1 and r["per_pred"]["inhand"]["wrong"] == 1 and r["accuracy"] == 0.0
+
+
+def test_relation_accuracy_uses_one_map_per_episode(tmp_path):
+    states = [{"t": t, "pos": {"bowl_1": [0, 0, 0], "bowl_2": [0.5, 0, 0], "plate_1": [0, 0, -0.02]},
+               "true": [["on", "bowl_1", "plate_1"]], "inhand": {"main": None}} for t in range(0, 101, 2)]
+    write_oracle(tmp_path, {"objects": {"bowl_1": "bowl", "bowl_2": "bowl", "plate_1": "plate"}, "relations": ["on"],
+                            "arms": ["main"]}, states, [], {"success": True})
+    o = load_oracle(tmp_path)
+    plate = _trk("plate_A", "plate", [0, 0, -0.02])
+    trace = [{"t": t, "tracks": [_trk("bowl_A", "bowl", [0, 0, 0]), _trk("bowl_B", "bowl", [0.5, 0, 0]), plate]}
+             for t in (0, 30, 60)]
+    # the tracker swapped the names at t=90
+    trace.append({"t": 90, "tracks": [_trk("bowl_A", "bowl", [0.5, 0, 0]), _trk("bowl_B", "bowl", [0, 0, 0]), plate]})
+    tm = TrackMap(trace, o, 0.15)
+    assert tm.fixed() == {"bowl_A": "bowl_1", "bowl_B": "bowl_2", "plate_A": "plate_1"}
+    rows = [{"t": 90, "belief": {"(on bowl_A plate_A)": [0.1, "obs"], "(on bowl_B plate_A)": [0.9, "obs"]}}]
+    names = ["bowl_A", "bowl_B", "plate_A"]
+    assert relation_accuracy(rows, o, tm, names, [None], tol=0)["accuracy"] == 0.0  # main: the swap is wrong
+    assert relation_accuracy(rows, o, tm, names, [None], tol=0, remap=True)["accuracy"] == 1.0  # auxiliary
+    nc = name_consistency(tm)
+    assert nc["map_changes"] == 2 and nc["rate"] < 1.0
+
+
+def test_zero_distance_duplicate_mask_is_dropped_not_given_to_another_object():
+    big = (2.0, 0.6, 0.9)
+    tr = Tracker(TrackConfig(assoc_radius=0.15, large_extent=0.4, closed_world=True))
+    tr.initialize(0, "head", [_det("countertop", 0.0, 0.0, 0.9, big), _det("countertop", 5.0, 0.0, 0.9, big)])
+    far = next(a for a, t in tr.tracks.items() if t.pos[0] > 1)
+    pos = tr.tracks[far].pos.copy()
+    # two masks of the near counter, both inside its box (box gap 0)
+    rep = tr.update(10, "head", [_det("countertop", 0.3, 0.0, 0.9, big),
+                                 _det("countertop", -0.3, 0.0, 0.9, big, score=0.8)])
+    assert rep["new"] == [] and tr.counts["duplicates_dropped"] == 1 and tr.counts["closed_assigned"] == 0
+    assert np.allclose(tr.tracks[far].pos, pos) and not tr.tracks[far].seen_now
+
+
+def test_reacquire_is_a_joint_assignment_not_score_greedy():
+    tr = _libero_tracker(lm_cfg().tracks)
+    a = next(x for x, t in tr.tracks.items() if t.category == "bowl" and abs(t.pos[1]) < 0.05)  # y 0
+    b = next(x for x, t in tr.tracks.items() if t.category == "bowl" and x != a)  # y -0.2
+    # d1 (high score) is ambiguous: 0.105 from A, 0.095 from B; d2 is 0.09 from B only. Greedy by score gave B to
+    # d1 and pushed d2 onto A (0.29 away) through the closed world; jointly d1 -> A, d2 -> B.
+    rep = tr.update(30, "cam", [_det("bowl", 0.6, -0.105, score=0.95), _det("bowl", 0.6, -0.29, score=0.6)],
+                    detected_categories=["bowl"])
+    assert rep["new"] == [] and tr.counts["reacquired"] == 2 and tr.counts["closed_assigned"] == 0
+    assert np.isclose(tr.tracks[a].pos[1], -0.105) and np.isclose(tr.tracks[b].pos[1], -0.29)

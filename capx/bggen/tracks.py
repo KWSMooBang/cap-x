@@ -238,12 +238,13 @@ class Tracker:
             used_t.add(a)
             self._fill(self.tracks[a], t, cam, dets[i], base_pose)
             rep["matched"][a] = round(dist, 3)
-        # a duplicate of a track matched this frame (two masks of one object) is dropped
+        # a duplicate of a track matched this frame (two masks of one object) is dropped. A distance of 0 (a large
+        # object's boxes overlap) is the closest possible match, not "unknown": only None is not comparable.
         rest = []
         for i, d in enumerate(dets):
             if i in used_d:
                 continue
-            if any((self._dist(self.tracks[a], d, cam, base_pose) or 9.0) <= 1.5 for a in used_t
+            if any((x := self._dist(self.tracks[a], d, cam, base_pose)) is not None and x <= 1.5 for a in used_t
                    if self.tracks[a].category == d.category):
                 rep["dropped"] += 1
                 self.counts["duplicates_dropped"] += 1
@@ -254,15 +255,13 @@ class Tracker:
         for i, d in enumerate(dets):
             if i in used_d or i in rest:
                 n_det[d.category] = n_det.get(d.category, 0) + 1
-        for i in sorted(rest, key=lambda i: -dets[i].score):
+        for i, target, why in self._identify(rest, dets, t, cam, base_pose, used_t, n_det):
             d = dets[i]
-            target, why = self._identify(d, t, cam, base_pose, used_t, n_det.get(d.category, 0))
             if why == "drop":
                 rep["dropped"] += 1
                 continue
             if target is not None:
                 self._fill(self.tracks[target], t, cam, d, base_pose)
-                used_t.add(target)
                 rec = {"t": t, "from": None, "into": target, "why": why}
                 if why.startswith("detection at the release place"):
                     rep["merged"].append(rec)
@@ -281,47 +280,104 @@ class Tracker:
         rep["merged"] += self._late_merges(t, cam)
         return rep
 
-    def _identify(self, d: Detection, t: int, cam: str, base_pose: np.ndarray | None, used: set[str],
-                  n_det: int) -> tuple[str | None, str]:
-        """Which existing track an unmatched detection is, before it gets a new name, in this order:
+    @staticmethod
+    def _joint(cost: np.ndarray) -> list[tuple[int, int]]:
+        """Minimum-total-distance one-to-one assignment (rows x cols, inf = not allowed): (row, col) pairs."""
+        if cost.size == 0:
+            return []
+        from scipy.optimize import linear_sum_assignment
+
+        finite = np.isfinite(cost)
+        if not finite.any():
+            return []
+        big = (cost[finite].max() + 1.0) * (cost.shape[0] + cost.shape[1] + 1)
+        r, c = linear_sum_assignment(np.where(finite, cost, big))
+        return [(i, j) for i, j in zip(r, c, strict=True) if finite[i, j]]
+
+    def _identify(self, rest: Sequence[int], dets: Sequence[Detection], t: int, cam: str, base_pose: np.ndarray | None,
+                  used: set[str], n_det: dict[str, int]) -> list[tuple[int, str | None, str]]:
+        """Which existing track each unmatched detection is, before any gets a new name, in phases:
 
         1. the released, not-yet-re-seen object whose release place is near (an event names it);
-        2. the nearest unmatched track of the category within ``reacquire_radius`` (held / unseen included);
-        3. an expected name of the category (named by the task / init, not detected before);
-        4. closed world / ``max_instances`` / ``fixed_closed``: a new instance needs evidence (more detections of
-           the category this frame than known tracks, under the cap); otherwise the nearest unmatched known track
-           (movable objects: any distance; fixed ones only within the reacquire radius) or a dropped duplicate.
+        2. unmatched known tracks of the category within ``reacquire_radius`` (held / unseen included), assigned
+           JOINTLY by distance over all remaining detections (an ambiguous high-score detection cannot take a track
+           that another detection explains better);
+        3. expected names of the category (named by the task / init, not detected before);
+        4. closed world / ``max_instances`` / ``fixed_closed``: at most (detections this frame - known tracks, or the
+           cap's free room) new instances; the other detections are jointly assigned to the nearest unmatched known
+           tracks (movable or capped categories: any distance; fixed ones were only eligible in phase 2), the
+           worst-fitting ones become the allowed new tracks, the rest are dropped.
 
-        Returns (alias | None, why); (None, "drop") drops the detection, (None, "new") makes a new track."""
-        cat, cfg = d.category, self.cfg
-        target = self._released_near(d, cam, base_pose, exclude=used)
-        if target is not None:
-            self.counts["merged_on_detect"] += 1
-            return target, "detection at the release place of the last held object"
-        free = [a for a in self._known(cat) if a not in used]
-        near = sorted((x, a) for a in free if (x := self._reacq_dist(self.tracks[a], d, cam, base_pose)) is not None and x <= 1.0)
-        if near:
-            self.counts["reacquired"] += 1
-            return near[0][1], f"reacquired: unmatched track within the reacquire radius ({near[0][0]:.2f})"
-        exp = sorted(a for a in self.expected() if self.tracks[a].category == cat and a not in used)
-        if exp:
-            self.counts["bound_expected"] += 1
-            return exp[0], "bound to the expected object named by the task / init"
-        known = self._known(cat)
-        cap = cfg.max_instances.get(cat)
-        fixed = cat in cfg.fixed_categories
-        closed = (cap is not None and len(known) >= cap) \
-            or (fixed and cfg.fixed_closed and self.init_t is not None and t > self.init_t and bool(known)) \
-            or (cfg.closed_world and bool(known) and n_det <= len(known))
-        if not closed:
-            return None, "new"
-        if not fixed or cap is not None:
-            cands = sorted((self._metric(self.tracks[a], d, cam, base_pose) or ("?", 1e9))[1:] + (a,) for a in free)
-            if cands:
+        Returns [(detection index, alias | None, why)]; alias None with why "new" / "drop". ``used`` is updated."""
+        cfg = self.cfg
+        out: list[tuple[int, str | None, str]] = []
+        left = sorted(rest, key=lambda i: -dets[i].score)
+        # 1. events
+        for i in list(left):
+            target = self._released_near(dets[i], cam, base_pose, exclude=used)
+            if target is not None:
+                self.counts["merged_on_detect"] += 1
+                used.add(target)
+                out.append((i, target, "detection at the release place of the last held object"))
+                left.remove(i)
+        cats = list(dict.fromkeys(dets[i].category for i in left))
+        for cat in cats:
+            idx = [i for i in left if dets[i].category == cat]
+            # 2. reacquire: joint assignment within the reacquire radius
+            free = [a for a in self._known(cat) if a not in used]
+            cost = np.full((len(idx), len(free)), np.inf)
+            for r, i in enumerate(idx):
+                for c, a in enumerate(free):
+                    x = self._reacq_dist(self.tracks[a], dets[i], cam, base_pose)
+                    if x is not None and x <= 1.0:
+                        cost[r, c] = x
+            for r, c in self._joint(cost):
+                self.counts["reacquired"] += 1
+                used.add(free[c])
+                out.append((idx[r], free[c], f"reacquired: unmatched track within the reacquire radius ({cost[r, c]:.2f})"))
+            idx = [i for i in idx if all(i != o[0] for o in out)]
+            # 3. expected names (alphabetical), highest-score detections first
+            for i, a in zip(list(idx), sorted(a for a in self.expected() if self.tracks[a].category == cat and a not in used), strict=False):
+                self.counts["bound_expected"] += 1
+                used.add(a)
+                out.append((i, a, "bound to the expected object named by the task / init"))
+                idx.remove(i)
+            if not idx:
+                continue
+            # 4. closed world / caps
+            known = self._known(cat)
+            cap = cfg.max_instances.get(cat)
+            fixed = cat in cfg.fixed_categories
+            room = len(idx)  # new tracks allowed
+            if cap is not None:
+                room = min(room, max(cap - len(known), 0))
+            if fixed and cfg.fixed_closed and self.init_t is not None and t > self.init_t and known:
+                room = 0
+            if cfg.closed_world and known:
+                room = min(room, max(n_det.get(cat, 0) - len(known), 0))
+            assigned: list[tuple[float, int, str]] = []
+            if room < len(idx) and (not fixed or cap is not None):
+                free = [a for a in known if a not in used]
+                cost = np.full((len(idx), len(free)), np.inf)
+                for r, i in enumerate(idx):
+                    for c, a in enumerate(free):
+                        m = self._metric(self.tracks[a], dets[i], cam, base_pose)
+                        cost[r, c] = 1e6 if m is None else m[1]
+                assigned = sorted((cost[r, c], idx[r], free[c]) for r, c in self._joint(cost))
+                # keep the best-fitting assignments; the worst ones are the new instances the evidence allows
+                assigned = assigned[:max(len(idx) - room, 0)]
+            for _x, i, a in assigned:
                 self.counts["closed_assigned"] += 1
-                return cands[0][-1], "closed world: the nearest unmatched known track of the category"
-        self.counts["closed_dropped"] += 1
-        return None, "drop"
+                used.add(a)
+                out.append((i, a, "closed world: the nearest unmatched known track of the category (joint)"))
+            idx = [i for i in idx if all(i != x[1] for x in assigned)]
+            for k, i in enumerate(idx):
+                if k < room:
+                    out.append((i, None, "new"))
+                else:
+                    self.counts["closed_dropped"] += 1
+                    out.append((i, None, "drop"))
+        return out
 
     def _released_near(self, d: Detection, cam: str, base_pose: np.ndarray | None, exclude: set[str]) -> str | None:
         """The released, not-yet-re-seen object of this category whose release place is near ``d``."""

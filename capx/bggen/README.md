@@ -72,7 +72,7 @@ The forward rows are kept unchanged (`rows_forward.jsonl`, `cot_rows_forward.jso
 | `keyframes/` | marked images |
 | `backward_log.json` | backward decisions |
 | `summary.json`, `report.md` | events, model calls / tokens per role, fallbacks, verifier rule counts, goal, final graph, labels |
-| `eval.json`, `eval.md` | written by `cli eval`: forward vs forward+backward. Oracle object ↔ track map over the whole episode (3D, `--map-radius`, default 0.15 m / B1K 0.6 m; single-instance categories map every track), event tolerance ±`--tol` frames (default 5 / B1K 15), accuracy per relation kind, articulated grasps (door / switch segments) counted apart, boundary error vs `intent` (segment starts) and `contact` (oracle inhand changes) |
+| `eval.json`, `eval.md` | written by `cli eval`: forward vs forward+backward. Oracle object ↔ track map over the whole episode (3D, `--map-radius`, default 0.15 m / B1K 0.6 m; single-instance categories map every track). Relation accuracy is scored with ONE map per episode (each alias → its time-weighted majority object), so a name swap is an error; the per-row re-matched accuracy is an auxiliary column, and every re-match is a name-consistency error. Event tolerance ±`--tol` frames (default 5 / B1K 15), accuracy per relation kind, articulated grasps counted apart (only the arm the row believes holds the door / switch, for its inhand of that object and its handempty, inside those segments), boundary error vs `intent` (segment starts) and `contact` (oracle inhand changes) |
 
 ## Data (what the adapters read)
 
