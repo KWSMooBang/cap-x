@@ -79,6 +79,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 2g. [설계 2026-11-01] Agent as BG Generator (논문 Skeleton Ver3, 우성·현구): bg_est2 핵심을 벤치마크 무관 생성기로 일반화 —
     방식 A 시연 영상+action → BG-CoT 라벨(Ver1 형식, 앞·뒤 두 패스), 방식 B 추론 중 명시적 BG. 설계: https://claude.ai/artifact/TLLVFGWodLi5EBpT8tdiHg
     정할 것: Ver2(호용 UnsupBG)와 스키마·도구 공유 여부, 핵심 어휘, 시연 데이터 확보, 하류 학습 자원.
+    2026-11-01 사람 지시: 별도 브랜치(exp/agent-bg-gen, bg 미병합)에 구현 → LIBERO-Mem task 06 시연 1개, B1K task 45 episode_00450010 에서 테스트.
+    L2 exp_cap-bg_agent-bg-gen (구현·CPU 검증·데이터 준비) → 실제 모델 테스트는 kubectl. 데이터: HF libero-mem/LIBERO-Mem-Raw, behavior-1k/2025-challenge-demos.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
