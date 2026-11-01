@@ -125,6 +125,18 @@ class LaunchArgs:
     use_multimodel: bool | None = None
     """Whether to use multimodel for parallel ensembling."""
 
+    ensemble_candidates: str | None = None
+    """Multimodel ensemble candidates, "model@t1,t2;model2@t1" (overrides YAML ensemble.candidates).
+    Unset: upstream ENSEMBLE_CONFIGS."""
+
+    ensemble_synthesis_model: str | None = None
+    """Multimodel ensemble synthesis model (overrides YAML ensemble.synthesis_model). Unset: upstream openai/gpt-5.4."""
+
+    condition_video_mode: str | None = None
+    """RoboMME conditioning video in the first prompt: images (default; the sampled frames), vdm_text (the VDM
+    describes the frames once and the text goes in their place) or auto (vdm_text if any coding-side model
+    is text-only)."""
+
     # Memory condition (capx.belief); each overrides the YAML key of the same name
     memory_mode: str | None = None
     """Memory in the multi-turn decision prompt: none (cap-x baseline, default), vdm_history (every

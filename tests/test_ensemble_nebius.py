@@ -1,0 +1,520 @@
+"""Configurable multimodel ensemble, text-only models, conditioning video as VDM text, usage / cost logs.
+
+Ensemble requests go to a fake chat-completions HTTP server (no API key or network needed).
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+import yaml
+
+import capx.envs.trial as trial_mod
+import capx.llm.client as client
+from capx.envs.launch import LaunchArgs
+from capx.llm.client import (
+    ModelQueryArgs,
+    TextOnlyModelError,
+    parse_ensemble_candidates,
+    query_model,
+    query_model_ensemble,
+    synthesis_format_issue,
+)
+from capx.utils.launch_utils import _load_config
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import analyze_libero_mem_pilot as analyze_mem  # noqa: E402
+import analyze_robomme_pilot as analyze_rm  # noqa: E402
+import model_costs  # noqa: E402
+import run_ensemble_pilot as ens_pilot  # noqa: E402
+from test_robomme_api import make_code_env, patched_models  # noqa: E402, F401
+
+ENS_DIR = REPO_ROOT / "env_configs" / "capbg_ensemble"
+NEBIUS = [("openai/gpt-oss-120b", [0.1, 0.5, 0.9]), ("Qwen/Qwen3-235B-A22B-Instruct-2507", [0.1, 0.5, 0.9]),
+          ("moonshotai/Kimi-K2.7-Code", [0.1, 0.5, 0.9])]
+SYNTH = "deepseek-ai/DeepSeek-V4-Pro"
+CODE = "```python\nopen_gripper()\n```"
+IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+
+
+# --------------------------------------------------------------------------------------------------
+# Fake chat-completions server
+# --------------------------------------------------------------------------------------------------
+
+class FakeServer:
+    """Records every request body; replies by model. ``fail`` models get HTTP 400 (not retried)."""
+
+    def __init__(self, fail: set[str] = frozenset(), reply=None) -> None:
+        self.requests: list[dict[str, Any]] = []
+        self.fail = set(fail)
+        self.reply = reply or (lambda body: CODE)
+        lock = threading.Lock()
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # quiet
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                with lock:
+                    outer.requests.append(body)
+                # Candidates finish in temperature order, so the synthesis prompt's candidate order is fixed.
+                time.sleep(0.02 * float(body.get("temperature", 0) or 0) * 10)
+                if body["model"] in outer.fail:
+                    data, code = b'{"error": "bad request"}', 400
+                else:
+                    msg = {"role": "assistant", "content": outer.reply(body), "reasoning": "thinking"}
+                    data = json.dumps({
+                        "choices": [{"message": msg, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200,
+                                  "completion_tokens_details": {"reasoning_tokens": 150}},
+                    }).encode()
+                    code = 200
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}/chat/completions"
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.httpd.shutdown()
+
+    def synthesis(self, model: str) -> dict[str, Any]:
+        (req,) = [r for r in self.requests if r["model"] == model and r["messages"][0]["role"] == "system"]
+        return req
+
+    def candidates(self) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["messages"][0]["role"] != "system"]
+
+
+@pytest.fixture
+def server():
+    s = FakeServer()
+    yield s
+    s.close()
+
+
+def _args(url: str) -> ModelQueryArgs:
+    return ModelQueryArgs(model="unused", server_url=url, api_key="k", max_tokens=777, reasoning_effort="low")
+
+
+PROMPT = [{"role": "user", "content": [{"type": "text", "text": "Goal: pick the cube."}]}]
+
+
+# --------------------------------------------------------------------------------------------------
+# Ensemble calls
+# --------------------------------------------------------------------------------------------------
+
+def test_default_ensemble_requests_unchanged(server):
+    """No candidates / synthesis given: upstream ENSEMBLE_CONFIGS (gpt-5.4 x 0.1/0.5/0.9) and gpt-5.4 synthesis."""
+    out = query_model_ensemble(_args(server.url), PROMPT, is_multiturn=False)
+    cands = server.candidates()
+    assert len(cands) == 3
+    for body in cands:  # GPT payload: no temperature, reasoning_effort + max_completion_tokens
+        assert body == {"model": "openai/gpt-5.4", "reasoning_effort": "low", "max_completion_tokens": 777,
+                        "messages": PROMPT}
+    synth = server.synthesis("openai/gpt-5.4")
+    assert set(synth) == {"model", "reasoning_effort", "max_completion_tokens", "messages"}
+    assert synth["reasoning_effort"] == "medium"  # upstream: synthesis ModelQueryArgs default
+    sys_prompt = synth["messages"][0]["content"]
+    assert sys_prompt.startswith("You are synthesizing 3 candidate Python solutions into one optimal program.")
+    user = synth["messages"][1]["content"][0]["text"]
+    assert user.startswith("Synthesize the best solution.\n\n    <original_task_description>\n    Goal: pick the cube.")
+    assert "--- Candidate (openai/gpt-5.4, temp=0.1) ---\n" + CODE in user
+    # Upstream result keys are unchanged; no finish_reason / usage at top level (trial behaviour unchanged).
+    assert {"content", "reasoning", "all_responses", "ensemble_candidates_txt", "ensemble_synthesis_txt"} <= set(out)
+    assert "finish_reason" not in out and "usage" not in out
+    assert out["ensemble_log"]["n_candidates"] == 3 and out["ensemble_log"]["synthesis"]["model"] == "openai/gpt-5.4"
+
+
+def test_configured_candidates_and_synthesis(server):
+    server.fail = {"moonshotai/Kimi-K2.7-Code"}
+    out = query_model_ensemble(_args(server.url), PROMPT, synthesis_model=SYNTH, candidates=NEBIUS)
+    cands = server.candidates()
+    assert sorted((b["model"], b["temperature"]) for b in cands) == sorted((m, t) for m, ts in NEBIUS for t in ts)
+    for b in cands:  # non-GPT payload
+        assert set(b) == {"model", "temperature", "max_tokens", "messages"} and b["max_tokens"] == 777
+    synth = server.synthesis(SYNTH)
+    assert synth["temperature"] == 0.2
+    assert synth["messages"][0]["content"].startswith("You are synthesizing 6 candidate Python solutions")
+    text = synth["messages"][1]["content"][0]["text"]
+    assert "Kimi-K2.7-Code" not in text and text.count("--- Candidate (") == 6  # failed ones left out
+    log = out["ensemble_log"]
+    assert (log["n_candidates"], log["n_failed"]) == (9, 3)
+    ok = [c for c in log["candidates"] if c["ok"]]
+    assert all(c["tokens"] == {"prompt": 1000, "completion": 200, "reasoning": 150} for c in ok)
+    assert all(c["latency_s"] >= 0 for c in log["candidates"])
+    assert all("error" in c and c["usage"] is None for c in log["candidates"] if not c["ok"])
+    assert log["synthesis"]["model"] == SYNTH and log["synthesis"]["format_issue"] is None
+    assert log["synthesis"]["tokens"]["reasoning"] == 150
+    assert out["finish_reason"] == "stop" and out["usage"]["completion_tokens"] == 200
+    assert "Success: False" in out["ensemble_candidates_txt"]
+
+
+def test_all_candidates_fail_raises(server):
+    server.fail = {m for m, _ in NEBIUS}
+    with pytest.raises(RuntimeError, match="All ensemble queries failed"):
+        query_model_ensemble(_args(server.url), PROMPT, synthesis_model=SYNTH, candidates=NEBIUS)
+    assert not [r for r in server.requests if r["model"] == SYNTH]
+
+
+def test_text_only_models_never_get_images(server):
+    prompt = [{"role": "user", "content": [{"type": "text", "text": "Goal"}, IMAGE]}]
+    with pytest.raises(TextOnlyModelError):
+        query_model_ensemble(_args(server.url), prompt, synthesis_model=SYNTH, candidates=NEBIUS)
+    with pytest.raises(TextOnlyModelError):
+        query_model(ModelQueryArgs(model=SYNTH, server_url=server.url), prompt)
+    assert server.requests == []  # refused before any request
+    query_model(ModelQueryArgs(model="Qwen/Qwen3.8-27B", server_url=server.url), prompt)  # VLM: fine
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("content, multiturn, issue", [
+    (CODE, False, None),
+    ("reasoning\n" + CODE, False, None),
+    ("x = 1", False, "no_fence"),
+    (CODE + "\n" + CODE, False, "multiple_fences"),
+    ("```python\nx = 1\n", False, "unclosed_fence"),
+    ("", False, "empty"),
+    ("REGENERATE\n" + CODE, True, None),
+    ("FINISH", True, None),
+    ("**FINISH**", True, None),
+    ("Looks done. FINISH", True, "no_keyword"),
+    ("REGENERATE\nFINISH", True, "both_keywords"),
+    ("REGENERATE\nno code", True, "no_fence"),
+    ("FINISH\n" + CODE, True, "finish_with_code"),
+    ("REGENERATE\n" + CODE + CODE, True, "multiple_fences"),
+])
+def test_synthesis_format_issue(content, multiturn, issue):
+    assert synthesis_format_issue(content, multiturn) == issue
+
+
+def test_parse_ensemble_candidates():
+    assert parse_ensemble_candidates(None) is None
+    assert parse_ensemble_candidates("a/b@0.1,0.5;c@0.9") == [("a/b", [0.1, 0.5]), ("c", [0.9])]
+    assert parse_ensemble_candidates([{"model": "a", "temperatures": [0.1]}, ["b", 0.5]]) == [("a", [0.1]), ("b", [0.5])]
+    with pytest.raises(ValueError):
+        parse_ensemble_candidates("a")
+    with pytest.raises(ValueError):
+        parse_ensemble_candidates([{"model": "a", "temperatures": []}])
+
+
+# --------------------------------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------------------------------
+
+ENS_CONFIGS = sorted(ENS_DIR.rglob("*.yaml"))
+
+
+def test_generated_ensemble_configs_are_current():
+    r = subprocess.run([sys.executable, str(REPO_ROOT / "scripts" / "gen_capbg_ensemble_configs.py"), "--check"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    names = {p.relative_to(ENS_DIR).as_posix() for p in ENS_CONFIGS}
+    assert len([n for n in names if n.startswith("libero_mem/")]) == 5
+    assert len([n for n in names if n.startswith("robomme/")]) == 8
+    assert {n.split("/")[1][:7] for n in names if n.startswith("libero_mem/")} == {
+        "task_00", "task_04", "task_06", "task_07", "task_08"}
+
+
+@pytest.mark.parametrize("path", ENS_CONFIGS, ids=lambda p: p.relative_to(ENS_DIR).as_posix())
+def test_ensemble_config_matches_baseline_except_ensemble(path):
+    if path.parent.name == "libero_mem":
+        base = REPO_ROOT / "env_configs" / "capbg_baseline" / "libero_mem" / path.name
+    else:
+        base = REPO_ROOT / "env_configs" / "robomme" / path.name
+    ens, ref = yaml.safe_load(path.read_text()), yaml.safe_load(base.read_text())
+    changed = {"use_parallel_ensemble", "use_multimodel", "ensemble", "condition_video_mode", "output_dir"}
+    assert {k: v for k, v in ens.items() if k not in changed} == {k: v for k, v in ref.items() if k not in changed}
+    assert ens["output_dir"].startswith("./outputs/capbg_ensemble/")
+
+    _, config, _ = _load_config(LaunchArgs(config_path=str(path)))
+    assert config["use_parallel_ensemble"] is True and config["use_multimodel"] is True
+    assert config["ensemble_candidates"] == [[m, t] for m, t in NEBIUS]
+    assert config["ensemble_synthesis_model"] == SYNTH
+    assert config["condition_video_mode"] == ("auto" if path.parent.name == "robomme" else "images")
+    assert config["memory_mode"] == "none"
+    if path.parent.name == "robomme":
+        assert trial_mod._condition_video_mode(SimpleNamespace(model=SYNTH), config) == "vdm_text"
+
+
+def test_baseline_config_has_no_ensemble_settings():
+    path = REPO_ROOT / "env_configs" / "robomme" / "robomme_videounmaskswap.yaml"
+    _, config, _ = _load_config(LaunchArgs(config_path=str(path)))
+    assert (config["ensemble_candidates"], config["ensemble_synthesis_model"], config["condition_video_mode"]) == \
+        (None, None, "images")
+    assert trial_mod._condition_video_mode(SimpleNamespace(model="moonshotai/Kimi-K3"), config) == "images"
+
+
+def test_cli_overrides_and_validation(tmp_path):
+    path = ENS_DIR / "robomme" / "robomme_movecube.yaml"
+    args = LaunchArgs(config_path=str(path), ensemble_candidates="x/y@0.3", ensemble_synthesis_model="z",
+                      condition_video_mode="images")
+    _, config, _ = _load_config(args)
+    assert config["ensemble_candidates"] == [["x/y", [0.3]]] and config["ensemble_synthesis_model"] == "z"
+    assert config["condition_video_mode"] == "images"
+    with pytest.raises(ValueError, match="use_multimodel"):
+        _load_config(LaunchArgs(config_path=str(path), use_multimodel=False))
+    with pytest.raises(ValueError, match="condition_video_mode"):
+        _load_config(LaunchArgs(config_path=str(path), condition_video_mode="video"))
+
+
+# --------------------------------------------------------------------------------------------------
+# Trial: conditioning video as VDM text, ensemble logs
+# --------------------------------------------------------------------------------------------------
+
+VDM_TEXT = "1. t = 0.20 s: the gripper lifts the red cup off the blue cube and puts it back."
+
+
+def _trial_config(tmp_path: Path, **kw) -> dict[str, Any]:
+    return {
+        "output_dir": str(tmp_path), "use_parallel_ensemble": True, "use_multimodel": True,
+        "use_visual_feedback": False, "use_img_differencing": True, "use_video_differencing": False,
+        "use_wrist_camera": False, "record_video": True, "use_oracle_code": False, "save_multiturn_prompts": True,
+        "ensemble_candidates": [[m, t] for m, t in NEBIUS], "ensemble_synthesis_model": SYNTH,
+        "condition_video_mode": "auto", **kw,
+    }
+
+
+TRIAL_ARGS = SimpleNamespace(
+    model=SYNTH, server_url="", api_key=None, max_tokens=100, temperature=1.0, reasoning_effort="low",
+    debug=False, use_legacy_multi_turn_decision_prompt=False, visual_differencing_model="Qwen/Qwen3.8-27B",
+    visual_differencing_model_server_url="", visual_differencing_model_api_key=None,
+)
+
+
+def _usage(p=100, c=20, r=5):
+    return {"prompt_tokens": p, "completion_tokens": c, "completion_tokens_details": {"reasoning_tokens": r}}
+
+
+def _run_trial(monkeypatch, tmp_path, config):
+    calls: list[tuple[str, Any]] = []
+
+    def fake(args, prompt):
+        client.check_prompt_images(args.model, prompt)  # the real guard (query_model is replaced here)
+        calls.append((args.model, prompt))
+        system = prompt[0]["content"] if prompt[0]["role"] == "system" else ""
+        if "demonstration video" in system:
+            text = VDM_TEXT
+        elif args.model == "Qwen/Qwen3.8-27B":
+            text = "A table with cups."
+        elif "multi-turn" in system:
+            text = "FINISH"
+        elif args.model == SYNTH and system:
+            text = CODE
+        else:
+            text = "FINISH" if "console stdout" in str(prompt).lower() or "Executed:" in str(prompt) else CODE
+        return {"content": text, "reasoning": None, "finish_reason": "stop", "usage": _usage()}
+
+    monkeypatch.setattr(trial_mod, "_query_model", fake)
+    monkeypatch.setattr(client, "query_model", fake)
+    monkeypatch.setattr(trial_mod, "_write_video", lambda frames, base_dir, suffix="": None)
+    code_env = make_code_env(monkeypatch, task_id="VideoUnmaskSwap", n_demo=12)
+    trial_mod._run_single_trial(code_env, 1, TRIAL_ARGS, config,
+                                "Executed:\n{executed_code}\n{console_stdout}\n{console_stderr}")
+    trial_dir = next(tmp_path.glob("trial_01_*"))
+    return calls, json.loads((trial_dir / "all_responses.json").read_text())
+
+
+def _has_images(prompt) -> bool:
+    return client.count_prompt_images(prompt) > 0
+
+
+def test_trial_vdm_text_replaces_conditioning_video(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    calls, responses = _run_trial(monkeypatch, tmp_path, _trial_config(tmp_path))
+    cv_calls = [p for m, p in calls if "demonstration video" in str(p[0]["content"])]
+    assert len(cv_calls) == 1 and client.count_prompt_images(cv_calls[0]) == 12  # one VDM call with all frames
+    coding = [(m, p) for m, p in calls if m != "Qwen/Qwen3.8-27B"]
+    assert coding and not any(_has_images(p) for _, p in coding)
+    first_cands = [p for m, p in coding if m == "openai/gpt-oss-120b"][:1]
+    text = str(first_cands[0])
+    assert "<conditioning_video_description>" in text and VDM_TEXT in text and "Video frame" not in text
+    # The synthesis prompt carries the description too (upstream: text of the original prompt).
+    synth = [p for m, p in coding if m == SYNTH][0]
+    assert VDM_TEXT in synth[1]["content"][0]["text"]
+    initial = responses[0]
+    cv = initial["condition_video"]
+    assert cv["mode"] == "vdm_text" and cv["config_mode"] == "auto" and cv["description"] == VDM_TEXT
+    assert cv["n_frames"] == 12 and cv["vdm_calls"][0]["usage"]["prompt_tokens"] == 100
+    assert not _has_images(initial["initial_prompt"])
+    assert len(initial["vdm_usage"]) == 2  # conditioning video + initial scene description
+    (ens,) = initial["ensemble_calls"]
+    assert ens["n_candidates"] == 9 and ens["n_failed"] == 0 and ens["synthesis"]["model"] == SYNTH
+    later = [r for r in responses[1:] if r.get("decision") in ("finish", "regenerate")]
+    assert later and all(len(r["ensemble_calls"]) == 1 and r["ensemble_calls"][0]["is_multiturn"] for r in later)
+
+
+def test_trial_images_mode_with_text_only_models_fails_loudly(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    with pytest.raises(TextOnlyModelError):
+        _run_trial(monkeypatch, tmp_path, _trial_config(tmp_path, condition_video_mode="images"))
+
+
+def test_trial_auto_keeps_images_for_vision_models(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    config = _trial_config(tmp_path, ensemble_candidates=[["Qwen/Qwen3.8-27B", [0.1]]],
+                           ensemble_synthesis_model="moonshotai/Kimi-K3")
+    calls, responses = _run_trial(monkeypatch, tmp_path, config)
+    assert responses[0]["condition_video"]["mode"] == "images"
+    assert "description" not in responses[0]["condition_video"]
+    first_coding = [p for m, p in calls if m == "Qwen/Qwen3.8-27B" and "Goal" in str(p) and "Video frame" in str(p)]
+    assert first_coding and client.count_prompt_images(first_coding[0]) == 12
+
+
+def test_baseline_trial_logs_unchanged(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    """Ensemble off, no condition_video_mode key: no ensemble_calls key, images in the first prompt."""
+    config = _trial_config(tmp_path, use_parallel_ensemble=False, use_multimodel=False)
+    for k in ("ensemble_candidates", "ensemble_synthesis_model", "condition_video_mode"):
+        config.pop(k)
+    args = SimpleNamespace(**{**vars(TRIAL_ARGS), "model": "moonshotai/Kimi-K3"})
+    monkeypatch.setattr(sys.modules[__name__], "TRIAL_ARGS", args)
+    calls, responses = _run_trial(monkeypatch, tmp_path, config)
+    assert "ensemble_calls" not in responses[0]
+    assert responses[0]["condition_video"]["mode"] == "images"
+    assert client.count_prompt_images(responses[0]["initial_prompt"]) == 12
+
+
+# --------------------------------------------------------------------------------------------------
+# Usage and cost
+# --------------------------------------------------------------------------------------------------
+
+def _ens_call(failed: int = 0, issue: str | None = None, multiturn: bool = False) -> dict[str, Any]:
+    cands = []
+    for i, (m, temps) in enumerate(NEBIUS):
+        for t in temps:
+            ok = not (i == 2 and failed and len([c for c in cands if not c["ok"]]) < failed)
+            cands.append({"model": m, "temp": t, "ok": ok, "latency_s": 2.0,
+                          "usage": _usage(1_000_000, 100_000, 50_000) if ok else None})
+    return {"kind": "multimodel", "is_multiturn": multiturn, "n_candidates": 9, "n_failed": failed,
+            "candidates": cands, "candidates_s": 3.0, "wall_s": 5.0,
+            "synthesis": {"model": SYNTH, "ok": True, "latency_s": 2.0, "usage": _usage(2_000_000, 200_000, 0),
+                          "format_issue": issue}}
+
+
+def _ensemble_responses() -> list[dict[str, Any]]:
+    return [
+        {"decision": "initial", "usage": _usage(2_000_000, 200_000), "ensemble_calls": [_ens_call()],
+         "vdm_usage": [_usage(1_000_000, 100_000)]},
+        {"decision": "regenerate", "usage": _usage(2_000_000, 200_000),
+         "ensemble_calls": [_ens_call(failed=3, issue="no_keyword", multiturn=True), _ens_call(multiturn=True)],
+         "vdm_usage": [_usage(1_000_000, 100_000)]},
+    ]
+
+
+def test_trial_usage_and_cost():
+    prices = model_costs.load_prices()
+    assert prices["deepseek-ai/DeepSeek-V4-Pro"] == (1.75, 3.5) and prices["moonshotai/Kimi-K2.7-Code"] == (0.95, 4.0)
+    u = model_costs.trial_usage(_ensemble_responses(), "unused", "Qwen/Qwen3.8-27B")
+    bm = u["by_model"]
+    assert bm["openai/gpt-oss-120b"]["calls"] == 9 and bm["openai/gpt-oss-120b"]["prompt"] == 9_000_000
+    assert bm["moonshotai/Kimi-K2.7-Code"]["calls"] == 9 and bm["moonshotai/Kimi-K2.7-Code"]["failed"] == 3
+    assert bm["moonshotai/Kimi-K2.7-Code"]["prompt"] == 6_000_000
+    assert bm[SYNTH]["calls"] == 3 and bm[SYNTH]["prompt"] == 6_000_000  # entry "usage" not counted twice
+    assert bm["Qwen/Qwen3.8-27B"]["calls"] == 2 and "unused" not in bm
+    assert bm["openai/gpt-oss-120b"]["reasoning"] == 9 * 50_000
+    ens = u["ensemble"]
+    assert (ens["ensemble_queries"], ens["candidate_calls"], ens["failed_candidates"]) == (3, 27, 3)
+    assert (ens["synthesis_calls"], ens["synthesis_format_errors"], ens["format_issues"]) == (3, 1, {"no_keyword": 1})
+    cost = model_costs.cost_by_model(bm, prices)
+    assert cost["openai/gpt-oss-120b"] == pytest.approx(9 * (0.15 + 0.1 * 0.6))
+    assert cost["Qwen/Qwen3-235B-A22B-Instruct-2507"] == pytest.approx(9 * (0.2 + 0.1 * 0.6))
+    assert cost["moonshotai/Kimi-K2.7-Code"] == pytest.approx(6 * (0.95 + 0.1 * 4))
+    assert cost[SYNTH] == pytest.approx(3 * (2 * 1.75 + 0.2 * 3.5))
+    assert cost["Qwen/Qwen3.8-27B"] == pytest.approx(2 * (0.45 + 0.1 * 3))
+    assert cost["total"] == pytest.approx(sum(v for k, v in cost.items() if k not in ("total", "unpriced")))
+
+
+def test_single_model_usage_and_unpriced():
+    responses = [{"decision": "initial", "usage": _usage(1_000_000, 1_000_000), "vdm_usage": []},
+                 {"decision": "finish", "usage": _usage(1_000_000, 0), "truncated_first_usage": _usage(1_000_000, 0),
+                  "s5_first_reply": {"usage": _usage(1_000_000, 0)}}]
+    u = model_costs.trial_usage(responses, "moonshotai/Kimi-K3", "Qwen/Qwen3.8-27B")
+    assert u["by_model"]["moonshotai/Kimi-K3"]["prompt"] == 4_000_000
+    cost = model_costs.cost_by_model(u["by_model"], model_costs.load_prices())
+    assert cost["total"] == pytest.approx(4 * 3 + 15)
+    cost = model_costs.cost_by_model({"x/unknown": {"prompt": 5, "completion": 1}}, {})
+    assert cost["x/unknown"] is None and cost["unpriced"] == ["x/unknown"]
+
+
+def _fake_trial(task_dir: Path, trial: int, end: dict, responses) -> None:
+    d = task_dir / f"trial_{trial:02d}_sandboxrc_0"
+    d.mkdir(parents=True)
+    (d / "all_responses.json").write_text(json.dumps(responses))
+    (d / "trial_end.json").write_text(json.dumps({"trial": trial, **end}))
+
+
+def _run_main(module, argv):
+    old = sys.argv
+    try:
+        sys.argv = argv
+        return module.main()
+    finally:
+        sys.argv = old
+
+
+def test_robomme_analyzer_cost_and_ensemble(tmp_path):
+    run = tmp_path / "run"
+    task = run / "deepseek-ai_DeepSeek-V4-Pro" / "robomme_videounmaskswap"
+    _fake_trial(task, 1, {"reason": "success", "task_completed": True, "turns": 2, "sim_steps": 400, "time_s": 900},
+                _ensemble_responses())
+    (run / "pilot_manifest.jsonl").write_text(json.dumps({"memory_mode": "none", "trials": 1, "model": SYNTH,
+                                                         "vdm_model": "Qwen/Qwen3.8-27B"}) + "\n")
+    assert _run_main(analyze_rm, ["analyze", str(run)]) == 0
+    lines = (run / "results.tsv").read_text().strip().split("\n")
+    row = dict(zip(analyze_rm.COLUMNS, lines[1].split("\t")))
+    expected = model_costs.cost_by_model(
+        model_costs.trial_usage(_ensemble_responses(), SYNTH, "Qwen/Qwen3.8-27B")["by_model"],
+        model_costs.load_prices())["total"]
+    assert float(row["cost_usd"]) == pytest.approx(expected, abs=1e-3)
+    assert (row["ens_queries"], row["ens_failed_candidates"], row["synth_format_errors"]) == ("3", "3", "1")
+    assert int(row["code_prompt_tok"]) == 24_000_000 + 6_000_000  # 24 ok candidates + 3 synthesis calls
+    summary = (run / "SUMMARY.md").read_text()
+    assert "## Cost by model" in summary and "moonshotai/Kimi-K2.7-Code" in summary
+    assert "failed candidates: 3 / 27" in summary and "synthesis format errors: 1 / 3" in summary
+
+
+def test_libero_mem_analyzer(tmp_path):
+    run = tmp_path / "run"
+    task = run / "deepseek-ai_DeepSeek-V4-Pro" / "task_06_swap_bowls"
+    responses = _ensemble_responses()
+    responses[0]["init_source"] = "upstream"
+    _fake_trial(task, 1, {"reason": "finish", "task_completed": True, "turns": 2, "sim_steps": 4000,
+                          "time_s": 1200}, responses)
+    (run / "pilot_manifest.jsonl").write_text(json.dumps({"bench": "libero_mem", "use_parallel_ensemble": True,
+                                                         "trials": 2, "model": SYNTH}) + "\n")
+    assert _run_main(analyze_mem, ["analyze", str(run)]) == 0
+    rows = [dict(zip(analyze_mem.COLUMNS, ln.split("\t")))
+            for ln in (run / "results.tsv").read_text().strip().split("\n")[1:]]
+    assert [(r["task"], r["trial"], r["reason"]) for r in rows] == [
+        ("task_06_swap_bowls", "1", "finish"), ("task_06_swap_bowls", "2", "missing")]
+    assert rows[0]["cond"] == "ensemble" and rows[0]["init_source"] == "upstream" and float(rows[0]["cost_usd"]) > 0
+    summary = (run / "SUMMARY.md").read_text()
+    assert "| task_06_swap_bowls | 1/2 | 50% |" in summary and "## Ensemble" in summary
+
+
+def test_ensemble_pilot_commands():
+    args = ens_pilot.Args(bench="libero_mem", run_name="r")
+    cfgs = ens_pilot.task_configs(args)
+    assert [s[:7] for s in cfgs] == ["task_00", "task_04", "task_06", "task_07", "task_08"]
+    cmd = ens_pilot.task_command(args, next(iter(cfgs.values())), 2, Path("/tmp/x"))
+    assert cmd[cmd.index("--resume-idx") + 1] == "2" and cmd[cmd.index("--total-trials") + 1] == "5"
+    assert cmd[cmd.index("--trial-timeout-s") + 1] == "3600" and cmd[cmd.index("--model") + 1] == SYNTH
+    assert "capbg_ensemble/libero_mem" in cmd[cmd.index("--config-path") + 1]
+    assert "--api-key" not in cmd
+    rm = ens_pilot.task_configs(ens_pilot.Args(bench="robomme", run_name="r"))
+    assert len(rm) == 8 and "robomme_videounmaskswap" in rm
+    assert ens_pilot.ensemble_settings(rm["robomme_movecube"])["condition_video_mode"] == "auto"

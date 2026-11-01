@@ -1,0 +1,13 @@
+# Nebius AI Studio catalogue prices, USD per 1M tokens (input, output), as of 2026-11-01.
+# Used by scripts/model_costs.py (scripts/analyze_robomme_pilot.py, scripts/analyze_libero_mem_pilot.py).
+# Output price applies to all completion tokens; reasoning tokens are completion tokens (billed as output).
+# Estimates only: the Nebius console is the authority (cached-input discounts etc. are not modelled).
+currency: USD
+unit_tokens: 1000000
+models:
+  openai/gpt-oss-120b: {input: 0.15, output: 0.6}
+  Qwen/Qwen3-235B-A22B-Instruct-2507: {input: 0.2, output: 0.6}
+  moonshotai/Kimi-K2.7-Code: {input: 0.95, output: 4.0}
+  deepseek-ai/DeepSeek-V4-Pro: {input: 1.75, output: 3.5}
+  Qwen/Qwen3.8-27B: {input: 0.45, output: 3.0}
+  moonshotai/Kimi-K3: {input: 3.0, output: 15.0}

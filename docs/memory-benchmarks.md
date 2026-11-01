@@ -181,6 +181,11 @@ of the video's frames, and RoboMME treats every reset frame except the last as t
 - `vdm_usage` (a list of token usages) on the initial entry and every decision entry of `all_responses.json`.
 - `--resume-idx k` on the CLI (it was YAML only) runs trials `k..total_trials`.
 
+### Conditioning video for text-only models
+
+`condition_video_mode` (`images` default, `vdm_text`, `auto`) can replace the frames with one VDM description of
+them; `auto` does so when a coding-side model is text-only. See `docs/capbg-ensemble.md`.
+
 ### Smoke tests and pilot (GPU pod with NVIDIA Vulkan)
 
 ```bash

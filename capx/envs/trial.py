@@ -30,8 +30,11 @@ from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 
 from capx.llm.client import (
+    DEFAULT_SYNTHESIS_MODEL,
+    ENSEMBLE_CONFIGS,
     VLM_MODELS,
     ModelQueryArgs,
+    is_text_only_model,
     query_model as _query_model,
     query_model_ensemble as _query_model_ensemble,
     query_single_model_ensemble as _query_single_model_ensemble,
@@ -79,6 +82,99 @@ def _take_vdm_usage() -> list[Any]:
     usage = list(_VDM_USAGE)
     _VDM_USAGE.clear()
     return usage
+
+
+# Per-call logs (usage, latency, failed candidates, synthesis format) of the ensemble queries made since the
+# last _take_ensemble_calls(), cut-off / empty retries and S5 re-asks included.
+_ENSEMBLE_CALLS: list[dict[str, Any]] = []
+
+
+def _take_ensemble_calls() -> list[dict[str, Any]]:
+    calls = list(_ENSEMBLE_CALLS)
+    _ENSEMBLE_CALLS.clear()
+    return calls
+
+
+def _ensemble_calls_log(config: dict[str, Any]) -> dict[str, Any]:
+    """``ensemble_calls`` for an all_responses.json entry (nothing when the ensemble is off)."""
+    calls = _take_ensemble_calls()
+    return {"ensemble_calls": calls} if config.get("use_parallel_ensemble") or calls else {}
+
+
+def _query_ensemble(args: Any, config: dict[str, Any], prompt: list[dict[str, Any]], is_multiturn: bool) -> dict:
+    """One parallel-ensemble query (multimodel or single model) with the configured candidates / synthesis."""
+    turn = "MULTITURN " if is_multiturn else ""
+    if config.get("use_multimodel", False):
+        print(f"RUNNING {turn}MULTIMODEL ENSEMBLE QUERY")
+        cands = config.get("ensemble_candidates")
+        synth = config.get("ensemble_synthesis_model")
+        if cands is None and synth is None:
+            out = _query_model_ensemble(args, prompt, is_multiturn=is_multiturn)  # upstream call
+        else:
+            out = _query_model_ensemble(
+                args, prompt, synthesis_model=synth, is_multiturn=is_multiturn,
+                candidates=[(m, list(t)) for m, t in cands] if cands is not None else None,
+            )
+    else:
+        print(f"RUNNING {turn}SINGLE MODEL ENSEMBLE QUERY")
+        out = _query_single_model_ensemble(args, prompt, args.model, is_multiturn=is_multiturn)
+    if out.get("ensemble_log") is not None:
+        _ENSEMBLE_CALLS.append(out["ensemble_log"])
+    return out
+
+
+def _coding_models(args: Any, config: dict[str, Any]) -> list[str]:
+    """Every model that gets the coding prompts (ensemble candidates and synthesis, or the single model)."""
+    if config.get("use_parallel_ensemble") and config.get("use_multimodel"):
+        cands = config.get("ensemble_candidates") or ENSEMBLE_CONFIGS
+        synth = config.get("ensemble_synthesis_model") or DEFAULT_SYNTHESIS_MODEL
+        return list(dict.fromkeys([m for m, _ in cands] + [synth]))
+    return [args.model]
+
+
+def _condition_video_mode(args: Any, config: dict[str, Any]) -> str:
+    """images or vdm_text; auto is vdm_text when any coding-side model is text-only."""
+    mode = config.get("condition_video_mode") or "images"
+    if mode == "auto":
+        return "vdm_text" if any(is_text_only_model(m) for m in _coding_models(args, config)) else "images"
+    return mode
+
+
+def _apply_condition_video_mode(
+    env: Any, obs: dict[str, Any], args: Any, config: dict[str, Any], vdm_args: ModelQueryArgs
+) -> dict[str, Any] | None:
+    """Conditioning video (RoboMME Video* / Imitation tasks) in the first prompt: the frames (images) or, for
+    vdm_text, one VDM description of the frames in their place. Returns the log for all_responses.json."""
+    cv = getattr(env, "condition_video", None)
+    if not cv:
+        return None
+    mode = _condition_video_mode(args, config)
+    log: dict[str, Any] = {
+        "mode": mode, "config_mode": config.get("condition_video_mode") or "images",
+        "n_frames": len(cv["frames"]), "total_frames": cv["total"], "frame_indices": [i for i, _ in cv["frames"]],
+    }
+    if mode != "vdm_text":
+        return log
+    handle = getattr(env.low_level_env, "handle", None)
+    goal = getattr(handle, "task_language", None) if handle is not None else None
+    prompt = env.condition_video_vdm_prompt(goal if isinstance(goal, str) else None)
+    calls = []
+    out: dict[str, Any] = {}
+    for _ in range(2):  # one more try for an empty or cut-off description
+        start = time.time()
+        out = _query_model(vdm_args, prompt)
+        _VDM_USAGE.append(out.get("usage"))
+        calls.append({"latency_s": round(time.time() - start, 2), "finish_reason": out.get("finish_reason"),
+                      "usage": out.get("usage")})
+        if (out.get("content") or "").strip() and out.get("finish_reason") != "length":
+            break
+    description = (out.get("content") or "").strip()
+    if not description:
+        raise RuntimeError(f"VDM {vdm_args.model} gave no conditioning-video description (twice)")
+    env.use_condition_video_text(obs, description)
+    log.update({"vdm_model": vdm_args.model, "description": description, "vdm_calls": calls,
+                "vdm_reasoning": out.get("reasoning")})
+    return log
 
 
 def _write_trial_end(code_path: str | None, record: dict[str, Any]) -> None:
@@ -537,12 +633,7 @@ def _query_initial_code(
     def query():
         if not config["use_parallel_ensemble"]:
             return _query_model(args, obs["full_prompt"]), None
-        if config.get("use_multimodel", False):
-            print("RUNNING MULTIMODEL ENSEMBLE QUERY")
-            out = _query_model_ensemble(args, obs["full_prompt"], is_multiturn=False)
-        else:
-            print("RUNNING SINGLE MODEL ENSEMBLE QUERY")
-            out = _query_single_model_ensemble(args, obs["full_prompt"], args.model, is_multiturn=False)
+        out = _query_ensemble(args, config, obs["full_prompt"], is_multiturn=False)
         return out, {
             "ensemble_candidates_txt": out["ensemble_candidates_txt"],
             "ensemble_synthesis_txt": out["ensemble_synthesis_txt"],
@@ -690,12 +781,7 @@ def _handle_multi_turn_step(
     # Query model
     def query_decision(prompt):
         if config["use_parallel_ensemble"]:
-            if config.get("use_multimodel", False):
-                print("RUNNING MULTITURN MULTIMODEL ENSEMBLE QUERY")
-                out = _query_model_ensemble(args, prompt, is_multiturn=True)
-            else:
-                print("RUNNING MULTITURN SINGLE MODEL ENSEMBLE QUERY")
-                out = _query_single_model_ensemble(args, prompt, args.model, is_multiturn=True)
+            out = _query_ensemble(args, config, prompt, is_multiturn=True)
             entry = {
                 "ensemble_candidates_txt": out.get("ensemble_candidates_txt", ""),
                 "ensemble_synthesis_txt": out.get("ensemble_synthesis_txt", ""),
@@ -764,6 +850,7 @@ def _handle_multi_turn_step(
             }
 
     parse_meta["vdm_usage"] = _take_vdm_usage()
+    parse_meta.update(_ensemble_calls_log(config))
     reasoning = content["reasoning"]
     return parsed.decision, parsed.new_code, reasoning, multiturn_ensemble_entry, decision_prompt, parse_meta
 
@@ -791,6 +878,7 @@ def _run_single_trial(
     """
     trial_start_time = time.time()
     _take_vdm_usage()  # drop anything left from an earlier (e.g. timed-out) trial in this process
+    _take_ensemble_calls()
     if partial_artifacts is not None:
         partial_artifacts["trial_start_time"] = trial_start_time
 
@@ -855,6 +943,9 @@ def _run_single_trial(
 
     # Memory condition (memory_mode); none adds nothing to any prompt.
     memory = _make_trial_memory(config, env, args, visual_differencing_args, trial=trial)
+
+    # Conditioning video (RoboMME): images, or the VDM's description for text-only coding models.
+    condition_video_log = _apply_condition_video_mode(env, obs, args, config, visual_differencing_args)
 
     # --- 2. Capture initial visual feedback ---
     visual_feedback_imgs, visual_feedback_base64_history, task_description = (
@@ -938,6 +1029,8 @@ def _run_single_trial(
         "init_source": reset_info.get("init_source"),
         "reset_memory": reset_info.get("memory"),
         "vdm_usage": _take_vdm_usage(),
+        **_ensemble_calls_log(config),
+        **({"condition_video": condition_video_log} if condition_video_log is not None else {}),
         "memory_mode": memory.mode,
         "memory_initial_text": initial_memory_text,
         "memory_state": memory.state(),

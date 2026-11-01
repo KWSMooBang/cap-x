@@ -136,6 +136,44 @@ def _memory_config(args: LaunchArgs, configs_dict: dict[str, Any]) -> dict[str, 
     return out
 
 
+CONDITION_VIDEO_MODES = ("images", "vdm_text", "auto")
+
+
+def _ensemble_config(args: LaunchArgs, configs_dict: dict[str, Any], use_multimodel: bool) -> dict[str, Any]:
+    """Ensemble and conditioning-video keys: CLI > YAML. Unset: upstream ensemble, images.
+
+    YAML::
+
+        ensemble:
+          candidates:
+            - {model: openai/gpt-oss-120b, temperatures: [0.1, 0.5, 0.9]}
+          synthesis_model: deepseek-ai/DeepSeek-V4-Pro
+        condition_video_mode: auto
+    """
+    from capx.llm.client import parse_ensemble_candidates
+
+    yaml_ens = configs_dict.get("ensemble") or {}
+    if not isinstance(yaml_ens, dict):
+        raise ValueError(f"ensemble must be a mapping with candidates / synthesis_model, got {yaml_ens!r}")
+    unknown = set(yaml_ens) - {"candidates", "synthesis_model"}
+    if unknown:
+        raise ValueError(f"ensemble: unknown keys {sorted(unknown)} (candidates, synthesis_model)")
+    cli_cands = getattr(args, "ensemble_candidates", None)
+    candidates = parse_ensemble_candidates(cli_cands if cli_cands is not None else yaml_ens.get("candidates"))
+    synth = getattr(args, "ensemble_synthesis_model", None) or yaml_ens.get("synthesis_model")
+    if (candidates is not None or synth is not None) and not use_multimodel:
+        # Only the multimodel ensemble reads them; refuse rather than ignore them.
+        raise ValueError("ensemble candidates / synthesis_model need use_multimodel: true (and use_parallel_ensemble)")
+    mode = getattr(args, "condition_video_mode", None) or configs_dict.get("condition_video_mode", "images")
+    if mode not in CONDITION_VIDEO_MODES:
+        raise ValueError(f"condition_video_mode must be one of {CONDITION_VIDEO_MODES}, got {mode!r}")
+    return {
+        "ensemble_candidates": [[m, list(t)] for m, t in candidates] if candidates is not None else None,
+        "ensemble_synthesis_model": synth,
+        "condition_video_mode": mode,
+    }
+
+
 def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
     """Load YAML configuration and merge with command-line arguments.
 
@@ -229,6 +267,7 @@ def _load_config(args: LaunchArgs) -> tuple[Any, dict[str, Any], list]:
         "save_multiturn_prompts": configs_dict.get("save_multiturn_prompts", False),
         **_memory_config(args, configs_dict),
     }
+    merged_config.update(_ensemble_config(args, configs_dict, bool(merged_config["use_multimodel"])))
 
     return env_factory, merged_config, api_servers
 

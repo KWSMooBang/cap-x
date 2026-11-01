@@ -85,9 +85,129 @@ ENSEMBLE_CONFIGS = [
     ("openai/gpt-5.4", [0.1, 0.5, 0.9]),
 ]
 
+# Models that take text only (Nebius catalogue). query_model refuses a prompt with images for these instead
+# of letting the server drop or reject them; RoboMME's conditioning video then goes in as VDM text
+# (condition_video_mode vdm_text / auto, see capx/envs/trial.py).
+TEXT_ONLY_MODELS = [
+    "openai/gpt-oss-120b",
+    "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    "moonshotai/Kimi-K2.7-Code",
+    "deepseek-ai/DeepSeek-V4-Pro",
+]
+
+# Upstream synthesis model of query_model_ensemble (used when no synthesis model is configured).
+DEFAULT_SYNTHESIS_MODEL = "openai/gpt-5.4"
+
 # ---------------------------------------------------------------------------
 # Helper functions
 # ---------------------------------------------------------------------------
+
+
+class TextOnlyModelError(ValueError):
+    """A prompt with images was about to go to a model that only takes text."""
+
+
+def is_text_only_model(model: str) -> bool:
+    return model in TEXT_ONLY_MODELS
+
+
+def count_prompt_images(prompt: list[dict]) -> int:
+    """Number of image (or video) items in a chat prompt."""
+    n = 0
+    for message in prompt:
+        content = message.get("content")
+        if isinstance(content, list):
+            n += sum(1 for c in content if isinstance(c, dict) and c.get("type") in ("image_url", "input_image"))
+    return n
+
+
+def check_prompt_images(model: str, prompt: list[dict]) -> None:
+    """Raise TextOnlyModelError if ``prompt`` has images and ``model`` is text-only (never drop them silently)."""
+    if is_text_only_model(model):
+        n = count_prompt_images(prompt)
+        if n:
+            raise TextOnlyModelError(
+                f"{model} is text-only but the prompt has {n} image(s). Describe them in text first "
+                "(RoboMME conditioning video: condition_video_mode vdm_text or auto; no use_visual_feedback)."
+            )
+
+
+def parse_ensemble_candidates(spec: Any) -> list[tuple[str, list[float]]] | None:
+    """Ensemble candidates as ``[(model, [temperatures])]``.
+
+    Accepts None, a list of ``{"model": ..., "temperatures": [...]}`` dicts or ``[model, [temps]]`` pairs
+    (YAML ``ensemble.candidates``), or a CLI string ``"model@0.1,0.5,0.9;model2@0.5"``.
+    """
+    if spec is None:
+        return None
+    items: list[tuple[str, list[float]]] = []
+    if isinstance(spec, str):
+        for part in spec.split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if "@" not in part:
+                raise ValueError(f"ensemble candidate {part!r}: expected model@t1,t2,...")
+            model, temps = part.rsplit("@", 1)
+            items.append((model.strip(), [float(t) for t in temps.split(",") if t.strip()]))
+    else:
+        for entry in spec:
+            if isinstance(entry, dict):
+                model, temps = entry["model"], entry.get("temperatures", entry.get("temps"))
+            else:
+                model, temps = entry
+            if isinstance(temps, (int, float)):
+                temps = [temps]
+            items.append((str(model), [float(t) for t in temps]))
+    if not items or any(not temps for _, temps in items):
+        raise ValueError(f"ensemble candidates need at least one model with at least one temperature: {spec!r}")
+    return items
+
+
+def usage_tokens(usage: Any) -> dict[str, int]:
+    """Input / output / reasoning tokens of an OpenAI-style usage dict (zeros when missing).
+
+    ``completion`` already includes ``reasoning`` (OpenAI and Nebius count reasoning as completion tokens).
+    """
+    if not isinstance(usage, dict):
+        return {"prompt": 0, "completion": 0, "reasoning": 0}
+    details = usage.get("completion_tokens_details") or {}
+    reasoning = details.get("reasoning_tokens") if isinstance(details, dict) else None
+    if reasoning is None:
+        reasoning = usage.get("reasoning_tokens")
+    return {
+        "prompt": int(usage.get("prompt_tokens") or 0),
+        "completion": int(usage.get("completion_tokens") or 0),
+        "reasoning": int(reasoning or 0),
+    }
+
+
+def synthesis_format_issue(content: Any, is_multiturn: bool) -> str | None:
+    """Why a synthesis reply breaks the synthesis prompt's OUTPUT FORMAT, or None if it follows it.
+
+    Initial code: exactly one closed fenced code block. Multi-turn: a REGENERATE line followed by exactly one
+    closed fenced code block, or a FINISH line (not both).
+    """
+    if not isinstance(content, str) or not content.strip():
+        return "empty"
+    n_open = content.count("```")
+    n_blocks = content.count("```python")
+    lines = {ln.strip().strip("*#").strip() for ln in content.splitlines()}
+    if is_multiturn:
+        regen, finish = "REGENERATE" in lines, "FINISH" in lines
+        if regen and finish:
+            return "both_keywords"
+        if finish:
+            return None if n_open == 0 else "finish_with_code"
+        if not regen:
+            return "no_keyword"
+    if n_blocks == 0:
+        return "no_fence"
+    if n_open % 2:
+        return "unclosed_fence"
+    if n_blocks > 1 or n_open > 2:
+        return "multiple_fences"
+    return None
 
 
 def is_openrouter_model(model: str) -> bool:
@@ -228,6 +348,8 @@ def query_model(args: "LaunchArgs | ModelQueryArgs", prompt: list[dict]) -> str:
     Returns:
         Model response content
     """
+
+    check_prompt_images(args.model, prompt)
 
     # Route OpenRouter models to the OpenRouter proxy server
     if is_openrouter_model(args.model):
@@ -468,13 +590,54 @@ def query_model_streaming(
     }
 
 
+def _timed_query(query_args: ModelQueryArgs, prompt: list[dict]) -> tuple[dict[str, Any], float]:
+    start = time.time()
+    result = query_model(query_args, prompt)
+    return result, time.time() - start
+
+
+def _call_log(model: str, temp: float, ok: bool, latency_s: float, result: dict | None, error: str | None) -> dict:
+    """One model call for the trial log (all_responses.json): no reply text, which is in the ensemble_*.txt files."""
+    usage = result.get("usage") if result else None
+    return {
+        "model": model,
+        "temp": temp,
+        "ok": ok,
+        "latency_s": round(latency_s, 2),
+        "finish_reason": result.get("finish_reason") if result else None,
+        "usage": usage,
+        "tokens": usage_tokens(usage),
+        **({"error": error[:500]} if error else {}),
+    }
+
+
 def query_model_ensemble(
     args: "LaunchArgs | ModelQueryArgs",
     prompt: list[dict],
-    synthesis_model: str = "openai/gpt-5.4",
-    is_multiturn = False
+    synthesis_model: str | None = None,
+    is_multiturn = False,
+    candidates: list[tuple[str, list[float]]] | None = None,
 ) -> dict[str, Any]:
-    """Query 9 models (3 models x 3 temperatures) and synthesize final output."""
+    """Query the candidate models (each at its temperatures) in parallel and synthesize one final output.
+
+    Args:
+        candidates: ``[(model, [temperatures])]``; None uses the upstream ENSEMBLE_CONFIGS.
+        synthesis_model: None uses the upstream DEFAULT_SYNTHESIS_MODEL.
+
+    With neither set, the requests are exactly the upstream ones. Failed candidates are left out of the
+    synthesis (it fails only if all of them fail). When either is given, the result also carries the
+    synthesis reply's ``finish_reason`` and ``usage`` (so the trial's cut-off handling applies to it);
+    ``ensemble_log`` always holds per-call usage, latency and failures for the trial log.
+    """
+    configured = candidates is not None or synthesis_model is not None
+    if synthesis_model is None:
+        synthesis_model = DEFAULT_SYNTHESIS_MODEL
+    if candidates is None:
+        candidates = ENSEMBLE_CONFIGS
+    # A text-only candidate would fail on an image prompt and drop out quietly: refuse up front instead.
+    for model, _ in candidates:
+        check_prompt_images(model, prompt)
+    ensemble_start = time.time()
 
     def query_single(model: str, temp: float) -> dict:
         query_args = ModelQueryArgs(
@@ -485,24 +648,28 @@ def query_model_ensemble(
             max_tokens=args.max_tokens,
             reasoning_effort=getattr(args, "reasoning_effort", "medium"),
         )
+        start = time.time()
         try:
-            result = query_model(query_args, copy.deepcopy(prompt))
-            return {"model": model, "temp": temp, "content": result["content"], "ok": True}
+            result, latency = _timed_query(query_args, copy.deepcopy(prompt))
+            return {"model": model, "temp": temp, "content": result["content"], "ok": True,
+                    "log": _call_log(model, temp, True, latency, result, None)}
         except Exception as e:
             error_msg = str(e)
             print(f"[Multimodel Ensemble] {model} temp={temp} FAILED: {error_msg}")
-            return {"model": model, "temp": temp, "content": error_msg, "ok": False}
+            return {"model": model, "temp": temp, "content": error_msg, "ok": False,
+                    "log": _call_log(model, temp, False, time.time() - start, None, error_msg)}
 
     # Build all (model, temp) pairs and query in parallel
-    tasks = [(m, t) for m, temps in ENSEMBLE_CONFIGS for t in temps]
+    tasks = [(m, t) for m, temps in candidates for t in temps]
     responses = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(9, len(tasks))) as executor:
         futures = {executor.submit(query_single, m, t): (m, t) for m, t in tasks}
         for future in concurrent.futures.as_completed(futures):
             resp = future.result()
             responses.append(resp)
             if resp['ok']:
                 print(f"[Multimodel Ensemble] {resp['model']} temp={resp['temp']} ok={resp['ok']}")
+    candidates_s = time.time() - ensemble_start
 
     successful = [r for r in responses if r["ok"]]
     if not successful:
@@ -598,7 +765,7 @@ def query_model_ensemble(
         temperature=0.2,
         max_tokens=args.max_tokens,
     )
-    final = query_model(synth_args, synthesis_prompt)
+    final, synthesis_s = _timed_query(synth_args, synthesis_prompt)
 
     # Build text content for saving
     candidates_txt = "\n\n".join(
@@ -609,12 +776,46 @@ def query_model_ensemble(
     synthesis_txt += f"{'='*60}\nREASONING\n{'='*60}\n{final.get('reasoning') or '(none)'}\n\n"
     synthesis_txt += f"{'='*60}\nOUTPUT\n{'='*60}\n{final['content']}"
 
-    return {
+    out = {
         "content": final["content"],
         "reasoning": final.get("reasoning"),
         "all_responses": responses,
         "ensemble_candidates_txt": candidates_txt,
         "ensemble_synthesis_txt": synthesis_txt,
+        "ensemble_log": _ensemble_log(
+            "multimodel", responses, synthesis_model, final, synthesis_s, is_multiturn,
+            candidates_s=candidates_s, wall_s=time.time() - ensemble_start,
+        ),
+    }
+    if configured:
+        out["finish_reason"] = final.get("finish_reason")
+        out["usage"] = final.get("usage")
+    return out
+
+
+def _ensemble_log(
+    kind: str,
+    responses: list[dict],
+    synthesis_model: str,
+    final: dict,
+    synthesis_s: float,
+    is_multiturn: bool,
+    *,
+    candidates_s: float,
+    wall_s: float,
+) -> dict[str, Any]:
+    """Per-call record of one ensemble query for all_responses.json (``ensemble_calls``)."""
+    synth = _call_log(synthesis_model, 0.2, True, synthesis_s, final, None)
+    synth["format_issue"] = synthesis_format_issue(final.get("content"), is_multiturn)
+    return {
+        "kind": kind,
+        "is_multiturn": bool(is_multiturn),
+        "n_candidates": len(responses),
+        "n_failed": sum(1 for r in responses if not r["ok"]),
+        "candidates": [r["log"] for r in responses],
+        "synthesis": synth,
+        "candidates_s": round(candidates_s, 2),
+        "wall_s": round(wall_s, 2),
     }
 
 
@@ -644,16 +845,21 @@ def query_single_model_ensemble(
             max_tokens=args.max_tokens,
             reasoning_effort=getattr(args, "reasoning_effort", "medium"),
         )
+        start = time.time()
         try:
-            result = query_model(query_args, copy.deepcopy(prompt))
-            return {"model": model, "temp": temp, "content": result["content"], "ok": True}
+            result, latency = _timed_query(query_args, copy.deepcopy(prompt))
+            return {"model": model, "temp": temp, "content": result["content"], "ok": True,
+                    "log": _call_log(model, temp, True, latency, result, None)}
         except Exception as e:
             error_msg = str(e)
             print(f"[Single Model Ensemble] {model} temp={temp} FAILED: {error_msg}")
-            return {"model": model, "temp": temp, "content": error_msg, "ok": False}
+            return {"model": model, "temp": temp, "content": error_msg, "ok": False,
+                    "log": _call_log(model, temp, False, time.time() - start, None, error_msg)}
 
     # Query same model with 9 different temperatures (0.1 to 0.9)
     temperatures = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    check_prompt_images(model, prompt)
+    ensemble_start = time.time()
     responses = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
         futures = {executor.submit(query_single, t): t for t in temperatures}
@@ -662,6 +868,7 @@ def query_single_model_ensemble(
             responses.append(resp)
             if resp['ok']:
                 print(f"[Single Model Ensemble] {resp['model']} temp={resp['temp']} ok={resp['ok']}")
+    candidates_s = time.time() - ensemble_start
 
     successful = [r for r in responses if r["ok"]]
     if not successful:
@@ -758,7 +965,7 @@ def query_single_model_ensemble(
         temperature=0.2,
         max_tokens=args.max_tokens,
     )
-    final = query_model(synth_args, synthesis_prompt)
+    final, synthesis_s = _timed_query(synth_args, synthesis_prompt)
 
     # Build text content for saving
     candidates_txt = "\n\n".join(
@@ -775,6 +982,10 @@ def query_single_model_ensemble(
         "all_responses": responses,
         "ensemble_candidates_txt": candidates_txt,
         "ensemble_synthesis_txt": synthesis_txt,
+        "ensemble_log": _ensemble_log(
+            "single_model", responses, model, final, synthesis_s, is_multiturn,
+            candidates_s=candidates_s, wall_s=time.time() - ensemble_start,
+        ),
     }
 
 
