@@ -186,9 +186,10 @@ class FakeDetector:
 
     name = "synthetic_fake"
 
-    def __init__(self, world: SwapWorld, fail_prompts: tuple[str, ...] = ()) -> None:
+    def __init__(self, world: SwapWorld, fail_prompts: tuple[str, ...] = (), hide: Any = None) -> None:
         self.w = world
         self.fail = set(fail_prompts)
+        self.hide = hide  # hide(t, sim_name) -> True: missed (occlusion / detector failure)
         self.calls = 0
         self.rng = np.random.default_rng(0)
 
@@ -209,6 +210,8 @@ class FakeDetector:
             eef = self.w.eef[t]
             for name, p in objs.items():
                 held = self.w.held[t] == name
+                if self.hide is not None and self.hide(t, name):
+                    continue
                 if (not held and cat.key == "bowl" and np.hypot(*(p[:2] - eef[:2])) < 0.04 and eef[2] > p[2] + 0.03):
                     continue  # hidden under the gripper
                 c = p + self.rng.normal(0, 0.002, 3)

@@ -168,7 +168,20 @@ Models:
 - **Measured on kubectl:**
   - B1K gripper events by width (right 3/3, left 2/2).
   - Base debounce: stop ≥ 1 s, start-to-stop distance ≥ 0.05 m; `check-episode` prints raw vs debounced counts.
-- **Provisional grasps:** a `close` stays provisional until the hand has carried the object ≥ 2 cm from where it was. Articulated targets (fridge, microwave) are accepted without the test, because a door moves on an arc while the body stays.
+- **Provisional grasps (`Generator._grasp_evidence`):** a `close` stays provisional until clear evidence arrives. Each event while the hand is closed compares two hypotheses with this image's detections of the category:
+  - **Moved with the hand:** the expected position = the EEF + the offset at the close.
+  - **Stayed:** where the object was at the close.
+  - **Where:** in 3D, or in pixels for tracks without depth (2D path). The two places must be ≥ 2 cm / 20 px apart.
+  - **Rules:**
+    - Detected at the hand and not at the old place → confirmed.
+    - At the old place and not at the hand → retracted. The object's relations from before the close are restored.
+    - Both → ambiguous (two same-looking bowls), not confirmed.
+    - A detection that another known track of the category explains is not evidence.
+    - No detection of the category → cannot tell (occlusion / miss).
+    - Category seen elsewhere, nothing at either place, hand lifted ≥ 3 cm and no longer above the old place → confirmed_lifted.
+  - **Undecided at the release:** checked once more with the release image. Object at the release place → confirmed; at the old place → retracted, and the release lets go of nothing.
+  - **Still undecided:** UNVERIFIED. The close and release rows are flagged; the backward pass labels the segment `maybe_pick` / `maybe_place` and writes no Effect. `report.md` lists every check (`grasp_checks`: result, evidence, where decided).
+  - **Articulated targets** (fridge, microwave) are accepted without the test, because a door moves on an arc while the body stays.
 - **B1K hot dogs disappear inside closed doors.** The memory value is kept (? → mem).
 - **Detection on a moving head camera** uses 3D world association only (no appearance embedding yet). Objects out of view keep their last state.
 - **robot_rel is always computed.** The agent's choice covers observe / geometry / detect / look / hindsight.

@@ -40,6 +40,7 @@ class Segment:
     label_pick: str = ""
     label_place: str = ""
     effect: list[tuple[EdgeKey, int, int]] = field(default_factory=list)
+    uncertain: bool = False  # a provisional grasp never verified (the release did not settle it either)
 
 
 @dataclass
@@ -129,7 +130,7 @@ def segments(rows: Sequence[Any], categories: dict[str, str]) -> list[Segment]:
         if r.kind in ("grasp", "close", "close_empty") and r.obj:
             empty = r.kind == "close_empty" or "grasp_retracted" in r.notes
             kind = "articulated" if categories.get(r.obj) in OPENABLE_KEYS or empty else "object"
-            open_seg[r.arm] = Segment(r.t, r.t, r.arm, r.obj, kind, i, i)
+            open_seg[r.arm] = Segment(r.t, r.t, r.arm, r.obj, kind, i, i, uncertain="grasp_unverified" in r.notes)
         elif r.kind in ("release", "open") and r.arm in open_seg:
             s = open_seg.pop(r.arm)
             s.end_t, s.end_row = r.t, i
@@ -153,6 +154,10 @@ def _state(row: Any, obj: str) -> dict[EdgeKey, bool]:
 
 def effects(rows: list[Any], segs: list[Segment], log: list[dict[str, Any]]) -> None:
     for n, s in enumerate(segs):
+        if s.uncertain:
+            log.append({"rule": "B3", "segment": [s.start_t, s.end_t, s.obj], "effect": None,
+                        "why": "grasp never verified: no Effect"})
+            continue
         start = _state(rows[max(s.start_row - 1, 0)], s.obj)
         limit = segs[n + 1].start_row if n + 1 < len(segs) else len(rows)
         for j in range(s.end_row, max(limit, s.end_row + 1)):
@@ -197,6 +202,8 @@ def subtasks(rows: list[Any], segs: list[Segment], categories: dict[str, str], b
         else:
             op = "put_in" if dst != "?" and is_container(categories.get(dst, "")) else "place"
             s.label_pick, s.label_place = f"pick({s.obj}, {src})", f"{op}({s.obj}, {dst})"
+            if s.uncertain:  # the grasp was never verified: an attempt, not a known pick-and-place
+                s.label_pick, s.label_place = "maybe_" + s.label_pick, "maybe_" + s.label_place
         for i in range(prev_end + 1, len(rows)):
             t = rows[i].t
             if i <= s.start_row:
