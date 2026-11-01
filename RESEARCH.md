@@ -76,6 +76,9 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
     새 기준 오프라인 재적용(baccus): 거부권 [43,15] → [22,14], bowl dz 오답 27 → 0, t06 테두리 걸침은 d_xy 로 계속 거부. 남는 약점: 접시 반경 r 추정 오차 (백로그).
     2026-11-01 사람 결정: 수정 코드로 bg_est2 10×5 전체 재실행 (약 10 GPU-h, coding 약 50달러). 진행 중 run 은 끝까지 두고(원래 설정 기준 자료),
     끝나는 대로 kubectl 에서 20261101_mem10x5_bgest2_r2 (bg f9508fb = 코드 7dccdad, 같은 설정·seed, pod 2) 시작, 처음 2 trial 을 smoke 로 확인.
+2g. [설계 2026-11-01] Agent as BG Generator (논문 Skeleton Ver3, 우성·현구): bg_est2 핵심을 벤치마크 무관 생성기로 일반화 —
+    방식 A 시연 영상+action → BG-CoT 라벨(Ver1 형식, 앞·뒤 두 패스), 방식 B 추론 중 명시적 BG. 설계: https://claude.ai/artifact/TLLVFGWodLi5EBpT8tdiHg
+    정할 것: Ver2(호용 UnsupBG)와 스키마·도구 공유 여부, 핵심 어휘, 시연 데이터 확보, 하류 학습 자원.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
