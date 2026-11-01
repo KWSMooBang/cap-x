@@ -120,7 +120,9 @@ def task_command(args: Args, config: Path, resume_idx: int, out_dir: Path) -> li
 def ensemble_settings(config: Path) -> dict:
     cfg = yaml.safe_load(config.read_text())
     return {"ensemble": cfg.get("ensemble"), "use_parallel_ensemble": cfg.get("use_parallel_ensemble"),
-            "use_multimodel": cfg.get("use_multimodel"), "condition_video_mode": cfg.get("condition_video_mode")}
+            "use_multimodel": cfg.get("use_multimodel"), "condition_video_mode": cfg.get("condition_video_mode"),
+            "condition_video_model": cfg.get("condition_video_model"),
+            "condition_video_segment_frames": cfg.get("condition_video_segment_frames")}
 
 
 def main(args: Args) -> int:

@@ -144,6 +144,10 @@ class LaunchArgs:
     condition_video_max_segments: int | None = None
     """vdm_text: at most this many VDM calls per video (default 12)."""
 
+    condition_video_model: str | None = None
+    """vdm_text: model that describes the conditioning video (default: --visual-differencing-model, the turn
+    VDM). Must take images. Only the conditioning-video calls use it; turn VDM calls keep the VDM model."""
+
     condition_video_mode: str | None = None
     """RoboMME conditioning video in the first prompt: images (default; the sampled frames), vdm_text (the VDM
     describes the frames once and the text goes in their place) or auto (vdm_text if any coding-side model

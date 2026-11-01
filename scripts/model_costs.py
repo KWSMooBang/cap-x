@@ -9,7 +9,9 @@ What is counted, per all_responses.json entry:
   ``truncated_first_usage`` (the synthesis reply) are not counted again.
 - Ensemble off: ``usage``, ``truncated_first_usage`` and ``s5_first_reply.usage`` under the coding model.
 - ``vdm_usage`` under the VDM model (turn VDM calls and, for condition_video_mode vdm_text, the conditioning
-  video description).
+  video description when the VDM wrote it).
+- With ``condition_video_model`` set (``condition_video.usage_in_vdm_usage`` false), the conditioning-video
+  calls in ``condition_video.vdm_calls`` under ``condition_video.vdm_model`` (role vdm).
 Cost = prompt tokens x input price + completion tokens x output price (reasoning tokens are part of the
 completion tokens). Models without a price get cost None and are listed as unpriced.
 """
@@ -111,11 +113,17 @@ def trial_usage(responses: list[dict[str, Any]], coding_model: str, vdm_model: s
                 add_single(r["s5_first_reply"])
         for u in r.get("vdm_usage") or []:
             acc.add("vdm", vdm_model, u)
-        # Conditioning-video VDM calls: tokens are in vdm_usage above; their latency is only logged here.
+        # Conditioning-video VDM calls. Same model as the turn VDM: tokens are in vdm_usage above, only the latency
+        # is logged here. condition_video_model set (usage_in_vdm_usage false): the calls and tokens are counted
+        # here, under that model.
         cv = r.get("condition_video") if isinstance(r.get("condition_video"), dict) else {}
+        cv_model = cv.get("vdm_model") or vdm_model
         for call in cv.get("vdm_calls") or []:
-            if call.get("latency_s") is not None:
-                acc.add_latency("vdm", cv.get("vdm_model") or vdm_model, call["latency_s"])
+            if cv.get("usage_in_vdm_usage", True):
+                if call.get("latency_s") is not None:
+                    acc.add_latency("vdm", cv_model, call["latency_s"])
+            else:
+                acc.add("vdm", cv_model, call.get("usage"), call.get("latency_s"))
     ens["format_issues"] = dict(ens["format_issues"])
     return {"by_model": {m: dict(v) for m, v in acc.by_model.items()}, "by_role": acc.by_role, "ensemble": ens}
 

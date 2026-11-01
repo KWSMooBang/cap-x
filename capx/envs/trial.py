@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import copy
+import dataclasses
 import gc
 import io
 import json
@@ -30,6 +31,7 @@ from capx.envs.configs.instantiate import instantiate
 from capx.envs.tasks.base import CodeExecutionEnvBase
 
 from capx.llm.client import (
+    check_condition_video_model,
     DEFAULT_SYNTHESIS_MODEL,
     ENSEMBLE_CONFIGS,
     VLM_MODELS,
@@ -184,10 +186,22 @@ def _apply_condition_video_mode(
         describe_condition_video_single,
     )
 
+    # condition_video_model (unset: the turn VDM) describes the video; turn VDM calls keep vdm_args. A separate
+    # model's usage stays out of vdm_usage (that is the VDM model's) and is costed from the calls logged here.
+    cv_model = config.get("condition_video_model") or vdm_args.model
+    separate = cv_model != vdm_args.model
+    if separate:
+        check_condition_video_model(cv_model)
+        vdm_args = dataclasses.replace(vdm_args, model=cv_model)
+
     def query(a: ModelQueryArgs, prompt: list[dict[str, Any]]) -> dict[str, Any]:
         out = _query_model(a, prompt)
-        _VDM_USAGE.append(out.get("usage"))
+        if not separate:
+            _VDM_USAGE.append(out.get("usage"))
         return out
+
+    if separate:
+        log["usage_in_vdm_usage"] = False
 
     if seg["segment_frames"] > 0:
         # Every stride-th frame in overlapping parts, one VDM call per part, state carried between parts.

@@ -7,6 +7,12 @@ The baseline CaP-X loop with the CaP-Agent0 **multimodel parallel ensemble** on,
 | Candidates (9 replies per query) | `openai/gpt-oss-120b`, `Qwen/Qwen3-235B-A22B-Instruct-2507`, `deepseek-ai/DeepSeek-V4-Flash-0731` | 0.1, 0.5, 0.9 each |
 | Synthesis | `deepseek-ai/DeepSeek-V4-Pro` | 0.2 (upstream) |
 | VDM | `Qwen/Qwen3.8-27B` | as the baseline |
+| Conditioning-video description (RoboMME VideoUnmaskSwap, VideoPlaceOrder, MoveCube, PatternLock) | `moonshotai/Kimi-K3` | one call, 32 sampled frames |
+
+Only the conditioning-video description uses Kimi-K3 (`condition_video_model`, below); the turn VDM stays
+Qwen3.8-27B. Reason: on kubectl, episode 0 of the four video tasks, judged by eye, Qwen3.8-27B's descriptions often
+got cup swaps, placement order and the pattern wrong, and Kimi-K3's single 32-frame call got the four tasks right most
+evenly. All four tasks use the same method; there is no per-task choice.
 
 The third candidate was `moonshotai/Kimi-K2.7-Code` in the first smoke run. The lead replaced it with
 DeepSeek-V4-Flash-0731 after measuring latency on kubectl: Flash replied in 14–56 s with 4/4 well-formed replies;
@@ -22,6 +28,7 @@ a VDM description (`condition_video_mode: auto` → `vdm_text`, below).
 | `ensemble.candidates` (list of `{model, temperatures}`) | `--ensemble-candidates "m1@0.1,0.5,0.9;m2@0.5"` | upstream `ENSEMBLE_CONFIGS` (`openai/gpt-5.4` × 0.1/0.5/0.9) |
 | `ensemble.synthesis_model` | `--ensemble-synthesis-model M` | upstream `openai/gpt-5.4` |
 | `condition_video_mode`: `images` \| `vdm_text` \| `auto` | `--condition-video-mode` | `images` |
+| `condition_video_model` | `--condition-video-model M` | the VDM (`--visual-differencing-model`) |
 
 - The candidates and synthesis model are used by the multimodel ensemble only (`use_parallel_ensemble: true`,
   `use_multimodel: true`). Setting them without both is an error, not ignored.
@@ -70,13 +77,20 @@ prompt. Unknown models are assumed to take images (as before). Images reach the 
   `condition_video_segment_frames: 0` gives the first version: one call with the 32 sampled frames.
   The CLI flags are `--condition-video-stride`, `--condition-video-segment-frames`, `--condition-video-overlap` and
   `--condition-video-max-segments`. The RoboMME ensemble configs set the four keys explicitly.
+- `condition_video_model` (`vdm_text` only): the model that writes the description. Unset, the VDM writes it and
+  every request is byte for byte as before. Set, only the conditioning-video requests go to that model; prompts,
+  server, `max_tokens` and temperature are the VDM's, and the turn VDM calls are unchanged
+  (`tests/test_ensemble_nebius.py` compares the requests). It must take images: a model in `TEXT_ONLY_MODELS` or not
+  in `VLM_MODELS` is an error at config load.
 - `auto`: `vdm_text` if any coding-side model (every candidate and the synthesis model, or the single coding model
   without the ensemble) is text-only, else `images`.
 
 Logged in the initial entry of `all_responses.json` as `condition_video`: `mode`, `config_mode`, `n_frames`,
 `total_frames`, `frame_indices`, and for `vdm_text` the inserted `description`, `vdm_model`, `segmentation`
 (stride used, settings, `n_segments`, `[first, last, count]` per part), `vdm_calls` (part, attempt, frame range,
-latency, finish_reason, usage) and `parts` (each part's verbatim `reply`, parsed `events` / `state`, `reasoning`). Its usage is also in `vdm_usage`. `initial_prompt` in the same
+latency, finish_reason, usage) and `parts` (each part's verbatim `reply`, parsed `events` / `state`, `reasoning`). Its usage is also in `vdm_usage`,
+except with a `condition_video_model` other than the VDM: then `vdm_model` is that model, `usage_in_vdm_usage` is
+false, and the usage is only in `vdm_calls` (so `vdm_usage` stays the VDM model's). `initial_prompt` in the same
 entry is the prompt as sent (no images with `vdm_text`). Decision prompts never carry the video in either mode.
 
 #### First prompt, `images` (VideoUnmaskSwap, stub env; API docs shortened)
@@ -196,7 +210,8 @@ Qwen3.8-27B 0.45/3, Kimi-K3 3/15, and the alternatives Kimi-K2.7-Code 0.95/4, GL
 `nvidia/Nemotron-3-Ultra-550b-a55b` 1/3, Qwen3.5-397B-A17B 0.6/3.6 (text2text on Nebius; all of them are in
 `TEXT_ONLY_MODELS`; the GLM ID `zai-org/GLM-5.3` is unconfirmed). `scripts/model_costs.py` sums each trial's calls per model (ensemble: every
 candidate and synthesis call in `ensemble_calls`; no ensemble: `usage`, `truncated_first_usage`, `s5_first_reply`
-under the coding model; `vdm_usage` under the VDM model) and prices them as prompt × input + completion × output
+under the coding model; `vdm_usage` under the VDM model; with `condition_video_model`, the conditioning-video calls
+in `condition_video.vdm_calls` under that model, e.g. Kimi-K3 at 3/15) and prices them as prompt × input + completion × output
 (reasoning tokens are completion tokens). Molmo (local) and cached-input discounts are not included; the Nebius
 console is the authority.
 
@@ -225,7 +240,15 @@ later runs and `--check` reuse it:
 ```bash
 python scripts/gen_capbg_ensemble_configs.py --replace deepseek-ai/DeepSeek-V4-Flash-0731=<new/model>  # keeps its temperatures
 python scripts/gen_capbg_ensemble_configs.py --candidates "a/m1@0.1,0.5,0.9;b/m2@0.1,0.5,0.9" --synthesis-model c/m3
+# the current conditioning-video choice (models.json "condition_video"):
+python scripts/gen_capbg_ensemble_configs.py --condition-video-model moonshotai/Kimi-K3 \
+  --condition-video-tasks VideoUnmaskSwap,VideoPlaceOrder,MoveCube,PatternLock \
+  --condition-video-segment-frames 0 --condition-frames 32
+python scripts/gen_capbg_ensemble_configs.py --condition-video-model none  # back to the VDM, part by part
 ```
+
+The four video configs get `condition_video_model: moonshotai/Kimi-K3` and `condition_video_segment_frames: 0`
+(`condition_frames` stays 32, the baseline's); the other nine are unchanged.
 
 The configs' headers say which coding-side models are text-only (`TEXT_ONLY_MODELS`); add a new text-only model
 there before using it. A pilot started on older configs keeps their settings in its `pilot_manifest.jsonl`.
@@ -293,6 +316,18 @@ kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg &&
     --bench robomme --run-name 20261102_ens_robomme8x5 --trials 5 --workers 2 > logs/20261102_ens_robomme8x5.out 2>&1'
 ```
 
+(2b) The four video tasks with the Kimi-K3 description, into the same run as a separate process (finished trials
+in the run are skipped; it reuses SAM3 / GraspNet / pyroki servers already running, but if it started them they stop
+when it ends):
+
+```bash
+kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg && git fetch origin && git checkout exp/ensemble-nebius &&
+  git pull --ff-only origin exp/ensemble-nebius &&
+  nohup .venv-robomme/bin/python scripts/run_ensemble_pilot.py --bench robomme --run-name 20261101_ens2_robomme8x5 \
+    --tasks VideoUnmaskSwap VideoPlaceOrder MoveCube PatternLock --trials 5 --workers 2 \
+    > logs/20261101_ens2_robomme8x5_video.out 2>&1 &'
+```
+
 (3) Aggregate:
 
 ```bash
@@ -328,7 +363,9 @@ few dollars of VDM (each conditioning-video part sends 20 images). The aggregato
 - The VDM description replaces the frames. The coding models cannot recover anything the VDM misses or gets wrong.
   The part-by-part version is untested against the real VDM; check it with (0) before the pilot. Each part sees only
   its own frames plus the previous state, so an event that spans a boundary relies on the overlap frames.
-- 20 images per VDM request (the old single call sent 32). Lower `condition_video_segment_frames` if the endpoint limits
+- The Kimi-K3 description is one request with 32 images (`condition_frames`); a long video is seen only through
+  those 32 sampled frames.
+- 20 images per VDM request in the part-by-part mode (the single call sends 32). Lower `condition_video_segment_frames` if the endpoint limits
   images, and report different settings as different conditions.
 - Candidates cut off at `max_tokens` (or with empty content) still count as successful and go into the synthesis
   (upstream semantics); they are counted in the summary. A cut-off synthesis re-runs the whole ensemble once.

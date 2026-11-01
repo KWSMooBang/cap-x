@@ -186,11 +186,18 @@ def _ensemble_config(
     sf, ov = seg["condition_video_segment_frames"], seg["condition_video_overlap"]
     if sf and ov is not None and ov >= sf:
         raise ValueError(f"condition_video_overlap ({ov}) must be smaller than condition_video_segment_frames ({sf})")
+    cv_model = getattr(args, "condition_video_model", None) or configs_dict.get("condition_video_model")
+    if cv_model is not None:
+        from capx.llm.client import check_condition_video_model
+
+        check_condition_video_model(cv_model)
     return {
         "ensemble_candidates": [[m, list(t)] for m, t in candidates] if candidates is not None else None,
         "ensemble_synthesis_model": synth,
         "condition_video_mode": mode,
         **seg,
+        # None: the turn VDM (--visual-differencing-model) describes the conditioning video.
+        "condition_video_model": cv_model,
     }
 
 

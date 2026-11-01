@@ -138,6 +138,12 @@ def check_prompt_images(model: str, prompt: list[dict]) -> None:
             )
 
 
+def check_condition_video_model(model: str) -> None:
+    """condition_video_model gets the conditioning frames as images: refuse a text-only or non-VLM model."""
+    if is_text_only_model(model) or model not in VLM_MODELS:
+        raise ValueError(f"condition_video_model {model!r} must take images (one of VLM_MODELS, not text-only)")
+
+
 def parse_ensemble_candidates(spec: Any) -> list[tuple[str, list[float]]] | None:
     """Ensemble candidates as ``[(model, [temperatures])]``.
 

@@ -44,6 +44,9 @@ ENS_DIR = REPO_ROOT / "env_configs" / "capbg_ensemble"
 NEBIUS = [("openai/gpt-oss-120b", [0.1, 0.5, 0.9]), ("Qwen/Qwen3-235B-A22B-Instruct-2507", [0.1, 0.5, 0.9]),
           ("deepseek-ai/DeepSeek-V4-Flash-0731", [0.1, 0.5, 0.9])]
 SYNTH = "deepseek-ai/DeepSeek-V4-Pro"
+# Conditioning-video describer of the video tasks (models.json condition_video; lead, 2026-11-01).
+CV_MODEL = "moonshotai/Kimi-K3"
+CV_TASKS = ["VideoUnmaskSwap", "VideoPlaceOrder", "MoveCube", "PatternLock"]
 CODE = "```python\nopen_gripper()\n```"
 IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
 
@@ -242,9 +245,13 @@ def test_ensemble_config_matches_baseline_except_ensemble(path):
     ens, ref = yaml.safe_load(path.read_text()), yaml.safe_load(base.read_text())
     changed = {"use_parallel_ensemble", "use_multimodel", "ensemble", "condition_video_mode", "output_dir",
                "condition_video_stride", "condition_video_segment_frames", "condition_video_overlap",
-               "condition_video_max_segments"}
+               "condition_video_max_segments", "condition_video_model"}
     assert {k: v for k, v in ens.items() if k not in changed} == {k: v for k, v in ref.items() if k not in changed}
     assert ens["output_dir"].startswith("./outputs/capbg_ensemble/")
+    video_task = path.name in {f"robomme_{t.lower()}.yaml" for t in CV_TASKS}
+    assert ens.get("condition_video_model") == (CV_MODEL if video_task else None)
+    if path.parent.name == "robomme":
+        assert ens["condition_video_segment_frames"] == (0 if video_task else 20)
 
     _, config, _ = _load_config(LaunchArgs(config_path=str(path)))
     assert config["use_parallel_ensemble"] is True and config["use_multimodel"] is True
@@ -252,6 +259,7 @@ def test_ensemble_config_matches_baseline_except_ensemble(path):
     assert config["ensemble_synthesis_model"] == SYNTH
     assert config["condition_video_mode"] == ("auto" if path.parent.name == "robomme" else "images")
     assert config["memory_mode"] == "none"
+    assert config["condition_video_model"] == (CV_MODEL if video_task else None)
     if path.parent.name == "robomme":
         assert trial_mod._condition_video_mode(SimpleNamespace(model=SYNTH), config) == "vdm_text"
 
@@ -699,7 +707,7 @@ def test_trial_vdm_text_segmented(monkeypatch, patched_models, tmp_path):  # noq
 
 
 def test_segment_settings_config():
-    path = ENS_DIR / "robomme" / "robomme_movecube.yaml"
+    path = ENS_DIR / "robomme" / "robomme_pickxtimes.yaml"  # the video tasks use segment_frames 0 (Kimi-K3)
     _, config, _ = _load_config(LaunchArgs(config_path=str(path)))
     assert trial_mod._condition_video_segment_settings(config) == {
         "stride": 1, "segment_frames": 20, "overlap": 4, "max_segments": 12}
@@ -873,3 +881,161 @@ def test_text_only_ids():
     assert client.is_text_only_model("nvidia/Nemotron-3-Ultra-550b-a55b")
     assert client.is_text_only_model("Qwen/Qwen3.5-397B-A17B")
     assert not client.is_text_only_model("nvidia/Nemotron-3-Ultra-550b")
+
+
+# --------------------------------------------------------------------------------------------------
+# condition_video_model: another model describes the conditioning video, turn VDM unchanged
+# --------------------------------------------------------------------------------------------------
+
+def _recording(sink: list):
+    """Wrap the fake model: record every request (all ModelQueryArgs fields + prompt) as JSON text."""
+    import dataclasses
+
+    def wrap(model_fn):
+        def f(args, prompt):
+            sink.append(json.dumps({"args": dataclasses.asdict(args), "prompt": prompt}, sort_keys=True))
+            return model_fn(args, prompt)
+        return f
+    return wrap
+
+
+def _canonical(reqs: list[str]) -> list[str]:
+    """Requests as a sorted multiset; in synthesis prompts the lines are sorted too. Candidates run in parallel, so
+    their request order and their order in the synthesis prompt (completion order, as upstream) vary run to run."""
+    out = []
+    for r in reqs:
+        j = json.loads(r)
+        if "synthesizing" in str(j["prompt"][0]["content"]):
+            j["prompt"] = sorted(line.strip() for line in json.dumps(j["prompt"]).split("\\n"))
+        out.append(json.dumps(j, sort_keys=True))
+    return sorted(out)
+
+
+def _is_cv_request(req: str) -> bool:
+    return "demonstration video" in str(json.loads(req)["prompt"][0]["content"])
+
+
+@pytest.mark.parametrize("segment_frames, n_demo", [(0, 12), (20, 50)])
+def test_condition_video_model_only_moves_condition_video_calls(monkeypatch, patched_models, tmp_path,  # noqa: F811
+                                                                segment_frames, n_demo):
+    """Unset (or = the VDM): requests byte for byte as before. Set: only the conditioning-video requests change,
+    and only in ``model``; every turn VDM / coding request is the same."""
+    runs = {}
+    for name, extra in [("unset", {}), ("same", {"condition_video_model": "Qwen/Qwen3.8-27B"}),
+                        ("kimi", {"condition_video_model": CV_MODEL})]:
+        d = tmp_path / name
+        d.mkdir()
+        reqs: list[str] = []
+        config = _trial_config(d, condition_video_segment_frames=segment_frames, **extra)
+        _, responses = _run_trial(monkeypatch, d, config, n_demo=n_demo, wrap=_recording(reqs))
+        runs[name] = (reqs, responses)
+    unset, same, kimi = (runs[k][0] for k in ("unset", "same", "kimi"))
+    assert _canonical(same) == _canonical(unset)
+    # Conditioning-video requests are sequential and come first: compare them in order.
+    cv_unset, cv_kimi = [r for r in unset if _is_cv_request(r)], [r for r in kimi if _is_cv_request(r)]
+    n_cv = len(cv_unset)
+    assert n_cv == (1 if segment_frames == 0 else 3) and len(cv_kimi) == n_cv
+    assert unset[:n_cv] == cv_unset and kimi[:n_cv] == cv_kimi
+    for a, b in zip(cv_unset, cv_kimi):
+        ja, jb = json.loads(a), json.loads(b)
+        assert ja["args"]["model"] == "Qwen/Qwen3.8-27B" and jb["args"]["model"] == CV_MODEL
+        jb["args"]["model"] = ja["args"]["model"]
+        assert jb == ja  # same prompt, server, max_tokens, temperature, ...
+    # Everything else (turn VDM, candidates, synthesis) byte for byte the same.
+    assert _canonical(kimi[n_cv:]) == _canonical(unset[n_cv:])
+    vdm_models = [json.loads(r)["args"]["model"] for r in kimi if not _is_cv_request(r)]
+    assert "Qwen/Qwen3.8-27B" in vdm_models and CV_MODEL not in vdm_models  # turn VDM stays Qwen
+
+    # Logs: unset keeps the old log (conditioning-video usage in vdm_usage); set keeps it out of vdm_usage.
+    first = {k: runs[k][1][0] for k in runs}
+    cv_unset, cv_kimi = first["unset"]["condition_video"], first["kimi"]["condition_video"]
+    assert "usage_in_vdm_usage" not in cv_unset and cv_unset["vdm_model"] == "Qwen/Qwen3.8-27B"
+    assert cv_kimi["usage_in_vdm_usage"] is False and cv_kimi["vdm_model"] == CV_MODEL
+    assert len(first["unset"]["vdm_usage"]) == n_cv + 1 and len(first["kimi"]["vdm_usage"]) == 1
+    assert first["same"]["vdm_usage"] == first["unset"]["vdm_usage"]
+
+    # Costs: the conditioning-video calls at Kimi-K3 prices, the turn VDM at Qwen's; VDM-role totals unchanged.
+    prices = model_costs.load_prices()
+    u_unset = model_costs.trial_usage(runs["unset"][1], SYNTH, "Qwen/Qwen3.8-27B")
+    u_kimi = model_costs.trial_usage(runs["kimi"][1], SYNTH, "Qwen/Qwen3.8-27B")
+    k, q = u_kimi["by_model"][CV_MODEL], u_kimi["by_model"]["Qwen/Qwen3.8-27B"]
+    q0 = u_unset["by_model"]["Qwen/Qwen3.8-27B"]
+    assert (k["calls"], k["prompt"], k["completion"], k["timed_calls"]) == (n_cv, 100 * n_cv, 20 * n_cv, n_cv)
+    assert q["calls"] == q0["calls"] - n_cv and q["prompt"] == q0["prompt"] - 100 * n_cv
+    assert q0["timed_calls"] == n_cv and q["timed_calls"] == 0
+    for key in ("calls", "prompt", "completion"):
+        assert u_kimi["by_role"]["vdm"][key] == u_unset["by_role"]["vdm"][key]
+    cost = model_costs.cost_by_model(u_kimi["by_model"], prices)
+    assert prices[CV_MODEL] == (3.0, 15.0)
+    assert cost[CV_MODEL] == pytest.approx(n_cv * (100 * 3.0 + 20 * 15.0) / 1e6)
+    assert cost["Qwen/Qwen3.8-27B"] == pytest.approx(q["calls"] * (100 * 0.45 + 20 * 3.0) / 1e6)
+
+
+def test_condition_video_model_costs_from_log():
+    """A logged trial with condition_video_model: calls, tokens and latency under that model, none twice."""
+    responses = [{"decision": "initial", "vdm_usage": [_usage(10, 2)],
+                  "condition_video": {"mode": "vdm_text", "vdm_model": CV_MODEL, "usage_in_vdm_usage": False,
+                                      "vdm_calls": [{"latency_s": 30.0, "usage": _usage(1_000_000, 100_000)}]}}]
+    u = model_costs.trial_usage(responses, "x", "Qwen/Qwen3.8-27B")
+    k, q = u["by_model"][CV_MODEL], u["by_model"]["Qwen/Qwen3.8-27B"]
+    assert (k["calls"], k["prompt"], k["completion"], k["latency_s"]) == (1, 1_000_000, 100_000, 30.0)
+    assert (q["calls"], q["prompt"], q["timed_calls"]) == (1, 10, 0)
+    assert u["by_role"]["vdm"]["calls"] == 2
+    cost = model_costs.cost_by_model(u["by_model"], model_costs.load_prices())
+    assert cost[CV_MODEL] == pytest.approx(3.0 + 0.1 * 15.0)
+
+
+def test_condition_video_model_config_and_validation():
+    video = ENS_DIR / "robomme" / "robomme_videoplaceorder.yaml"
+    other = ENS_DIR / "robomme" / "robomme_pickxtimes.yaml"
+    _, config, _ = _load_config(LaunchArgs(config_path=str(video)))
+    assert config["condition_video_model"] == CV_MODEL
+    assert trial_mod._condition_video_segment_settings(config)["segment_frames"] == 0
+    _, config, _ = _load_config(LaunchArgs(config_path=str(other)))
+    assert config["condition_video_model"] is None
+    base = REPO_ROOT / "env_configs" / "robomme" / "robomme_videoplaceorder.yaml"
+    _, config, _ = _load_config(LaunchArgs(config_path=str(base)))
+    assert config["condition_video_model"] is None
+    _, config, _ = _load_config(LaunchArgs(config_path=str(video), condition_video_model="Qwen/Qwen3.8-27B"))
+    assert config["condition_video_model"] == "Qwen/Qwen3.8-27B"  # CLI > YAML
+    with pytest.raises(ValueError, match="must take images"):
+        _load_config(LaunchArgs(config_path=str(video), condition_video_model="openai/gpt-oss-120b"))
+    with pytest.raises(ValueError, match="must take images"):
+        _load_config(LaunchArgs(config_path=str(other), condition_video_model="x/not-a-vlm"))
+
+
+def test_trial_refuses_text_only_condition_video_model(monkeypatch, patched_models, tmp_path):  # noqa: F811
+    with pytest.raises(ValueError, match="must take images"):
+        _run_trial(monkeypatch, tmp_path, _trial_config(tmp_path, condition_video_model="openai/gpt-oss-120b"))
+
+
+def test_generator_condition_video_override():
+    files_none = gen_ens.build(condition_video=None)
+    files = gen_ens.build()
+    assert gen_ens.load_condition_video() == {"model": CV_MODEL, "tasks": CV_TASKS, "segment_frames": 0,
+                                              "condition_frames": 32}
+    video = {Path("robomme") / f"robomme_{t.lower()}.yaml" for t in CV_TASKS}
+    assert len(files) == 13
+    for rel, text in files.items():
+        if rel not in video:
+            assert text == files_none[rel]  # the other 9 configs: no change
+            continue
+        a, b = yaml.safe_load(text), yaml.safe_load(files_none[rel])
+        assert a["condition_video_model"] == CV_MODEL and a["condition_video_segment_frames"] == 0
+        assert a["env"]["cfg"]["low_level"]["condition_frames"] == 32
+        for key in ("condition_video_model", "condition_video_segment_frames"):
+            a.pop(key, None)
+            b.pop(key, None)
+        assert a == b
+    # condition_frames other than 32 goes into the env block; segment_frames unset keeps the default.
+    alt = gen_ens.build(condition_video={"model": CV_MODEL, "tasks": ["MoveCube"], "segment_frames": None,
+                                         "condition_frames": 16})[Path("robomme") / "robomme_movecube.yaml"]
+    assert "      condition_frames: 16\n" in alt and "condition_video_segment_frames: 20\n" in alt
+    gen = [sys.executable, str(REPO_ROOT / "scripts" / "gen_capbg_ensemble_configs.py"), "--check"]
+    r = subprocess.run(gen + ["--condition-video-model", "openai/gpt-oss-120b"], capture_output=True, text=True)
+    assert r.returncode == 2 and "must take images" in r.stderr
+    r = subprocess.run(gen + ["--condition-frames", "16"], capture_output=True, text=True)
+    assert r.returncode == 2
+    r = subprocess.run(gen + ["--condition-video-model", "none"], capture_output=True, text=True)
+    assert r.returncode == 1 and "models.json" in r.stdout  # would change; --check writes nothing
+    assert gen_ens.load_condition_video()["model"] == CV_MODEL

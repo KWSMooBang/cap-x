@@ -5,6 +5,7 @@
 #   synthesis DeepSeek-V4-Pro (upstream synthesis prompt). All coding-side models are text-only.
 # condition_video_mode auto -> vdm_text (if a coding-side model is text-only): the VDM describes the
 # conditioning video part by part (condition_video_* keys) and the text replaces the images in the first prompt.
+# Here the conditioning video is described by moonshotai/Kimi-K3 (condition_video_model), in one call, condition_frames 32; turn VDM calls keep Qwen/Qwen3.8-27B.
 # Everything else (prompts, APIs, servers, VDM on, video, max_tokens, budgets) is the baseline's.
 # VDM: --visual-differencing-model Qwen/Qwen3.8-27B (as the baseline). Molmo2-8B server at 127.0.0.1:8122 as for the baseline.
 # Requires the baseline venv (.venv-robomme). Run: python scripts/run_ensemble_pilot.py --bench robomme ...  (docs/capbg-ensemble.md)
@@ -79,10 +80,13 @@ ensemble:
 condition_video_mode: auto
 # vdm_text: every stride-th frame, segment_frames per VDM call, overlap frames shared with the previous call,
 # at most max_segments calls (the stride grows if needed).
+# segment_frames 0: one call with the condition_frames sampled frames (stride / overlap / max_segments unused).
 condition_video_stride: 1
-condition_video_segment_frames: 20
+condition_video_segment_frames: 0
 condition_video_overlap: 4
 condition_video_max_segments: 12
+# Model that describes the conditioning video (turn VDM calls keep the VDM model).
+condition_video_model: moonshotai/Kimi-K3
 use_img_differencing: true
 use_visual_feedback: false
 use_video_differencing: false
