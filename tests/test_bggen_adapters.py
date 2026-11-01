@@ -162,6 +162,9 @@ def test_libero_prepare_mocked(tmp_path, monkeypatch):
         def movable_objects(self):
             return ["akita_black_bowl_1", "plate_1"]
 
+        def on_targets(self):
+            return ["akita_black_bowl_1", "plate_1", "kitchen_table_the_center", "table"]
+
         def goal_state(self):
             return [["sequence", ["on", "akita_black_bowl_1", "plate_2"], ["on", "akita_black_bowl_1", "plate_1"]]]
 
@@ -193,6 +196,7 @@ def test_libero_prepare_mocked(tmp_path, monkeypatch):
     assert list(ep.camera_frames("agentview")) == [0, 4, 8, 11] and ep.camera("agentview", 9).rgb[0, 0, 0] == 8
     orc = load_oracle(tmp_path / "ep")
     assert orc.objects == {"akita_black_bowl_1": "bowl", "plate_1": "plate"}
+    assert orc.meta["regions"] == {"center": "kitchen_table_the_center"}  # at(X, center) is scored against it
     assert orc.at(0)["true"] == [["on", "akita_black_bowl_1", "plate_1"]] and orc.at(6)["inhand"]["main"] == "akita_black_bowl_1"
     assert [s["label"] for s in orc.segments] == ["pick"]
     assert orc.final["success"] is True and orc.final["tracker_success"] is False

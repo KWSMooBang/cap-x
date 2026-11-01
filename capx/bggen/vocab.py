@@ -28,6 +28,10 @@ from capx.belief.perception import VOCABULARY_V2, Category, categories_from_inst
 EdgeKey = tuple[str, str, "str | None"]
 TABLE = "table"
 ARMS_ONE = (None,)
+# Named table regions (``("at", X, region)``). LIBERO-Mem tasks 8 / 9 put a basket "in the center" (BDDL
+# ``(On basket_1 kitchen_table_the_center)``); the oracle names the region ``kitchen_table_the_center`` and
+# ``oracle/meta.json`` "regions" maps "center" to it. A region is never a subject.
+REGIONS = ("center",)
 
 BINARY = ("on", "in", "at")
 UNARY = ("lifted", "open", "toggled_on", "cooked")
@@ -114,6 +118,8 @@ def statement_key(pred: str, args: Sequence[str], names: Sequence[str] = (),
                   arms: Sequence[str | None] = ARMS_ONE) -> EdgeKey | None:
     canon = {n.lower(): n for n in names}
     canon[TABLE] = TABLE
+    for r in REGIONS:
+        canon.setdefault(r, r)
     pred = pred.lower()
     arm: str | None = None
     for base in ("inhand", "handempty"):
@@ -133,13 +139,19 @@ def statement_key(pred: str, args: Sequence[str], names: Sequence[str] = (),
     if names and any(x is None for x in a):
         return None
     a = [x if x is not None else y for x, y in zip(a, args, strict=True)]
+    if a and a[0] in REGIONS:
+        return None
     if pred == "handempty":
         return ("handempty", arm, None) if not a else None
     if pred == "inhand":
         return ("inhand", a[0], arm) if len(a) == 1 else None
     if pred in UNARY:
         return (pred, a[0], None) if len(a) == 1 else None
-    if len(a) != 2 or a[0] == a[1] or a[0] == TABLE:
+    if len(a) != 2 or a[0] == a[1] or a[0] in (TABLE, *REGIONS):
+        return None
+    if a[1] in REGIONS:  # (on basket_A center) as the BDDL writes it -> (at basket_A center)
+        return ("at", a[0], a[1])
+    if pred == "at":  # at needs a region
         return None
     return (pred, a[0], a[1])
 

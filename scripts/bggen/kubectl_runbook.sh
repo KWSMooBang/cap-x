@@ -1,28 +1,33 @@
 #!/usr/bin/env bash
-# Agent as BG Generator (capx.bggen) on kubectl: one LIBERO-Mem task-06 demo and B1K task-45 episode_00450010.
+# Agent as BG Generator (capx.bggen) on kubectl, over the episode list scripts/bggen/episodes.yaml
+# (LIBERO-Mem tasks 0 / 2 / 6 / 7 / 8 x demo_1..3, B1K task 45 x 5 episodes; ONLY=... narrows it).
 #
-#   bash scripts/bggen/kubectl_runbook.sh <step>     step = 1a 1b 2 3 4 (in this order), or "all"
+#   bash scripts/bggen/kubectl_runbook.sh <step>     step = list 1a 1b 2 3 4 (in this order), or "all"
 #
-#   1a  data, LIBERO-Mem (CPU ok): download the swap HDF5 only, dump its structure, replay + render the first demo (DEMO=demo_k to choose)
-#       (agentview RGB-D, K, camera pose, proprio from the HDF5) and the simulator oracle. Needs the LIBERO-Mem venv.
-#       CHECKS: structure.json (datasets / attrs / gripper range), prep JSON (replay mode, eef drift HDF5 vs cap-x,
-#       success), check-episode (gripper events = 3 grasp + 3 release, depth range, camera height).
-#   1b  data, B1K (CPU): download the episode's parquet + head/wrist rgb/depth videos + meta + annotation only,
-#       dump the structure, decode at 5 Hz, write the oracle (annotation timeline, task_info inhand / positions).
-#       CHECKS: structure.json checks (task_info layout_ok, head_height_1_2m, head_looks_forward_down),
-#       check-episode (depth p50 0.5-5 m, events: grasps per arm, base_start/stop).
-#       If a check is false, the corresponding path is wrong: STOP and report (camera order / depth constants).
-#   2   smoke with FAKE models (scripted local server) + FAKE detector (fixed boxes): output format only.
-#       CHECKS: trace.jsonl / cot_rows.jsonl / report.md / keyframes exist, agent fallbacks > 0 (bad_every=5),
+#   list  the episodes, whether each is prepared and whether RUN_TAG has a run of it.
+#   1a  data, LIBERO-Mem (CPU ok; needs the LIBERO-Mem venv PY_LM and a renderer): per task download that task's HDF5
+#       only, dump its structure (data/libero_mem/structure_tNN.json), then per demo replay + render (agentview + wrist
+#       RGB-D, K, camera pose, proprio) and the simulator oracle, then check-episode. Prepared episodes are skipped
+#       (FORCE=1 redoes them). prepare checks the HDF5's bddl_file_name against the task_id and uses the BDDL language.
+#   1b  data, B1K (CPU): per episode download its parquet + head / wrist rgb / depth videos + meta + annotation only,
+#       decode at 5 Hz, write the oracle, check-episode. A false data check (head_height_1_2m, head_looks_forward_down,
+#       task_info_layout_ok) marks the episode check_failed: step 3 does not run it (ALLOW_CHECK_FAIL=1 to run anyway).
+#       Per-episode results: episodes/prep_status.json; command output: logs/batch/{download,prep,check}_<id>.log.
+#   2   smoke with FAKE models (scripted local server) + FAKE detector (fixed boxes) on SMOKE_EPS: output format only.
+#       CHECKS: trace.jsonl / cot_rows.jsonl / report.md / summary.json exist, agent fallbacks > 0 (bad_every=5),
 #       backward forbidden_violations == [].
-#   3   real models + SAM3 (GPU 1): starts the SAM3 server, runs mode A on both episodes (rows_forward = mode B).
+#   3   real models + SAM3 (GPU 1): starts the SAM3 server, runs mode A on every prepared episode into
+#       runs/${RUN_TAG}/<id>/ (JOBS episodes at once, default 1) and evaluates each. A run that already has
+#       summary.json is skipped (FORCE=1 reruns). A failing episode is recorded (runs/${RUN_TAG}/batch_status.json,
+#       logs/batch/run_${RUN_TAG}_<id>.log) and the next one starts. Init failures (no goal) are recorded; after the
+#       whole batch the step exits 3 if any episode's init failed, unless ALLOW_INIT_FAIL=1.
 #       Needs NEBIUS_SERVER_URL / NEBIUS_API_KEY (or BGGEN_<ROLE>_URL / _MODEL for a vLLM server).
-#       Run folders: runs/${RUN_TAG}_{libero,b1k}_A (RUN_TAG default "real"; RUN_TAG=fix2 keeps the first run's outputs).
-#       Prints each run's init state; exits 3 after both runs if an init failed (no goal), unless ALLOW_INIT_FAIL=1.
-#   4   oracle evaluation (same RUN_TAG): eval.md (forward vs forward+backward), name / goal consistency.
+#   4   re-evaluate every run of RUN_TAG, then aggregate: runs/${RUN_TAG}/aggregate.{md,json} (per task / benchmark /
+#       all, forward and forward+backward lines, mean [min, max]).
 #
-# Exit codes: any failing command fails its step and the script (set -Eeuo pipefail; the ERR trap names the step
-# and line). Step 3 also exits 3 after both runs when an init failed (no goal), unless ALLOW_INIT_FAIL=1.
+# Exit codes: a failing command of the driver itself fails the step (set -Eeuo pipefail; the ERR trap names the step
+# and line). Per-episode failures do not: they are in the status files and in aggregate.md. Step 3 exits 3 after the
+# whole batch when an init failed (no goal), unless ALLOW_INIT_FAIL=1.
 set -Eeuo pipefail
 STEP=${1:-}
 trap 'rc=$?; echo "[runbook] step ${STEP} FAILED (exit ${rc}) at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
@@ -31,49 +36,47 @@ REPO=${REPO:-$(cd "$(dirname "$0")/../.." && pwd)}
 OUT=${OUT:-/workspace/cap-bg/outputs/agent-bg-gen}
 PY=${PY:-$REPO/.venv/bin/python}                       # main venv (uv sync): huggingface_hub, pandas, pyarrow, SAM3 client
 PY_LM=${PY_LM:-$REPO/.venv-libero-mem/bin/python}      # LIBERO-Mem venv (docs/memory-benchmarks.md)
-LM_H5=KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_plate_demo.hdf5
-B1K_EP=$OUT/episodes/b1k_t45_e00450010
+EPISODES=${EPISODES:-$REPO/scripts/bggen/episodes.yaml}
+RUN_TAG=${RUN_TAG:-batch1}
+JOBS=${JOBS:-1}
+ONLY=${ONLY:-}                                         # e.g. ONLY=t08 or ONLY=b1k or ONLY=libero_mem_t06_demo_2
+SMOKE_EPS=${SMOKE_EPS:-"libero_mem_t06_demo_1 libero_mem_t08_demo_1 b1k_t45_e00450010"}
 cd "$REPO"
 mkdir -p "$OUT"/{data,episodes,runs,logs}
 
-# DEMO: the first demo in the file unless set (LIBERO-Mem-Raw starts at demo_1); the episode folder carries its name
-lm_ep() {
-  if [ -z "${DEMO:-}" ]; then
-    DEMO=$($PY -m capx.bggen.cli first-demo --h5 "$OUT/data/libero_mem/$LM_H5")
-  fi
-  LM_EP=$OUT/episodes/libero_mem_t06_${DEMO}
+batch() {  # batch <step> [--only X] ...
+  local step=$1; shift
+  local args=(--episodes "$EPISODES" --out "$OUT" --tag "$RUN_TAG" --py "$PY" --py-lm "$PY_LM")
+  [ "${FORCE:-0}" = 1 ] && args+=(--force)
+  [ "${ALLOW_CHECK_FAIL:-0}" = 1 ] && args+=(--allow-check-fail)
+  $PY -m capx.bggen.batch "$step" "${args[@]}" "$@"
 }
 
+only() {  # the --only value: ONLY if set, else the step's default ($1)
+  echo "${ONLY:-$1}"
+}
+
+step_list() { batch list --only "$(only '')"; }
+
 step_1a() {
-  $PY -m capx.bggen.cli download-libero --dest "$OUT/data/libero_mem"
-  $PY -m capx.bggen.cli dump-libero --h5 "$OUT/data/libero_mem/$LM_H5" --out "$OUT/data/libero_mem/structure.json" > "$OUT/logs/dump_libero.json"
-  head -80 "$OUT/logs/dump_libero.json"  # from a file: piping into head would SIGPIPE the writer and fail the step under pipefail
-  lm_ep
   # GPU node: EGL; CPU: MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa NUMBA_DISABLE_JIT=1
-  MUJOCO_GL=${MUJOCO_GL:-egl} PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-egl} \
-    $PY_LM -m capx.bggen.cli prep-libero --h5 "$OUT/data/libero_mem/$LM_H5" --demo "$DEMO" --root "$LM_EP" --task-id 6 --wrist \
-    | tee "$OUT/logs/prep_libero.json"
-  $PY -m capx.bggen.cli check-episode --root "$LM_EP" | tee "$OUT/logs/check_libero.json"
+  MUJOCO_GL=${MUJOCO_GL:-egl} PYOPENGL_PLATFORM=${PYOPENGL_PLATFORM:-egl} batch prep --only "$(only libero_mem)" | tee "$OUT/logs/batch_prep_libero.log"
 }
 
 step_1b() {
-  $PY -m capx.bggen.cli download-b1k --dest "$OUT/data/b1k" --wrist
-  $PY -m capx.bggen.cli dump-b1k --src "$OUT/data/b1k" --out "$OUT/data/b1k/structure.json" > "$OUT/logs/dump_b1k.json"
-  tail -40 "$OUT/logs/dump_b1k.json"
-  $PY -m capx.bggen.cli prep-b1k --src "$OUT/data/b1k" --root "$B1K_EP" --wrist --image-stride 6 | tee "$OUT/logs/prep_b1k.json"
-  $PY -m capx.bggen.cli check-episode --root "$B1K_EP" | tee "$OUT/logs/check_b1k.json"
+  batch prep --only "$(only b1k)" | tee "$OUT/logs/batch_prep_b1k.log"
 }
 
 step_2() {
-  lm_ep
-  $PY -m capx.bggen.cli run --root "$LM_EP" --out "$OUT/runs/smoke_libero" --benchmark libero_mem --mode A \
-    --fake-models --detector format_fake | tee "$OUT/logs/smoke_libero.json"
-  $PY -m capx.bggen.cli run --root "$B1K_EP" --out "$OUT/runs/smoke_b1k" --benchmark b1k --mode A \
-    --fake-models --detector format_fake | tee "$OUT/logs/smoke_b1k.json"
-  for r in smoke_libero smoke_b1k; do
-    ls "$OUT/runs/$r"/{trace.jsonl,cot_rows.jsonl,cot_rows_forward.jsonl,rows_backward.jsonl,report.md,summary.json} >/dev/null
-    $PY -c "import json,sys; s=json.load(open('$OUT/runs/$r/summary.json')); \
-print('$r', 'fallbacks', s['agent_fallbacks'], 'violations', s['backward']['forbidden_violations'])"
+  for ep in $SMOKE_EPS; do
+    local root="$OUT/episodes/$ep" bench=libero_mem
+    case "$ep" in b1k_*) bench=b1k ;; esac
+    if [ ! -f "$root/oracle/states.jsonl" ]; then echo "[runbook] smoke: $ep not prepared, skipped"; continue; fi
+    $PY -m capx.bggen.cli run --root "$root" --out "$OUT/runs/smoke/$ep" --benchmark "$bench" --mode A \
+      --fake-models --detector format_fake > "$OUT/logs/smoke_$ep.json"
+    ls "$OUT/runs/smoke/$ep"/{trace.jsonl,cot_rows.jsonl,cot_rows_forward.jsonl,rows_backward.jsonl,report.md,summary.json} >/dev/null
+    $PY -c "import json; s=json.load(open('$OUT/runs/smoke/$ep/summary.json')); \
+print('$ep', 'fallbacks', s['agent_fallbacks'], 'violations', s['backward']['forbidden_violations'])"
   done
 }
 
@@ -89,46 +92,31 @@ sam3_up() {
   curl -s -m 2 "$BGGEN_SAM3_URL" >/dev/null 2>&1 || { echo "[runbook] SAM3 server not up at $BGGEN_SAM3_URL (log: $OUT/logs/sam3.log)" >&2; return 1; }
 }
 
-# RUN_TAG names the run folders (default "real" = the first kubectl run; e.g. RUN_TAG=fix2 keeps that run's outputs)
-RUN_TAG=${RUN_TAG:-real}
-
-init_check() {  # $1 = run folder; prints the init state, returns 1 when the init failed (no goal)
-  $PY - "$1" <<'PY'
-import json, sys
-s = json.load(open(sys.argv[1] + "/summary.json"))
-f = s.get("init_failed")
-print(f"[runbook] {sys.argv[1]}: init {'FAILED: ' + f if f else 'ok'}; goal branches {len(s['goal']['branches'])}; "
-      f"track identity {s.get('track_identity')}")
-sys.exit(1 if f else 0)
-PY
-}
-
 step_3() {
   : "${NEBIUS_SERVER_URL:?set NEBIUS_SERVER_URL (or BGGEN_<ROLE>_URL)}"
   sam3_up
-  lm_ep
-  $PY -m capx.bggen.cli run --root "$LM_EP" --out "$OUT/runs/${RUN_TAG}_libero_A" --benchmark libero_mem --mode A \
-    | tee "$OUT/logs/${RUN_TAG}_libero.json"
-  $PY -m capx.bggen.cli run --root "$B1K_EP" --out "$OUT/runs/${RUN_TAG}_b1k_A" --benchmark b1k --mode A \
-    | tee "$OUT/logs/${RUN_TAG}_b1k.json"
-  local bad=0
-  init_check "$OUT/runs/${RUN_TAG}_libero_A" || bad=1
-  init_check "$OUT/runs/${RUN_TAG}_b1k_A" || bad=1
-  if [ "$bad" = 1 ] && [ "${ALLOW_INIT_FAIL:-0}" != 1 ]; then
-    echo "[runbook] init failed (no goal) in at least one run: see report.md; ALLOW_INIT_FAIL=1 to continue" >&2
+  batch run --only "$(only '')" --jobs "$JOBS" | tee "$OUT/logs/batch_run_${RUN_TAG}.log"
+  # every episode has run; an init failure (no goal) is loud here, as in the single-episode runbook
+  local bad
+  bad=$($PY - "$OUT/runs/$RUN_TAG/batch_status.json" <<'PY'
+import json, sys
+st = json.load(open(sys.argv[1]))
+print(" ".join(k for k, v in st.items() if v.get("init_failed")))
+PY
+)
+  if [ -n "$bad" ] && [ "${ALLOW_INIT_FAIL:-0}" != 1 ]; then
+    echo "[runbook] init failed (no goal) in: $bad -- see their report.md; every other episode ran. ALLOW_INIT_FAIL=1 to go on" >&2
     exit 3
   fi
 }
 
 step_4() {
-  lm_ep
-  $PY -m capx.bggen.cli eval --root "$LM_EP" --out "$OUT/runs/${RUN_TAG}_libero_A"
-  $PY -m capx.bggen.cli eval --root "$B1K_EP" --out "$OUT/runs/${RUN_TAG}_b1k_A"
-  for r in libero b1k; do echo "== ${RUN_TAG}_${r}_A"; cat "$OUT/runs/${RUN_TAG}_${r}_A/eval.md"; done
+  batch eval --only "$(only '')" | tee "$OUT/logs/batch_eval_${RUN_TAG}.log"
+  $PY scripts/bggen/aggregate.py "$OUT/runs/$RUN_TAG"
 }
 
 case "${1:-}" in
-  1a) step_1a ;; 1b) step_1b ;; 2) step_2 ;; 3) step_3 ;; 4) step_4 ;;
+  list) step_list ;; 1a) step_1a ;; 1b) step_1b ;; 2) step_2 ;; 3) step_3 ;; 4) step_4 ;;
   all) step_1a; step_1b; step_2; step_3; step_4 ;;
-  *) echo "usage: $0 1a|1b|2|3|4|all"; exit 2 ;;
+  *) echo "usage: $0 list|1a|1b|2|3|4|all"; exit 2 ;;
 esac

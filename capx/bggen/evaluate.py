@@ -35,6 +35,7 @@ Metrics, for the forward pass (= mode B) and forward + backward (mode A), one li
 from __future__ import annotations
 
 import json
+import re
 import statistics
 from bisect import bisect_left, bisect_right
 from collections.abc import Sequence
@@ -45,7 +46,7 @@ import numpy as np
 
 from .graph import decided
 from .oracle import Oracle, load_oracle
-from .vocab import OPENABLE_KEYS, parse_statement
+from .vocab import OPENABLE_KEYS, REGIONS, parse_statement
 
 DEFAULT_TOL = {"b1k": 15}  # frames; others 5
 DEFAULT_MAP_RADIUS = {"b1k": 0.6}  # m; others 0.15
@@ -199,13 +200,30 @@ def alias_map(trace0: dict[str, Any], oracle: Oracle, t: int = 0, radius: float 
 
 # --- relations ---------------------------------------------------------------------------------------
 
-def _sim_key(key: tuple, amap: dict[str, str]) -> list[tuple] | None:
+def oracle_regions(oracle: Oracle) -> dict[str, str]:
+    """Region word -> oracle region name (``at(X, center)`` is scored as the oracle's ``on X <region name>``).
+    From ``meta.json`` "regions" (LIBERO-Mem prepare writes it); else from region targets that hold somewhere in
+    the states (``kitchen_table_the_center`` -> "center"). Empty: ``at`` is not scored."""
+    reg = dict(oracle.meta.get("regions") or {})
+    if not reg:
+        for s in oracle.states:
+            for p in s.get("true", []):
+                m = re.search(r"_the_([a-z]+)$", str(p[2])) if len(p) > 2 and p[0] == "on" and p[2] else None
+                if m and m.group(1) in REGIONS:
+                    reg.setdefault(m.group(1), str(p[2]))
+    return reg
+
+
+def _sim_key(key: tuple, amap: dict[str, str], regions: dict[str, str] | None = None) -> list[tuple] | None:
     pred, a, b = key
     if pred in ("inhand", "handempty"):
         return None
     sa = amap.get(a)
     if sa is None:
         return None
+    if pred == "at":
+        rn = (regions or {}).get(b)
+        return [("on", sa, rn)] if rn else None
     if b is None:
         return [(pred, sa, None)]
     if b == "table":
@@ -216,7 +234,7 @@ def _sim_key(key: tuple, amap: dict[str, str]) -> list[tuple] | None:
     return [(pred, sa, sb), (pred, sa, f"{sb}_contain_region")]
 
 
-def _truth(key: tuple, state: dict[str, Any], amap: dict[str, str]) -> bool | None:
+def _truth(key: tuple, state: dict[str, Any], amap: dict[str, str], regions: dict[str, str] | None = None) -> bool | None:
     """The oracle value of a generated key in one oracle state (None: not covered / not mapped)."""
     inhand = state.get("inhand", {})
     if key[0] == "inhand":
@@ -229,7 +247,7 @@ def _truth(key: tuple, state: dict[str, Any], amap: dict[str, str]) -> bool | No
         if arm not in inhand:
             return None
         return inhand[arm] is None
-    sk = _sim_key(key, amap)
+    sk = _sim_key(key, amap, regions)
     if sk is None:
         return None
     truth = {(p[0], p[1], p[2] if len(p) > 2 else None) for p in state.get("true", [])}
@@ -267,6 +285,9 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
     """``remap`` False (main metric): the episode-level map (``TrackMap.fixed``). True: the map at each row's frame
     (re-matching allowed; an auxiliary number that forgives name swaps)."""
     covered = set(oracle.relations)
+    regions = oracle_regions(oracle)
+    if regions and "on" in covered:
+        covered.add("at")
     art = articulated_intervals(oracle)
     right = wrong = undecided = saved = unmapped = unmappable = 0
     per_pred: dict[str, list[int]] = {}
@@ -292,9 +313,9 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
                 tag = "undecided" if d is None else f"{key[0]}={int(d)}"
                 art_counts[tag] = art_counts.get(tag, 0) + 1
                 continue
-            vals = [_truth(key, s, amap) for s in states]
+            vals = [_truth(key, s, amap, regions) for s in states]
             if vals[0] is None:
-                objs = [x for x in (key[1], key[2]) if x and x != "table" and x not in (arms or ())]
+                objs = [x for x in (key[1], key[2]) if x and x != "table" and x not in REGIONS and x not in (arms or ())]
                 lost = isinstance(tmap, TrackMap) and any(x not in amap and tmap.unmappable(x) for x in objs)
                 d = decided(p)
                 if lost and d is not None:
@@ -427,8 +448,19 @@ def evaluate(out_dir: str | Path, root: str | Path, tol: int | None = None, map_
                            "tolerance_frames": tol, "name_consistency": name_consistency(tmap),
                            "init_failed": summary.get("init_failed"), "track_identity": summary.get("track_identity")}
     fin = summary.get("goal", {}).get("final_satisfied")
+    g = summary.get("goal", {})
+    branches = g.get("branches") or []
+    best = g.get("best")
+    done = g.get("done") or []
+    regions = oracle_regions(oracle)
+    in_goal = sorted({st for br in branches for step in br for st in step if str(st).startswith("(at ")})
     res["goal_consistency"] = {"final_graph_satisfies_goal": fin, "oracle_success": oracle.final.get("success"),
-                               "goal_known": bool(summary.get("goal", {}).get("branches"))}
+                               "goal_known": bool(branches),
+                               "steps_done": done[best] if best is not None and best < len(done) else None,
+                               "steps_total": len(branches[best]) if best is not None and best < len(branches) else None,
+                               # the oracle task has a table region (LIBERO-Mem 8 / 9 "center"): is it in the generated goal?
+                               "oracle_regions": regions, "region_relations_in_goal": in_goal,
+                               "region_goal_missing": bool(regions) and bool(branches) and not in_goal}
     for tag, fname in (("forward", "rows_forward.jsonl"), ("forward+backward", "rows_backward.jsonl")):
         rows = _jsonl(out / fname)
         if not rows:
@@ -487,8 +519,12 @@ def eval_table(res: dict[str, Any]) -> str:
     nc, gc, tm = res["name_consistency"], res["goal_consistency"], res["track_map"]
     lines += ["", f"Name consistency: {nc['rate']} (n={nc['n']}, vs the episode-level map); re-match errors: {nc['map_changes']}; "
                   f"objects with several aliases: {nc['objects_with_several_aliases']}",
-              f"Goal consistency: final graph satisfies goal = {gc['final_graph_satisfies_goal']} (goal known: {gc['goal_known']}), "
-              f"oracle success = {gc['oracle_success']}", "",
+              f"Goal consistency: final graph satisfies goal = {gc['final_graph_satisfies_goal']} (goal known: {gc['goal_known']}; "
+              f"steps confirmed {gc.get('steps_done')} / {gc.get('steps_total')}), oracle success = {gc['oracle_success']}"]
+    if gc.get("oracle_regions"):
+        lines.append(f"Table region {gc['oracle_regions']}: in the generated goal {gc.get('region_relations_in_goal')}"
+                     + (" -- **REGION MISSING FROM THE GOAL** (the at(center) step is not tracked)" if gc.get("region_goal_missing") else ""))
+    lines += ["",
               f"## Oracle object <-> track map (3D, radius {tm['radius']} m, updated over the episode; {tm['n_changes']} re-maps)",
               f"episode-level (scoring): {tm['fixed']}", f"first: {tm['first']}", f"final: {tm['final']}"]
     for c in [c for c in tm["changes"] if c["from"] is not None or c["t"] > 0][:30]:

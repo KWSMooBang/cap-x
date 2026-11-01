@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from .configs import RENAMES
 from .generator import GenConfig, Generator, save_trace
 from .records import load_episode
 from .serialize import cot_rows, row_to_json, write_jsonl
+from .vocab import REGIONS
 
 
 def base_motion(events: list[Any]) -> list[tuple[int, int]]:
@@ -52,6 +54,7 @@ def run_episode(root: str | Path, out: str | Path, cfg: GenConfig, models: Any, 
     summary = gen.summary()
     summary.update(benchmark=benchmark, mode=cfg.mode, instruction=ep.instruction, n_frames=ep.n_frames, fps=ep.fps,
                    arms=list(gen.arms), init=gen.init_info)
+    summary["goal"].update(region_check(ep.instruction, summary["goal"]["branches"], cfg.relations))
     final = fwd
     if cfg.offline:
         cats = {a: t.category for a, t in gen.tracker.tracks.items()}
@@ -75,6 +78,15 @@ def run_episode(root: str | Path, out: str | Path, cfg: GenConfig, models: Any, 
     (out / "summary.json").write_text(json.dumps(summary, indent=1, default=str))
     (out / "report.md").write_text(report(summary, final, rename))
     return summary
+
+
+def region_check(instruction: str, branches: list[Any], relations: tuple[str, ...]) -> dict[str, Any]:
+    """The instruction names a table region (LIBERO-Mem 8 / 9 "... in the center"): is an ``at`` relation in the goal?
+    ``region_missing`` True: the goal lost that step (no progress / goal satisfaction for it)."""
+    words = [r for r in REGIONS if re.search(rf"\b{r}\b", (instruction or "").lower())]
+    in_goal = sorted({st for br in branches for step in br for st in step if str(st).startswith("(at ")})
+    return {"region_words": words, "region_relations": in_goal,
+            "region_missing": bool(words) and bool(branches) and not in_goal, "at_allowed": "at" in relations}
 
 
 def report(s: dict[str, Any], rows: list[Any], rename: dict[str, str]) -> str:
@@ -108,7 +120,9 @@ def report(s: dict[str, Any], rows: list[Any], rename: dict[str, str]) -> str:
               f"{ti.get('closed_assigned')} / {ti.get('closed_dropped')}; duplicate masks dropped: {ti.get('duplicates_dropped')}",
               f"tracks per category: {ti.get('tracks_per_category')}; expected never seen: {ti.get('expected_unbound')}", "",
               "## Verifier decisions by rule", ", ".join(f"{k} {v}" for k, v in sorted(s["verifier_rules"].items())), "",
-              "## Goal", f"branches: {s['goal']['branches']}", f"done per branch: {s['goal']['done']} at frames {s['goal']['done_t']}",
+              "## Goal"] + ([f"> **REGION MISSING FROM THE GOAL**: the instruction names {s['goal']['region_words']} but no "
+                             "`at` relation is in the goal branches (that step is not tracked)."]
+                            if s["goal"].get("region_missing") else []) + [f"branches: {s['goal']['branches']}", f"done per branch: {s['goal']['done']} at frames {s['goal']['done_t']}",
               f"final graph satisfies the goal: {s['goal']['final_satisfied']}", ""]
     if "backward" in s:
         lines += ["## Backward pass", json.dumps(s["backward"]), ""]

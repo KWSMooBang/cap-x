@@ -41,9 +41,74 @@ SWAP_FILE = "KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_p
 SWAP_TASK_ID = 6
 FINGER_QPOS = slice(7, 9)  # Panda finger joints in sim.data.qpos (states[:, 8:10]); width = q0 - q1 = |q0| + |q1|
 SWAP_INSTRUCTION = "swap the 2 bowls on their plates using the empty plate"
+# cap-x LIBERO-Mem task_id (0-based) -> LIBERO-Mem task name = BDDL file stem = HF file "<name>_demo.hdf5"
+# (LIBERO-Mem libero/benchmark/libero_suite_task_map.py "libero_mem"; HF file list checked 2026-11-01).
+TASK_NAMES: tuple[str, ...] = (
+    "KITCHEN_SCENE1_1_pick_up_the_bowl_and_place_it_back_on_the_plate",
+    "KITCHEN_SCENE1_2_lift_the_bottle_and_put_it_down_on_the_plate",
+    "KITCHEN_SCENE1_3_lift_the_bowl_and_place_it_back_on_the_plate_3_times",
+    "KITCHEN_SCENE1_4_pick_up_the_bottle_and_put_it_down_the_plate_3_times",
+    "KITCHEN_SCENE1_5_lift_the_bowl_and_place_it_back_on_the_plate_5_times",
+    "KITCHEN_SCENE1_6_pick_up_the_bowl_and_place_it_on_the_plate_7_times",
+    "KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_plate",
+    "KITCHEN_SCENE1_8_rotate_the_3_bowls_on_their_plates_from_left_to_right_using_the_empty_plate",
+    "KITCHEN_SCENE1_9_put_the_cream_cheese_in_the_nearest_basket_and_place_that_basket_in_the_center",
+    "KITCHEN_SCENE1_10_put_the_cream_cheese_in_the_nearest_basket_and_place_the_empty_basket_in_the_center",
+)
+
+
+def task_file(task_id: int) -> str:
+    return f"{TASK_NAMES[task_id]}_demo.hdf5"
+
+
+def bddl_stem(path: str | None) -> str | None:
+    return Path(str(path)).stem if path else None
+
+
+def check_task(task_id: int, file_bddl: str | None, file_instruction: str | None, env_instruction: str | None,
+               h5_name: str | None = None) -> dict[str, Any]:
+    """Is the HDF5 a demo of cap-x task ``task_id``? The file's ``data@bddl_file_name`` stem (else the HDF5 name)
+    must be the task's name. The languages are compared too but may differ: LIBERO-Mem-Raw task 2
+    (KITCHEN_SCENE1_3 ... 3_times) stores "pick up the bowl and place it back on the plate" in problem_info while
+    its BDDL says "... 3 times" (checked 2026-11-01). The episode instruction is the env's (BDDL) language, the one
+    cap-x evaluates with; the file's is kept in the meta. Raises on a task mismatch."""
+    name = TASK_NAMES[task_id] if 0 <= task_id < len(TASK_NAMES) else None
+    h5 = Path(h5_name).name if h5_name else ""
+    stem = bddl_stem(file_bddl) or (h5.removesuffix("_demo.hdf5") if h5.startswith("KITCHEN_") and h5.endswith("_demo.hdf5") else None)
+
+    def norm(x: str | None) -> str:
+        return (x or "").strip().lower()
+
+    lang_same = bool(file_instruction and env_instruction) and norm(file_instruction) == norm(env_instruction)
+    if stem is not None and name is not None:
+        if stem != name:
+            raise RuntimeError(f"task_id {task_id} is {name} but the file is {stem}: pass the matching --task-id")
+        how = "bddl_file_name" if file_bddl else "hdf5 name"
+    elif file_instruction and env_instruction and not lang_same:
+        raise RuntimeError(f"task_id {task_id} is {env_instruction!r} but the file is {file_instruction!r}: "
+                           "pass the matching --task-id")
+    else:
+        how = "language"
+    return {"task_name": name, "matched_by": how, "language_same": lang_same, "file_instruction": file_instruction,
+            "env_instruction": env_instruction, "instruction": env_instruction or file_instruction}
+
+
+def regions_of(on_targets: list[str], objects: list[str]) -> dict[str, str]:
+    """Goal regions among the oracle's On targets: ``kitchen_table_the_center`` -> {"center": ...}."""
+    import re
+
+    from ..vocab import REGIONS
+
+    out = {}
+    for n in on_targets:
+        m = re.search(r"_the_([a-z]+)$", n)
+        if m and m.group(1) in REGIONS and n not in objects:
+            out[m.group(1)] = n
+    return out
 
 
 def download(dest: str | Path, filename: str = SWAP_FILE) -> Path:
+    """One task's HDF5 (``task_file(task_id)``); hf_hub_download skips a complete local copy."""
     from huggingface_hub import hf_hub_download
 
     return Path(hf_hub_download(REPO, filename, repo_type="dataset", local_dir=str(dest)))
@@ -118,6 +183,14 @@ def instruction_of(h5path: str | Path) -> str | None:
             return None
 
 
+def bddl_of(h5path: str | Path) -> str | None:
+    import h5py
+
+    with h5py.File(h5path, "r") as f:
+        v = f["data"].attrs.get("bddl_file_name") if "data" in f else None
+    return v.decode() if isinstance(v, bytes) else (str(v) if v is not None else None)
+
+
 def gripper_width(gs: np.ndarray) -> np.ndarray:
     """Finger opening = |q0| + |q1|: right for both sign conventions of the second finger joint
     (robosuite Panda: q1 negative when open; some exports store both positive)."""
@@ -185,8 +258,7 @@ def prepare(h5path: str | Path, root: str | Path, demo: str | None = None, task_
     low = FrankaLiberoMemEnv(task_id=task_id, privileged=False, max_steps=10 ** 8, control_freq=20)
     low.reset(seed=0)
     instr_env = getattr(low.handle, "task_language", "")
-    if instr_file and instr_env and instr_file.strip().lower() != instr_env.strip().lower():
-        raise RuntimeError(f"task_id {task_id} is {instr_env!r} but the file is {instr_file!r}: pass the matching --task-id")
+    task = check_task(task_id, bddl_of(h5path), instr_file, instr_env, Path(h5path).name)
     henv = low.handle.env  # OffScreenRenderEnv
     sim = henv.sim
     src = LiberoMemSource(low)
@@ -253,7 +325,7 @@ def prepare(h5path: str | Path, root: str | Path, demo: str | None = None, task_
     proprio = {"t": np.arange(n), "eef_pos_main": np.stack(eef_b), "gripper_main": np.asarray(width),
                "action": actions[:n]}
     meta = {"benchmark": "libero_mem", "episode_id": f"{Path(h5path).stem}/{demo}", "task_id": task_id,
-            "instruction": instr_file or instr_env, "fps": 20.0, "n_frames": n, "arms": ["main"],
+            "instruction": task["instruction"], "instruction_file": instr_file, "task_check": task, "fps": 20.0, "n_frames": n, "arms": ["main"],
             "cameras": {c: {"depth": True} for c in cams}, "image_stride": image_stride, "replay": mode,
             "notes": ["eef: HDF5 obs/ee_pos (grip site) in the robot base frame" if ee_pos is not None else
                       "eef: cap-x robot_cartesian_pos + TCP offset (no obs/ee_pos in the file)",
@@ -267,11 +339,12 @@ def prepare(h5path: str | Path, root: str | Path, demo: str | None = None, task_
                 objects[name] = key
                 break
     write_oracle(root, {"source": "libero_mem simulator", "frame": "base", "objects": objects,
-                        "relations": ["on", "in", "inhand", "handempty"], "arms": ["main"], "replay": mode},
+                        "relations": ["on", "in", "inhand", "handempty"], "arms": ["main"], "replay": mode,
+                        "regions": regions_of(src.on_targets(), src.movable_objects())},
                  ostates, segs, {"success": success, "source": "final goal predicates (BDDL) on the last state",
                                  "branches": goal["branches"], "tracker_success": tracker_success})
     drift = float(np.linalg.norm(np.stack(eef_b) - np.stack(capx_eef), axis=1).mean())
     return {"demo": demo, "frames": n, "replay": mode, "images": len(keep), "success": success,
             "tracker_success": tracker_success, "goal_final": goal["branches"], "instruction_file": instr_file,
-            "instruction_env": instr_env, "eef_hdf5_vs_capx_mean_m": round(drift, 4),
+            "instruction_env": instr_env, "task_check": task, "eef_hdf5_vs_capx_mean_m": round(drift, 4),
             "oracle_segments": len(segs)}

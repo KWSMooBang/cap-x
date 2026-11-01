@@ -82,7 +82,7 @@ The episode format and the oracle format are documented in `records.py` and `ora
 
 Swap task file: `KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_plate_demo.hdf5` (48.8 MB).
 
-- **File ↔ task (ASSUMPTION):** HF files are numbered 1–10, and file 7 = cap-x `task_id` 6. `prepare` aborts if the instructions differ.
+- **File ↔ task (checked 2026-11-01):** HF files are numbered 1–10, and file k+1 = cap-x `task_id` k (`TASK_NAMES`). `prepare` aborts if the file's `bddl_file_name` is another task.
 - **README:** says only "initial states, proprioception, control actions".
 - **Layout (measured on kubectl 1a):** demos start at `demo_1` (120 demos). Each holds only `actions` (N, 7), `init_state` (90,) and `states` (N, 90); there is no `obs/`. `states` = robosuite [time, qpos …], so the fingers are `states[:, 8:10]` (q0 0.0021–0.040, q1 −0.040 to −0.0021). The default demo is the first one in the file.
 
@@ -142,17 +142,44 @@ Oracle relations:
 Local tests (CPU, synthetic fixtures, fake detector, fake HTTP models):
 
 ```bash
-python -m pytest tests/test_bggen.py tests/test_bggen_adapters.py
+python -m pytest tests/test_bggen*.py
 ```
 
-kubectl:
+kubectl, over the episode list `scripts/bggen/episodes.yaml` (LIBERO-Mem tasks 0 / 2 / 6 / 7 / 8 x demo_1..3, B1K task 45 x
+episodes 00450010 / 20 / 30 / 40 / 50):
 
 ```bash
-bash scripts/bggen/kubectl_runbook.sh 1a|1b|2|3|4
-RUN_TAG=fix2 bash scripts/bggen/kubectl_runbook.sh 3   # runs/fix2_{libero,b1k}_A; default RUN_TAG=real
+bash scripts/bggen/kubectl_runbook.sh list|1a|1b|2|3|4
+RUN_TAG=batch1 JOBS=3 bash scripts/bggen/kubectl_runbook.sh 3   # runs/batch1/<episode id>/
+ONLY=t08 bash scripts/bggen/kubectl_runbook.sh 1a               # a subset (id / group substrings, comma list)
 ```
 
+- `capx/bggen/batch.py` drives prepare / run / eval per episode as subprocesses. Prepared episodes and finished runs are
+  skipped (`FORCE=1` redoes them). A failing episode is recorded (`episodes/prep_status.json`,
+  `runs/<RUN_TAG>/batch_status.json`, `logs/batch/<step>_<id>.log`) and the next one starts. A B1K data check that
+  fails marks the episode `check_failed`, and step 3 skips it (`ALLOW_CHECK_FAIL=1` runs it anyway).
+- `scripts/bggen/aggregate.py runs/<RUN_TAG>` (step 4) writes `aggregate.{md,json}`. It groups by task, benchmark and all
+  episodes. Pass-dependent metrics get a forward line and a forward+backward line. Values are the mean over episodes with
+  [min, max]. Cost uses `--price-in / --price-out` $ per 1M tokens (default 0.45 / 3).
+
 What each step checks is in the script header. Outputs go under `/workspace/cap-bg/outputs/agent-bg-gen/`.
+
+LIBERO-Mem task ↔ file (checked 2026-11-01):
+
+- `task_id` k is HF file `KITCHEN_SCENE1_<k+1>_..._demo.hdf5` (`adapters/libero_mem.TASK_NAMES`).
+- `prepare` checks the file's `data@bddl_file_name` against the task. The episode instruction is the env's BDDL language.
+- Task 2's file stores "pick up the bowl and place it back on the plate" in `problem_info` (no "3 times"). That string
+  is kept as `instruction_file`.
+
+Table regions (task 8 "... place that basket in the center"):
+
+- `at(X, center)` is a goal / observe relation. `statement_key` accepts the region name, and `(on X center)` becomes
+  `(at X center)`.
+- The oracle meta `regions` maps `center` → `kitchen_table_the_center`. Eval scores `at` against the oracle's `on X
+  kitchen_table_the_center`.
+- If the init goal has no `at` step while the instruction names the region, `report.md` and `eval.md` say
+  REGION MISSING FROM THE GOAL.
+- `at` is judged by the VDM only: there is no geometry check for regions.
 
 Models:
 

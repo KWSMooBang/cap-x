@@ -475,7 +475,9 @@ def test_swap_eval_two_lines(swap_run):
     for tag in ("forward", "forward+backward"):
         assert res[tag]["relations"]["accuracy"] >= 0.98
     assert res["name_consistency"]["rate"] == 1.0
-    assert res["goal_consistency"] == {"final_graph_satisfies_goal": True, "oracle_success": True, "goal_known": True}
+    assert {k: res["goal_consistency"][k] for k in ("final_graph_satisfies_goal", "oracle_success", "goal_known")} == \
+        {"final_graph_satisfies_goal": True, "oracle_success": True, "goal_known": True}
+    assert not res["goal_consistency"]["region_goal_missing"]
     md = (out / "eval.md").read_text()
     assert "| forward |" in md and "| forward+backward |" in md
 

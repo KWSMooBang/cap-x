@@ -1,0 +1,65 @@
+# Episodes of the bggen batch (scripts/bggen/batch.py, scripts/bggen/kubectl_runbook.sh batch steps).
+# Episode ids (= folders under episodes/ and runs/<RUN_TAG>/): libero_mem_t<task_id:02d>_<demo>, b1k_t<task>_e<episode:08d>
+# (the single-episode runs used libero_mem_t06_demo_1 and b1k_t45_e00450010: those prepared folders are reused).
+#
+# Checked 2026-11-01 (HF API file lists, the five HDF5s read with h5py, LIBERO-Mem libero_suite_task_map.py + BDDL):
+#   * cap-x task_id k = LIBERO-Mem task k (0-based) = HF file KITCHEN_SCENE1_<k+1>_..._demo.hdf5 (the old "file 7 = task 6"
+#     assumption holds). Every file's data@bddl_file_name stem is its task name; prepare checks it (check_task).
+#   * problem_info language == BDDL language for tasks 0, 6, 7, 8. Task 2 differs: the file stores "pick up the bowl and
+#     place it back on the plate" (no "3 times"); the BDDL / cap-x env says "lift the bowl and place it back on the plate
+#     3 times". prepare now uses the env (BDDL) language and keeps the file's in meta.json (instruction_file).
+#   * every file has 120 demos demo_1..demo_120; the first three are demo_1..demo_3 (lengths below, 20 Hz).
+#   * B1K task-0045 episodes 00450020..00450050: same scene (microwave_abzvij_0, fridge_dszchb_0, hotdog_207 / 208), same
+#     task_obs_keys and the same 13-skill annotation sequence as 00450010; head + wrist rgb / depth videos exist.
+#
+# Categories and SAM3 prompt candidates come from bg_est2's measured VOCABULARY_V2 (capx/belief/perception.py
+# V2_PROMPTS) through capx.bggen.vocab.categories_for(instruction): nothing per task to configure. Listed here for the
+# report only (tests/test_bggen_batch.py checks they match the code).
+
+libero_mem:
+  repo: libero-mem/LIBERO-Mem-Raw
+  tasks:
+    - task_id: 0
+      file: KITCHEN_SCENE1_1_pick_up_the_bowl_and_place_it_back_on_the_plate_demo.hdf5
+      instruction: pick up the bowl and place it back on the plate
+      demos: [demo_1, demo_2, demo_3]
+      frames: [167, 139, 158]
+      categories: {bowl: [bowl, black bowl], plate: [saucer, plate]}
+    - task_id: 2
+      file: KITCHEN_SCENE1_3_lift_the_bowl_and_place_it_back_on_the_plate_3_times_demo.hdf5
+      instruction: lift the bowl and place it back on the plate 3 times
+      file_instruction: pick up the bowl and place it back on the plate
+      demos: [demo_1, demo_2, demo_3]
+      frames: [285, 286, 273]
+      categories: {bowl: [bowl, black bowl], plate: [saucer, plate]}
+    - task_id: 6
+      file: KITCHEN_SCENE1_7_swap_the_2_bowls_on_their_plates_using_the_empty_plate_demo.hdf5
+      instruction: swap the 2 bowls on their plates using the empty plate
+      demos: [demo_1, demo_2, demo_3]
+      frames: [418, 322, 382]
+      categories: {bowl: [bowl, black bowl], plate: [saucer, plate]}
+    - task_id: 7
+      file: KITCHEN_SCENE1_8_rotate_the_3_bowls_on_their_plates_from_left_to_right_using_the_empty_plate_demo.hdf5
+      instruction: rotate the 3 bowls on their plates from left to right using the empty plate
+      demos: [demo_1, demo_2, demo_3]
+      frames: [627, 568, 517]
+      categories: {bowl: [bowl, black bowl], plate: [saucer, plate]}
+    - task_id: 8
+      file: KITCHEN_SCENE1_9_put_the_cream_cheese_in_the_nearest_basket_and_place_that_basket_in_the_center_demo.hdf5
+      instruction: put the cream cheese in the nearest basket and place that basket in the center
+      demos: [demo_1, demo_2, demo_3]
+      frames: [352, 331, 379]
+      categories: {cream_cheese: [small blue box, blue box, blue package], basket: [basket, wicker basket]}
+      # BDDL goal: Or(Sequence(In cream_cheese_1 basket_1_contain_region, On basket_1 kitchen_table_the_center), same with
+      # basket_2). The generator writes the second step as (at basket_X center); the oracle's region name goes to
+      # oracle/meta.json "regions" and eval scores at(X, center) against On X kitchen_table_the_center.
+      # flat_dz: cream_cheese/basket is a container pair (inside = center in the basket box), basket/table is not
+      # vetoed; any other pair uses its first accepted Observe 1 dz (Verifier._veto).
+
+b1k:
+  repo: behavior-1k/2025-challenge-demos
+  task: 45
+  instruction: Take the two hot dogs out of the refrigerator in the kitchen and cook them in the microwave until both are cooked.
+  episodes: [450010, 450020, 450030, 450040, 450050]
+  # annotation task_duration (frames, 30 Hz): 6645, 8190, 7935, 8538, 7375
+  frames: [6645, 8190, 7935, 8538, 7375]

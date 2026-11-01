@@ -1,6 +1,6 @@
 """Command line of the BG generator (the kubectl runbook ``scripts/bggen/kubectl_runbook.sh`` calls these).
 
-    python -m capx.bggen.cli download-libero --dest D
+    python -m capx.bggen.cli download-libero --dest D [--task-id 6]                  (that task's HDF5 only)
     python -m capx.bggen.cli dump-libero --h5 FILE --out structure.json
     python -m capx.bggen.cli first-demo --h5 FILE                                   (prints e.g. demo_1)
     python -m capx.bggen.cli prep-libero --h5 FILE [--demo demo_1] --root EP        (LIBERO-Mem venv, renderer; default: first demo)
@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     req, flag, opt = {"required": True}, {"action": "store_true"}, {}
     ep = ("--episode", {"type": int, "default": 450010})
     specs: dict[str, list[tuple[str, dict]]] = {
-        "download-libero": [("--dest", req)],
+        "download-libero": [("--dest", req), ("--task-id", {"type": int, "default": 6, "help": "cap-x task_id (0-based) -> its HDF5 only"})],
         "dump-libero": [("--h5", req), ("--out", opt)],
         "first-demo": [("--h5", req)],
         "prep-libero": [("--h5", req), ("--demo", {"default": None, "help": "default: the first demo in the file"}), ("--root", req), ("--task-id", {"type": int, "default": 6}),
@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if a.cmd == "download-libero":
         from .adapters import libero_mem
-        print(libero_mem.download(a.dest))
+        print(libero_mem.download(a.dest, libero_mem.task_file(a.task_id)))
     elif a.cmd == "dump-libero":
         from .adapters import libero_mem
         d = libero_mem.dump_structure(a.h5)
