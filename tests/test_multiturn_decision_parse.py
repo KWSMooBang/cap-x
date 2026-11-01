@@ -85,3 +85,64 @@ def test_finish_between_fence_and_tool_call_regenerates():
              '<|open|>argument key="code" type="string"<|sep|>close_gripper()\n<|close|>argument')
     parsed = parse_multi_turn_decision(reply)
     assert parsed.decision == "regenerate" and "finish_with_code" in parsed.flags
+
+
+# Unfenced code (bg_est2 10x5 misparsed_finish t01 tr5 / t02 tr5 / t03 tr1): declaration comments, then a program.
+RAW_REPLY = """# Subtask: place(bottle_A, plate_A)
+# Effect: bottle_A rests on plate_A
+import numpy as np
+
+def lift(pose, dz=0.1):
+    p = np.array(pose[0]) + np.array([0.0, 0.0, dz])
+    return p, pose[1]
+
+grasp = get_grasp("bottle_A")
+goto_pose(*lift(grasp))
+close_gripper()
+"""
+
+
+def test_raw_code_regenerates():
+    parsed = parse_multi_turn_decision(RAW_REPLY)
+    assert (parsed.decision, parsed.source, parsed.flags) == ("regenerate", "raw_code", [])
+    assert parsed.legacy_decision == "finish"
+    assert _extract_code(parsed.new_code) == [RAW_REPLY.strip()]
+    assert _parse_multi_turn_decision(RAW_REPLY) == ("regenerate", parsed.new_code)
+
+
+def test_raw_code_after_prose_regenerates_and_flags():
+    parsed = parse_multi_turn_decision("The bottle is not on the plate yet. Next:\n\n" + RAW_REPLY)
+    assert (parsed.decision, parsed.source, parsed.flags) == ("regenerate", "raw_code", ["prose_before_code"])
+    assert _extract_code(parsed.new_code) == [RAW_REPLY.strip()]
+
+
+def test_markdown_heading_before_raw_code():
+    parsed = parse_multi_turn_decision("# Analysis\nThe grasp slipped.\n\n" + RAW_REPLY)
+    assert (parsed.source, parsed.flags) == ("raw_code", ["prose_before_code"])
+    assert _extract_code(parsed.new_code) == [RAW_REPLY.strip()]
+
+
+@pytest.mark.parametrize("reply", [
+    "# Subtask: place(bottle_A, plate_A)\n# Effect: done\n",  # comments only
+    "Looks done.",
+    "Done",  # parses as a bare name
+    '"""The bottle is on the plate."""',
+    "The task is complete. The last call was:\nplace(bottle_A, plate_A)",  # quoted call after prose
+    RAW_REPLY + "\nThis should finish the task.",  # trailing prose
+    "pass",
+])
+def test_not_raw_code_falls_back(reply):
+    parsed = parse_multi_turn_decision(reply)
+    assert (parsed.decision, parsed.source) == ("finish", "fallback")
+
+
+@pytest.mark.parametrize("reply", [RAW_REPLY + "\nFINISH", RAW_REPLY + "# FINISH\n", "FINISH\n" + RAW_REPLY])
+def test_raw_code_with_finish_word_finishes(reply):
+    parsed = parse_multi_turn_decision(reply)
+    assert (parsed.decision, parsed.source, parsed.flags) == ("finish", "finish_keyword", [])
+
+
+def test_raw_code_does_not_change_fenced_paths():
+    reply = "Plan:\nx = 1\n```python\nopen_gripper()\n```"
+    parsed = parse_multi_turn_decision(reply)
+    assert (parsed.source, _extract_code(parsed.new_code)) == ("code_block", ["open_gripper()"])

@@ -147,10 +147,27 @@ by `parse_multi_turn_decision` in this order: `REGENERATE` keyword (original beh
 normalized the same way); a fenced code block (also an unclosed one cut off by the token limit) or a tool-call
 `code` argument means regenerate, unless `FINISH` comes after the last code (e.g. quoting code that already
 ran), which finishes so that code is not run twice; `FINISH` with no code means finish; an empty reply is
-queried once more and finishes if it is empty again; anything else finishes. Each multi-turn entry in
-`all_responses.json` records `decision_source`, `decision_flags` (`finish_with_code`, `finish_after_code`,
-`unclosed_fence`) and `legacy_decision`, so runs can report format violations and how often the decision
-differs from the original parser. Every model reply entry also records `finish_reason` and `usage`:
+queried once more and finishes if it is empty again; a reply with neither keyword nor fenced/tool-call code
+that is unfenced Python (`decision_source: raw_code`, below) means regenerate; anything else finishes
+(`fallback`). Each multi-turn entry in `all_responses.json` records `decision_source` (`keyword`,
+`code_block`, `tool_call`, `finish_keyword`, `empty`, `empty_retry`, `truncated_skip`, `raw_code`,
+`fallback`), `decision_flags` (`finish_with_code`, `finish_after_code`, `unclosed_fence`,
+`prose_before_code`) and `legacy_decision`, so runs can report format violations and how often the decision
+differs from the original parser.
+
+Raw code rule (`_find_raw_code`, added after bg_est2 10×5 had replies that were a whole program without a
+fence, starting with `# Subtask: ...` / `# Effect: ...` comments and ending as misparsed FINISH). It only
+applies when the reply has no `REGENERATE`, no `FINISH` (a FINISH anywhere keeps `finish_keyword`), and no
+fenced or tool-call code. The code starts at the first unindented line that looks like code (a `#` comment,
+`import`, `from ... import`, `def`, `class`, a decorator, `for`/`while`/`if`/`with`/`try`, an assignment or
+a call) such that everything from that line to the end of the reply parses with `ast.parse` and has at
+least one executable statement — a reply of only comments, strings, bare names (`Done`) or `pass` still
+finishes, and so does code followed by prose. If any text comes before the code, the code must also have a
+top-level `import`, `def` or `class` (a whole program, as the coding prompt asks for; flag
+`prose_before_code`), so prose that quotes one call is not re-run. `new_code` is that code in a python fence;
+`legacy_decision` stays `finish`. To re-judge saved runs with the current parser:
+`python scripts/rejudge_decisions.py <run_dir> [...] --json out.json` lists every saved reply (finish replies
+and S5(a) first replies) whose decision changes. Every model reply entry also records `finish_reason` and `usage`:
 `finish_reason: length` means the reply hit `max_tokens`, and on Nebius reasoning tokens count against it (a
 reply cut during reasoning comes back with empty content).
 
