@@ -130,13 +130,14 @@ class Row:
     effect: list[tuple[EdgeKey, int, int]] = field(default_factory=list)  # set by the backward pass
     notes: list[str] = field(default_factory=list)
     keyframe: str | None = None
-    # R10 (bggen-fix3 P2): Observe answers in ``observed`` that the verifier did not adopt (the first 0 of a conflict
-    # left pending or overturned), and the adopted value of a re-check with another camera at this event
+    # R10 (bggen-fix3): ``rejected`` = Observe answers in ``observed`` that are no B2 evidence (the first 0 of every
+    # conflict: not adopted, or superseded by the adopted re-check); ``rechecked`` = the adopted look re-check value
     rechecked: dict[EdgeKey, str] = field(default_factory=dict)
     rejected: list[EdgeKey] = field(default_factory=list)
-    # set by the backward B1b merge (evaluation provenance): final key -> merged alias it came from; displaced entries
-    b1b_origin: dict[EdgeKey, str] = field(default_factory=dict)
-    b1b_shadowed: list[tuple[EdgeKey, tuple[float, str], str | None]] = field(default_factory=list)
+    # set by the backward B1b merge (evaluation provenance): final key -> every merged alias it passed through; displaced
+    # entries (key, value, aliases; [] = the survivor's own)
+    b1b_origin: dict[EdgeKey, list[str]] = field(default_factory=dict)
+    b1b_shadowed: list[tuple[EdgeKey, tuple[float, str], list[str]]] = field(default_factory=list)
 
     def copy(self) -> Row:
         return Row(**{k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
@@ -866,8 +867,9 @@ class Generator:
                 a = adopted.get(k)
                 if a is not None and a[1].startswith("look"):
                     rechecked[k] = a[0]
-                if a is None or a[0] != "0":  # pending (0.5 conflict) or overturned: the first 0 was not adopted
-                    rejected.append(k)
+                # the first 0 is not B2 evidence: pending (0.5 conflict) / overturned -> not adopted; confirmed by the
+                # re-check -> the re-check is the adopted answer (counting both would count one moment twice)
+                rejected.append(k)
         # R9: release-geometry candidates the VDM left undecided: the best positive one -> expectation 0.7
         if auto_pairs:
             cmap = self._categories_map()

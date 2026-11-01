@@ -105,8 +105,8 @@ def row_to_json(row: Any) -> dict[str, Any]:
     if getattr(row, "rejected", None):
         extra["rejected"] = [statement_text(k) for k in row.rejected]
     if getattr(row, "b1b_origin", None) or getattr(row, "b1b_shadowed", None):
-        extra["b1b_origin"] = {statement_text(k): o for k, o in row.b1b_origin.items()}
-        extra["b1b_shadowed"] = [{"stmt": statement_text(k), "value": list(v), "origin": o} for k, v, o in row.b1b_shadowed]
+        extra["b1b_origin"] = {statement_text(k): list(o) for k, o in row.b1b_origin.items()}
+        extra["b1b_shadowed"] = [{"stmt": statement_text(k), "value": list(v), "origin": list(o)} for k, v, o in row.b1b_shadowed]
     return {"t": row.t, "kind": row.kind, "arm": row.arm, "obj": row.obj,
             "observed": [[statement_text(k), v] for k, v in row.observed], **extra,
             "belief": {statement_text(k): [p, s] for k, (p, s) in row.belief.items()},

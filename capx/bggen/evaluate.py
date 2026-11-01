@@ -340,14 +340,16 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
         # (its inhand of that object and its handempty); the other arm and other objects are scored as usual
         grips = _articulated_grips(r["belief"], names, arms, amap, oracle.objects) if in_art else {}
         origin = (r.get("b1b_origin") or {}) if merge_ok is not None else {}
-        items = [(stmt, pv, origin.get(stmt)) for stmt, pv in r["belief"].items()]
+        items = [(stmt, pv, _aliases(origin.get(stmt))) for stmt, pv in r["belief"].items()]
         if merge_ok is not None:
-            items += [(s["stmt"], r["belief"].get(s["stmt"], s["value"]), s["origin"]) for s in r.get("b1b_shadowed") or []]
-        for stmt, (p, src), from_alias in items:
+            items += [(s["stmt"], r["belief"].get(s["stmt"], s["value"]), _aliases(s.get("origin")))
+                      for s in r.get("b1b_shadowed") or []]
+        for stmt, (p, src), via in items:
             key = parse_statement(stmt, names, arms)
             if key is None or key[0] not in covered:
                 continue
-            if from_alias is not None and not (merge_ok or {}).get(from_alias, False):
+            bad = [x for x in via if not (merge_ok or {}).get(x, False)]  # any merge on its path wrong -> wrong
+            if bad:
                 d = decided(p)
                 pp = per_pred.setdefault(key[0], [0, 0, 0, 0])
                 if d is None:
@@ -358,7 +360,7 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
                     merge_wrong += 1
                     pp[1] += 1
                     if len(errors) < 40:
-                        errors.append({"t": t, "stmt": stmt, "p": p, "source": src, "truth": f"wrong merge of {from_alias}"})
+                        errors.append({"t": t, "stmt": stmt, "p": p, "source": src, "truth": f"wrong merge of {', '.join(bad)}"})
                 continue
             if (key[0] == "inhand" and key[2] in grips and grips[key[2]] == key[1]) or \
                     (key[0] == "handempty" and key[1] in grips):
@@ -538,18 +540,35 @@ def evaluate(out_dir: str | Path, root: str | Path, tol: int | None = None, map_
     return res
 
 
+def _aliases(o: Any) -> list[str]:
+    """A provenance entry as a list of merged aliases (older outputs stored one alias or None)."""
+    if not o:
+        return []
+    return [o] if isinstance(o, str) else [str(x) for x in o]
+
+
 def merge_checks(merges: Sequence[dict[str, Any]], tmap: TrackMap, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     """Per B1b merge X -> Y: right when X's own identity (``TrackMap.identity``: its forward map object, or outside the
-    map its nearest object, no one-to-one constraint) is Y's forward map object. ``rows_moved``: backward rows holding a
-    statement that came from X."""
+    map its nearest object, no one-to-one constraint) is the forward map object of the FINAL name its statements end
+    under (a chain X -> Y -> Z: Z, for X and for Y). A statement is wrong when any merge on its path is wrong.
+    ``rows_moved``: backward rows holding a statement that passed through X."""
     fixed = tmap.fixed()
+    into = {m["from"]: m["into"] for m in merges}
+
+    def final(a: str) -> str:
+        seen = {a}
+        while a in into and into[a] not in seen:
+            a = into[a]
+            seen.add(a)
+        return a
+
     out = []
     for m in merges:
         x, y = m["from"], m["into"]
-        ix, iy = tmap.identity(x), fixed.get(y)
-        moved = sum(1 for r in rows if x in (r.get("b1b_origin") or {}).values()
-                    or any(s.get("origin") == x for s in r.get("b1b_shadowed") or []))
-        out.append({"from": x, "into": y, "identity_from": ix, "identity_into": iy,
+        ix, iy = tmap.identity(x), fixed.get(final(y))
+        moved = sum(1 for r in rows if any(x in _aliases(o) for o in (r.get("b1b_origin") or {}).values())
+                    or any(x in _aliases(s.get("origin")) for s in r.get("b1b_shadowed") or []))
+        out.append({"from": x, "into": y, "final": final(y), "identity_from": ix, "identity_into": iy,
                     "right": ix is not None and ix == iy, "rows_moved": moved})
     return out
 
@@ -612,8 +631,8 @@ def eval_table(res: dict[str, Any]) -> str:
     if res.get("merges_backward"):
         lines += ["", "## Backward same-category merges (B1b; scored on the forward map, judged by the merged alias's own identity)"]
         for c in res["merges_backward"]:
-            lines.append(f"- {c['from']} -> {c['into']}: {'RIGHT' if c['right'] else 'WRONG'} ({c['from']} is "
-                         f"{c['identity_from']}, {c['into']} maps to {c['identity_into']}); rows moved {c['rows_moved']}")
+            lines.append(f"- {c['from']} -> {c['into']}{' (final ' + c['final'] + ')' if c.get('final', c['into']) != c['into'] else ''}: {'RIGHT' if c['right'] else 'WRONG'} ({c['from']} is "
+                         f"{c['identity_from']}, {c.get('final', c['into'])} maps to {c['identity_into']}); rows moved {c['rows_moved']}")
     if res.get("track_identity"):
         lines += ["", f"Generator track identity: {res['track_identity']}"]
     return "\n".join(lines) + "\n"

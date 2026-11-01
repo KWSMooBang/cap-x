@@ -239,7 +239,7 @@ def test_backward_merges_aliases_never_seen_together_after_a_base_move():
     assert res.merges_backward == m and any(x["rule"] == "B1b" for x in res.log)
     assert res.rows[1].belief[k_old] == (0.1, "obs")  # the later alias's (observed) edge wins over the stale one
     # provenance for the evaluation: the statement came from hotdog_C, the survivor's stale entry was displaced
-    assert res.rows[1].b1b_origin == {k_old: "hotdog_C"} and res.rows[1].b1b_shadowed == [(k_old, (0.9, "mem"), None)]
+    assert res.rows[1].b1b_origin == {k_old: ["hotdog_C"]} and res.rows[1].b1b_shadowed == [(k_old, (0.9, "mem"), [])]
     assert res.rows[0].b1b_origin == {} and res.rows[0].b1b_shadowed == []
     assert not any("hotdog_C" in str(k) for r in res.rows for k in r.belief)
     assert res.rows[1].s4 == ["hotdog_A may be resting on the rim of countertop_A"]
@@ -447,3 +447,89 @@ def test_a_small_rise_is_still_retracted_but_keeps_pick_and_place(tmp_path):
     seg = log["segments"][0]
     assert seg["kind"] == "object" and seg["retracted"] is True
     assert seg["label_pick"] != seg["label_place"] and not seg["label_pick"].startswith("manipulate")
+
+
+# --- review 2: chained merges, shadowed chains, re-check 0 counted once -------------------------------------------------
+
+def test_chained_merges_keep_every_alias_and_rename_shadowed_entries():
+    p = "countertop_A"
+    kw, kx, ky = ("on", "hotdog_W", p), ("on", "hotdog_X", p), ("on", "hotdog_Y", p)
+    row = Row(10, "keyframe", None, None, [], {ky: (0.9, "mem"), kx: (0.8, "mem"), kw: (0.1, "obs")}, [], "0/1", 0, 1, "?",
+              [], {"main": None})
+    bw.unify_ids([row], [{"from": "hotdog_W", "into": "hotdog_X", "prefer_from": True},
+                         {"from": "hotdog_X", "into": "hotdog_Y", "prefer_from": True}], [])
+    assert row.belief == {ky: (0.1, "obs")}  # W's observed value survives both merges
+    assert row.b1b_origin == {ky: ["hotdog_W", "hotdog_X"]}
+    # X's own entry (displaced by W at the first merge) is renamed by the second one and keeps its path
+    assert sorted(row.b1b_shadowed, key=str) == sorted([(ky, (0.8, "mem"), ["hotdog_X"]), (ky, (0.9, "mem"), [])], key=str)
+    from capx.bggen.serialize import row_to_json
+
+    j = row_to_json(row)
+    assert j["b1b_origin"] == {"(on hotdog_Y countertop_A)": ["hotdog_W", "hotdog_X"]}
+
+
+def _chain_run(tmp_path, mid_src):
+    """Forward names: bowl_B, then (cut1, cut2] ``mid_src``'s track called bowl_W, after cut2 bowl_B called bowl_C.
+    Backward merges C -> W -> B (a 2-step chain over 3 aliases); bowl_B's statements after cut2 passed through C and W."""
+    w = write_swap_episode(tmp_path)
+    out = tmp_path / "out"
+    with FakeServer(TruthBrain(w)) as srv:
+        run_episode(tmp_path, out, lm_cfg("A"), Models.from_env(env=srv.env()), FakeDetector(w), "libero_mem")
+    cut1 = w.release_t[1] + 40
+    cut2 = w.release_t[2] + 20
+    trace = _jsonl(out / "trace.jsonl")
+    for ln in trace:
+        ren = {mid_src: "bowl_W"} if cut1 < ln["t"] <= cut2 else {"bowl_B": "bowl_C"} if ln["t"] > cut2 else {}
+        ln["tracks"] = [{**t, "alias": ren.get(t["alias"], t["alias"])} for t in ln["tracks"]]
+    (out / "trace.jsonl").write_text("".join(json.dumps(x) + "\n" for x in trace))
+    rows = _jsonl(out / "rows_backward.jsonl")
+    for r in rows:
+        if r["t"] > cut2:
+            r["b1b_origin"] = {s: ["bowl_C", "bowl_W"] for s in r["belief"] if "bowl_B" in s}
+            r["b1b_shadowed"] = []
+    (out / "rows_backward.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
+    log = json.loads((out / "backward_log.json").read_text())
+    log["merges_backward"] = [{"t": cut2 + 1, "from": "bowl_C", "into": "bowl_W"}, {"t": cut1 + 1, "from": "bowl_W", "into": "bowl_B"}]
+    (out / "backward_log.json").write_text(json.dumps(log))
+    return out
+
+
+def test_chain_of_right_merges_scores_right(tmp_path):
+    from capx.bggen.evaluate import evaluate
+
+    res = evaluate(_chain_run(tmp_path, "bowl_B"), tmp_path)
+    assert [(c["from"], c["final"], c["identity_from"], c["identity_into"], c["right"]) for c in res["merges_backward"]] == \
+        [("bowl_C", "bowl_B", "bowl_2", "bowl_2", True), ("bowl_W", "bowl_B", "bowl_2", "bowl_2", True)]
+    rb = res["forward+backward"]["relations"]
+    assert rb["merge_wrong"] == 0 and rb["accuracy"] >= 0.98
+
+
+def test_chain_with_one_wrong_merge_makes_its_statements_wrong(tmp_path):
+    from capx.bggen.evaluate import evaluate
+
+    out = _chain_run(tmp_path, "bowl_A")  # bowl_W was really bowl_A's object (bowl_1): W -> B is wrong, C -> W -> B right for C
+    res = evaluate(out, tmp_path)
+    checks = {c["from"]: c for c in res["merges_backward"]}
+    assert checks["bowl_C"]["right"] is True and checks["bowl_W"]["right"] is False
+    assert checks["bowl_W"]["identity_from"] == "bowl_1" and checks["bowl_W"]["identity_into"] == "bowl_2"
+    rb = res["forward+backward"]["relations"]
+    # statements that passed through C and W: the earlier-right / later-wrong path is wrong (not scored as C's right merge)
+    assert rb["merge_wrong"] > 0 and all("bowl_W" in str(e["truth"]) for e in rb["errors"] if "wrong merge" in str(e["truth"]))
+    assert "bowl_W -> bowl_B: WRONG" in (out / "eval.md").read_text()
+
+
+def test_adopted_recheck_zero_counts_once_and_an_isolated_zero_is_corrected():
+    k = ("in", "cream_cheese_A", "basket_B")
+
+    def r(t, v, p, **kw):
+        row = Row(t, "keyframe", None, None, [(k, v)], {k: (p, "obs")}, [], "0/1", 0, 1, "?", [], {"main": None})
+        for a, b in kw.items():
+            setattr(row, a, b)
+        return row
+
+    # 1, then 0 confirmed by the wrist re-check (first 0 superseded), then 1: one 0 at t=258, isolated -> corrected
+    rows = [r(228, "1", 0.9), r(258, "0", 0.1, rejected=[k], rechecked={k: "0"}), r(288, "1", 0.9)]
+    log: list = []
+    bw.remove_noise(rows, log)
+    assert [(x["t"], x["was"], x["now"]) for x in log] == [(258, "0", "1")]
+    assert rows[1].rechecked == {k: "1"} and rows[1].belief[k][0] == 0.9
