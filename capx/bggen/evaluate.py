@@ -79,6 +79,7 @@ class TrackMap:
         self.counts: dict[str, dict[str, int]] = {}
         self.unmatched: dict[str, int] = {}
         seen: list[list[tuple[str, str]]] = []  # per trace line: (alias, object) observed there
+        near_seen: list[list[tuple[str, str]]] = []  # per trace line: (alias, nearest object), not one-to-one
         for line in sorted(trace, key=lambda x: x["t"]):
             obs: list[tuple[str, str]] = []
             seen.append(obs)
@@ -115,16 +116,27 @@ class TrackMap:
             for _d, a, _s in pairs:
                 if a not in used_a:
                     self.unmatched[a] = self.unmatched.get(a, 0) + 1
+            # each alias's nearest object within the radius, WITHOUT the one-to-one constraint (an alias's own identity,
+            # used to judge a backward merge of an alias outside the map)
+            best: dict[str, tuple[float, str]] = {}
+            for d, a, sim in pairs:
+                if d <= radius and (a not in best or d < best[a][0]):
+                    best[a] = (d, sim)
+            near_seen.append([(a, sim) for a, (_d, sim) in best.items()] + [(a, s) for a, s in obs if a not in best])
             self.ts.append(t)
             self.maps.append(dict(cur))
         # time-weighted votes: an observation counts for the frames until the next trace line (the last one until
         # the end of the episode)
         self.frames: dict[str, dict[str, int]] = {}
-        for k, obs in enumerate(seen):
+        self.near_frames: dict[str, dict[str, int]] = {}
+        for k, (obs, near) in enumerate(zip(seen, near_seen, strict=True)):
             nxt = self.ts[k + 1] if k + 1 < len(self.ts) else (end_t if end_t is not None else self.ts[k] + 1)
             w = max(nxt - self.ts[k], 1)
             for a, sim in obs:
                 f = self.frames.setdefault(a, {})
+                f[sim] = f.get(sim, 0) + w
+            for a, sim in near:
+                f = self.near_frames.setdefault(a, {})
                 f[sim] = f.get(sim, 0) + w
         self._fixed, self.fixed_how = self._one_to_one(by_cat)
 
@@ -157,6 +169,14 @@ class TrackMap:
         """Episode-level map, one-to-one (``_one_to_one``). Relation accuracy uses it, so a track that swaps objects
         mid-episode is scored wrong after the swap, and the swap counts against name consistency."""
         return dict(self._fixed)
+
+    def identity(self, alias: str) -> str | None:
+        """The object an alias itself is: its episode-map object, else (outside the map) the object nearest to its
+        observations within the map radius, time-weighted, without the one-to-one constraint; None if never near one."""
+        if alias in self._fixed:
+            return self._fixed[alias]
+        f = self.near_frames.get(alias)
+        return max(sorted(f), key=lambda s: f[s]) if f else None
 
     def unmappable(self, alias: str) -> bool:
         """An alias of a category the oracle has, without an object in the map: its predictions cannot be right."""
@@ -290,15 +310,22 @@ def _articulated_grips(belief: dict[str, Any], names: Sequence[str], arms: Seque
 
 
 def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: TrackMap | dict[str, str], names: Sequence[str],
-                      arms: Sequence[str | None], tol: int = 0, remap: bool = False) -> dict[str, Any]:
+                      arms: Sequence[str | None], tol: int = 0, remap: bool = False,
+                      merge_ok: dict[str, bool] | None = None) -> dict[str, Any]:
     """``remap`` False (main metric): the episode-level map (``TrackMap.fixed``). True: the map at each row's frame
-    (re-matching allowed; an auxiliary number that forgives name swaps)."""
+    (re-matching allowed; an auxiliary number that forgives name swaps).
+
+    ``merge_ok`` (backward rows with B1b merges): merged alias X -> whether the merge was right (``merge_checks``). The
+    rows carry ``b1b_origin`` (statements that came from X, now under the surviving name Y) and ``b1b_shadowed`` (entries
+    a collision displaced): the scored population is the one before the merge -- every final statement plus one item
+    per displaced entry, scored with the final (output) value. A statement from a wrongly merged X is wrong when
+    decided; one from a right merge is scored under Y's map object (= X's own identity). The map is the forward one."""
     covered = set(oracle.relations)
     regions = oracle_regions(oracle)
     if regions and "on" in covered:
         covered.add("at")
     art = articulated_intervals(oracle)
-    right = wrong = undecided = saved = unmapped = unmappable = 0
+    right = wrong = undecided = saved = unmapped = unmappable = merge_wrong = 0
     per_pred: dict[str, list[int]] = {}
     art_counts: dict[str, int] = {}
     errors = []
@@ -312,9 +339,26 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
         # inside a door / switch segment, only the arm the row believes holds the articulated object is set apart
         # (its inhand of that object and its handempty); the other arm and other objects are scored as usual
         grips = _articulated_grips(r["belief"], names, arms, amap, oracle.objects) if in_art else {}
-        for stmt, (p, src) in r["belief"].items():
+        origin = (r.get("b1b_origin") or {}) if merge_ok is not None else {}
+        items = [(stmt, pv, origin.get(stmt)) for stmt, pv in r["belief"].items()]
+        if merge_ok is not None:
+            items += [(s["stmt"], r["belief"].get(s["stmt"], s["value"]), s["origin"]) for s in r.get("b1b_shadowed") or []]
+        for stmt, (p, src), from_alias in items:
             key = parse_statement(stmt, names, arms)
             if key is None or key[0] not in covered:
+                continue
+            if from_alias is not None and not (merge_ok or {}).get(from_alias, False):
+                d = decided(p)
+                pp = per_pred.setdefault(key[0], [0, 0, 0, 0])
+                if d is None:
+                    undecided += 1
+                    pp[2] += 1
+                else:
+                    wrong += 1
+                    merge_wrong += 1
+                    pp[1] += 1
+                    if len(errors) < 40:
+                        errors.append({"t": t, "stmt": stmt, "p": p, "source": src, "truth": f"wrong merge of {from_alias}"})
                 continue
             if (key[0] == "inhand" and key[2] in grips and grips[key[2]] == key[1]) or \
                     (key[0] == "handempty" and key[1] in grips):
@@ -358,6 +402,7 @@ def relation_accuracy(rows: Sequence[dict[str, Any]], oracle: Oracle, tmap: Trac
             "undecided_rate": round(undecided / (n + undecided), 4) if n + undecided else None,
             "tolerance_frames": tol, "right_only_within_tolerance": saved, "not_mapped": unmapped,
             "unmappable_wrong": unmappable,
+            **({"merge_wrong": merge_wrong} if merge_ok is not None else {}),
             "per_pred": {k: {"right": v[0], "wrong": v[1] + v[3], "undecided": v[2], "unmappable": v[3],
                              "accuracy": round(v[0] / (v[0] + v[1] + v[3]), 4) if v[0] + v[1] + v[3] else None}
                          for k, v in per_pred.items()},
@@ -470,30 +515,43 @@ def evaluate(out_dir: str | Path, root: str | Path, tol: int | None = None, map_
                                # the oracle task has a table region (LIBERO-Mem 8 / 9 "center"): is it in the generated goal?
                                "oracle_regions": regions, "region_relations_in_goal": in_goal,
                                "region_goal_missing": bool(regions) and bool(branches) and not in_goal}
-    # B1b (mode A backward same-category merges): rows_backward use the merged aliases; their map is built from the
-    # trace read through the same alias map (still one alias per object, unmappable = wrong; a wrong merge is scored
-    # against the one object the merged alias maps to)
-    bl = (out / "backward_log.json")
-    ren = {m["from"]: m["into"] for m in (json.loads(bl.read_text()).get("merges_backward") or [])} if bl.exists() else {}
-    tmap_b, names_b = tmap, names
-    if ren:
-        trace_b = [{**ln, "tracks": [{**tr, "alias": ren.get(tr["alias"], tr["alias"])} for tr in ln.get("tracks", [])]}
-                   for ln in trace]
-        tmap_b = TrackMap(trace_b, oracle, radius, end_t=summary.get("n_frames"))
-        names_b = sorted({ren.get(a, a) for a in names})
-        res["track_map_backward"] = {"merges": ren, "fixed": tmap_b.fixed(), "name_consistency": name_consistency(tmap_b)}
+    # B1b (mode A backward same-category merges): the backward rows are scored with the SAME episode map as the forward
+    # rows; each merge X -> Y is judged by X's own identity (``merge_checks``) and the statements that came from X
+    # follow that verdict (``relation_accuracy`` merge_ok). The population is the pre-merge one.
+    bl = out / "backward_log.json"
+    merges = (json.loads(bl.read_text()).get("merges_backward") or []) if bl.exists() else []
+    merge_ok = None
     for tag, fname in (("forward", "rows_forward.jsonl"), ("forward+backward", "rows_backward.jsonl")):
         rows = _jsonl(out / fname)
         if not rows:
             continue
-        tm, nm = (tmap_b, names_b) if tag == "forward+backward" else (tmap, names)
-        res[tag] = {"relations": relation_accuracy(rows, oracle, tm, nm, arms, tol),
-                    "relations_remap": relation_accuracy(rows, oracle, tm, nm, arms, tol, remap=True),
+        if tag == "forward+backward" and merges:
+            res["merges_backward"] = merge_checks(merges, tmap, rows)
+            merge_ok = {c["from"]: c["right"] for c in res["merges_backward"]}
+        mo = merge_ok if tag == "forward+backward" else None
+        res[tag] = {"relations": relation_accuracy(rows, oracle, tmap, names, arms, tol, merge_ok=mo),
+                    "relations_remap": relation_accuracy(rows, oracle, tmap, names, arms, tol, remap=True, merge_ok=mo),
                     "subtask_boundary": boundary_error(rows, oracle),
                     "reobservation": reobservation(rows)}
     (out / "eval.json").write_text(json.dumps(res, indent=1))
     (out / "eval.md").write_text(eval_table(res))
     return res
+
+
+def merge_checks(merges: Sequence[dict[str, Any]], tmap: TrackMap, rows: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Per B1b merge X -> Y: right when X's own identity (``TrackMap.identity``: its forward map object, or outside the
+    map its nearest object, no one-to-one constraint) is Y's forward map object. ``rows_moved``: backward rows holding a
+    statement that came from X."""
+    fixed = tmap.fixed()
+    out = []
+    for m in merges:
+        x, y = m["from"], m["into"]
+        ix, iy = tmap.identity(x), fixed.get(y)
+        moved = sum(1 for r in rows if x in (r.get("b1b_origin") or {}).values()
+                    or any(s.get("origin") == x for s in r.get("b1b_shadowed") or []))
+        out.append({"from": x, "into": y, "identity_from": ix, "identity_into": iy,
+                    "right": ix is not None and ix == iy, "rows_moved": moved})
+    return out
 
 
 def eval_table(res: dict[str, Any]) -> str:
@@ -551,6 +609,11 @@ def eval_table(res: dict[str, Any]) -> str:
               f"episode-level (scoring): {tm['fixed']}", f"first: {tm['first']}", f"final: {tm['final']}"]
     for c in [c for c in tm["changes"] if c["from"] is not None or c["t"] > 0][:30]:
         lines.append(f"- t={c['t']}: {c['alias']} {c['from']} -> {c['to']} (d={c['dist']})")
+    if res.get("merges_backward"):
+        lines += ["", "## Backward same-category merges (B1b; scored on the forward map, judged by the merged alias's own identity)"]
+        for c in res["merges_backward"]:
+            lines.append(f"- {c['from']} -> {c['into']}: {'RIGHT' if c['right'] else 'WRONG'} ({c['from']} is "
+                         f"{c['identity_from']}, {c['into']} maps to {c['identity_into']}); rows moved {c['rows_moved']}")
     if res.get("track_identity"):
         lines += ["", f"Generator track identity: {res['track_identity']}"]
     return "\n".join(lines) + "\n"

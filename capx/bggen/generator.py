@@ -130,6 +130,13 @@ class Row:
     effect: list[tuple[EdgeKey, int, int]] = field(default_factory=list)  # set by the backward pass
     notes: list[str] = field(default_factory=list)
     keyframe: str | None = None
+    # R10 (bggen-fix3 P2): Observe answers in ``observed`` that the verifier did not adopt (the first 0 of a conflict
+    # left pending or overturned), and the adopted value of a re-check with another camera at this event
+    rechecked: dict[EdgeKey, str] = field(default_factory=dict)
+    rejected: list[EdgeKey] = field(default_factory=list)
+    # set by the backward B1b merge (evaluation provenance): final key -> merged alias it came from; displaced entries
+    b1b_origin: dict[EdgeKey, str] = field(default_factory=dict)
+    b1b_shadowed: list[tuple[EdgeKey, tuple[float, str], str | None]] = field(default_factory=list)
 
     def copy(self) -> Row:
         return Row(**{k: (dict(v) if isinstance(v, dict) else list(v) if isinstance(v, list) else v)
@@ -847,10 +854,20 @@ class Generator:
         observed = [(k, ("?" if (k[0] in STATE_PREDS and k[1] in hidden) else v)) for k, v in observed]
         hind: dict[EdgeKey, str] = {}
         # R10: 'in' answered 0 against the geometry -> re-check now (another camera; mode A: a later quiet frame)
+        # the row keeps which first answer was not adopted (``rejected``) and the adopted look re-check value
+        # (``rechecked``; a hindsight re-check goes to ``hindsight``): the backward pass (B2) uses adopted answers only
+        rechecked: dict[EdgeKey, str] = {}
+        rejected: list[EdgeKey] = []
         if self.verifier.new_conflicts:
-            done_keys, tool["recheck"] = self._recheck(e, fr, obs_cam.name, list(self.verifier.new_conflicts), ev_text,
-                                                       next_gripper_t, hind)
+            conf = list(self.verifier.new_conflicts)
+            done_keys, tool["recheck"], adopted = self._recheck(e, fr, obs_cam.name, conf, ev_text, next_gripper_t, hind)
             accepted |= done_keys
+            for k in conf:
+                a = adopted.get(k)
+                if a is not None and a[1].startswith("look"):
+                    rechecked[k] = a[0]
+                if a is None or a[0] != "0":  # pending (0.5 conflict) or overturned: the first 0 was not adopted
+                    rejected.append(k)
         # R9: release-geometry candidates the VDM left undecided: the best positive one -> expectation 0.7
         if auto_pairs:
             cmap = self._categories_map()
@@ -870,6 +887,7 @@ class Generator:
         confirmed = self.goal.update(self.graph, e.t)
         self.prev_image[main.name] = now_url
         row = self._row(e, observed, touched_now, hind, kf)
+        row.rechecked, row.rejected = rechecked, rejected
         rec.update(agent=agent_rec, plan=plan.to_dict(), tools=tool, marks=marks_text,
                    decisions=[d.to_dict() for d in self.verifier.decisions], goal_confirmed=confirmed,
                    tracks=[t.to_dict() for t in self.tracker.tracks.values()],
@@ -927,9 +945,11 @@ class Generator:
         return [(obj, s) for _, _, s in sorted(cands)[: self.cfg.release_geo_k]]
 
     def _recheck(self, e: Event, fr: FrameRecord, used_cam: str, keys: list[EdgeKey], ev_text: str,
-                 next_gripper_t: int, hind: dict[EdgeKey, str]) -> tuple[set[EdgeKey], dict[str, Any]]:
+                 next_gripper_t: int, hind: dict[EdgeKey, str],
+                 ) -> tuple[set[EdgeKey], dict[str, Any], dict[EdgeKey, tuple[str, str]]]:
         """R10: re-ask conflicting 'in' keys now -- another camera first, then (mode A) a later frame of the same quiet
-        interval. Returns (keys decided by an observation, trace info)."""
+        interval. Returns (keys decided by an observation, trace info, adopted {key: (value, "look <cam>" | "hindsight")})."""
+        adopted: dict[EdgeKey, tuple[str, str]] = {}
         cfg = self.cfg
         info: dict[str, Any] = {"keys": [statement_text(k) for k in keys]}
         decided_keys: set[EdgeKey] = set()
@@ -947,6 +967,7 @@ class Generator:
                 for k in list(left):
                     if self.verifier.recheck(k, vals.get(k, "?"), e.t, f"look {c}"):
                         decided_keys.add(k)
+                        adopted[k] = (vals[k], f"look {c}")
                         left.remove(k)
                 break  # one other camera
         if left and cfg.offline:
@@ -959,9 +980,10 @@ class Generator:
                     hind[k] = v
                 if self.verifier.recheck(k, v, e.t, "hindsight"):
                     decided_keys.add(k)
+                    adopted[k] = (v, "hindsight")
                     left.remove(k)
         info["pending"] = [statement_text(k) for k in left]
-        return decided_keys, info
+        return decided_keys, info, adopted
 
     def _grasp_evidence(self, pend: dict[str, Any], arm: str, fr: FrameRecord, cam: CameraFrame,
                         dets: Sequence[Detection], hand_world: np.ndarray | None) -> tuple[str, dict[str, Any]]:

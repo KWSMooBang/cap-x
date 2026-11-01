@@ -133,8 +133,9 @@ def test_recheck_uses_hindsight_in_mode_a(tmp_path):
         gen.graph.set(k, 0.5, "conflict", 10)
         from capx.bggen.events import Event
         hind: dict = {}
-        done, info = gen._recheck(Event(10, "keyframe"), gen.ep.frame(10, ["agentview"]), "agentview", [k], "check", w.grasp_t[0], hind)
-    assert done == {k} and gen.graph.p(k) == 0.9 and hind == {k: "1"} and info["pending"] == []
+        done, info, adopted = gen._recheck(Event(10, "keyframe"), gen.ep.frame(10, ["agentview"]), "agentview", [k], "check",
+                                           w.grasp_t[0], hind)
+    assert done == {k} and gen.graph.p(k) == 0.9 and hind == {k: "1"} and info["pending"] == [] and adopted == {k: ("1", "hindsight")}
     assert [d.rule for d in gen.verifier.decisions][-1] == "R10-resolve"
 
 
@@ -237,6 +238,9 @@ def test_backward_merges_aliases_never_seen_together_after_a_base_move():
                       base, sight=sight, caps={"hotdog": 2})
     assert res.merges_backward == m and any(x["rule"] == "B1b" for x in res.log)
     assert res.rows[1].belief[k_old] == (0.1, "obs")  # the later alias's (observed) edge wins over the stale one
+    # provenance for the evaluation: the statement came from hotdog_C, the survivor's stale entry was displaced
+    assert res.rows[1].b1b_origin == {k_old: "hotdog_C"} and res.rows[1].b1b_shadowed == [(k_old, (0.9, "mem"), None)]
+    assert res.rows[0].b1b_origin == {} and res.rows[0].b1b_shadowed == []
     assert not any("hotdog_C" in str(k) for r in res.rows for k in r.belief)
     assert res.rows[1].s4 == ["hotdog_A may be resting on the rim of countertop_A"]
     assert bw.check_forbidden(rows, res.rows, renamed={"hotdog_C": "hotdog_A"}) == []
@@ -255,29 +259,116 @@ def test_backward_merge_after_a_carry():
     assert [(x["from"], x["into"]) for x in m] == [("hotdog_E", "hotdog_A")] and "carried" in m[0]["why"]
 
 
-def test_evaluation_reads_the_backward_rows_through_the_backward_alias_map(tmp_path):
-    """rows_backward use the merged alias; the trace still has the split one -> its map is built from the trace read
-    through the same merges (strictness unchanged: one alias per object)."""
+def _split_run(tmp_path, into):
+    """A swap run whose forward pass "lost" bowl_B near the end and called it bowl_C (trace + forward rows), and whose
+    backward rows merged bowl_C into ``into`` (provenance as B1b writes it)."""
+    w = write_swap_episode(tmp_path)
+    out = tmp_path / "out"
+    with FakeServer(TruthBrain(w)) as srv:
+        run_episode(tmp_path, out, lm_cfg("A"), Models.from_env(env=srv.env()), FakeDetector(w), "libero_mem")
+    cut = w.release_t[2] + 20  # bowl_B (bowl_2) has most of its frames under its own name: it keeps the map
+    trace = _jsonl(out / "trace.jsonl")
+    for ln in trace:
+        if ln["t"] > cut:
+            ln["tracks"] = [{**t, "alias": "bowl_C" if t["alias"] == "bowl_B" else t["alias"]} for t in ln["tracks"]]
+    (out / "trace.jsonl").write_text("".join(json.dumps(x) + "\n" for x in trace))
+    rows = _jsonl(out / "rows_backward.jsonl")
+    for r in rows:  # the statements of bowl_B after the cut came from bowl_C
+        if r["t"] > cut:
+            r["b1b_origin"] = {s: "bowl_C" for s in r["belief"] if "bowl_B" in s}
+            r["b1b_shadowed"] = []
+    (out / "rows_backward.jsonl").write_text("".join(json.dumps(x) + "\n" for x in rows))
+    log = json.loads((out / "backward_log.json").read_text())
+    log["merges_backward"] = [{"t": cut + 1, "from": "bowl_C", "into": into}]
+    (out / "backward_log.json").write_text(json.dumps(log))
+    return out, rows, cut
+
+
+def test_backward_scoring_uses_the_forward_map_and_a_right_merge_can_score_right(tmp_path):
     from capx.bggen.evaluate import evaluate
+
+    out, rows, cut = _split_run(tmp_path, "bowl_B")
+    res = evaluate(out, tmp_path)
+    assert res["track_map"]["fixed"]["bowl_B"] == "bowl_2" and "bowl_C" not in res["track_map"]["fixed"]
+    [c] = res["merges_backward"]
+    assert (c["from"], c["into"], c["identity_from"], c["identity_into"], c["right"]) == ("bowl_C", "bowl_B", "bowl_2", "bowl_2", True)
+    assert c["rows_moved"] == sum(1 for r in rows if r["t"] > cut and r["b1b_origin"])
+    rb = res["forward+backward"]["relations"]
+    assert rb["merge_wrong"] == 0 and rb["accuracy"] >= 0.98
+    assert "bowl_C -> bowl_B: RIGHT" in (out / "eval.md").read_text()
+
+
+def test_wrong_merge_makes_the_moved_statements_wrong(tmp_path):
+    from capx.bggen.evaluate import evaluate, relation_accuracy
+
+    out, rows, cut = _split_run(tmp_path, "bowl_A")  # bowl_C is bowl_2, bowl_A maps to bowl_1
+    res = evaluate(out, tmp_path)
+    [c] = res["merges_backward"]
+    assert c["right"] is False and c["identity_from"] == "bowl_2" and c["identity_into"] == "bowl_1"
+    rb = res["forward+backward"]["relations"]
+    assert rb["merge_wrong"] > 0 and any(str(e["truth"]).startswith("wrong merge of bowl_C") for e in rb["errors"])
+    # the population is unchanged: decided + undecided equals a scoring of the same rows without the merge verdict
+    from capx.bggen.evaluate import TrackMap
+    from capx.bggen.oracle import load_oracle
+
+    oracle = load_oracle(tmp_path)
+    tmap = TrackMap(_jsonl(out / "trace.jsonl"), oracle, 0.15, end_t=None)
+    names = sorted({t["alias"] for ln in _jsonl(out / "trace.jsonl") for t in ln["tracks"]})
+    arms = json.loads((out / "summary.json").read_text()).get("arms") or [None]
+    plain = relation_accuracy(rows, oracle, tmap, names, arms, res["tolerance_frames"])
+    assert rb["decided"] + rb["undecided"] == plain["decided"] + plain["undecided"]
+
+
+def test_no_merge_backward_scoring_is_unchanged(tmp_path):
+    from capx.bggen.evaluate import TrackMap, evaluate, relation_accuracy
+    from capx.bggen.oracle import load_oracle
 
     w = write_swap_episode(tmp_path)
     out = tmp_path / "out"
     with FakeServer(TruthBrain(w)) as srv:
         run_episode(tmp_path, out, lm_cfg("A"), Models.from_env(env=srv.env()), FakeDetector(w), "libero_mem")
-    cut = w.release_t[1]
-    trace = _jsonl(out / "trace.jsonl")
-    for ln in trace:  # the forward pass "lost" bowl_B after its release and called it bowl_C
-        if ln["t"] > cut:
-            ln["tracks"] = [{**t, "alias": "bowl_C" if t["alias"] == "bowl_B" else t["alias"]} for t in ln["tracks"]]
-    (out / "trace.jsonl").write_text("".join(json.dumps(x) + "\n" for x in trace))
-    log = json.loads((out / "backward_log.json").read_text())
-    log["merges_backward"] = [{"t": cut + 1, "from": "bowl_C", "into": "bowl_B"}]
-    (out / "backward_log.json").write_text(json.dumps(log))
     res = evaluate(out, tmp_path)
-    tb = res["track_map_backward"]
-    assert tb["merges"] == {"bowl_C": "bowl_B"} and tb["fixed"]["bowl_B"] == "bowl_2" and "bowl_C" not in tb["fixed"]
-    assert res["forward+backward"]["relations"]["accuracy"] >= 0.98
-    assert res["track_map"]["fixed"].get("bowl_C") is None  # forward: bowl_C lost to bowl_B (one alias per object)
+    assert "merges_backward" not in res and "merge_wrong" not in res["forward+backward"]["relations"]
+    trace, oracle = _jsonl(out / "trace.jsonl"), load_oracle(tmp_path)
+    tmap = TrackMap(trace, oracle, 0.15, end_t=json.loads((out / "summary.json").read_text())["n_frames"])
+    names = sorted({t["alias"] for ln in trace for t in ln["tracks"]} | {t["alias"] for t in json.loads((out / "summary.json").read_text())["tracks"]})
+    arms = json.loads((out / "summary.json").read_text()).get("arms") or [None]
+    direct = relation_accuracy(_jsonl(out / "rows_backward.jsonl"), oracle, tmap, names, arms, res["tolerance_frames"])
+    assert json.dumps(res["forward+backward"]["relations"], sort_keys=True) == json.dumps(direct, sort_keys=True)
+
+
+# --- P2: an R10 first answer that was not adopted is no B2 neighbour ----------------------------------------------------
+
+def test_rejected_first_answer_is_not_a_b2_neighbour():
+    k = ("in", "cream_cheese_A", "basket_B")
+
+    def r(t, v, rejected=False, rechecked=None, p=0.9):
+        row = Row(t, "keyframe", None, None, [(k, v)], {k: (p, "obs")}, [], "0/1", 0, 1, "?", [], {"main": None})
+        if rejected:
+            row.rejected = [k]
+        if rechecked:
+            row.rechecked = {k: rechecked}
+        return row
+
+    # t=228: the VDM said 0 against the geometry, the wrist camera could not tell (pending 0.5): not adopted
+    rows = [r(228, "0", rejected=True, p=0.5), r(258, "1"), r(288, "0", p=0.1)]
+    log: list = []
+    bw.remove_noise(rows, log)
+    assert log == [] and rows[1].observed == [(k, "1")]  # the 1 at t=258 has one real neighbour only: kept
+    # without the flag the rejected 0 would have "corrected" it (the artificial fix the review found)
+    rows2 = [r(228, "0", p=0.5), r(258, "1"), r(288, "0", p=0.1)]
+    bw.remove_noise(rows2, log)
+    assert [x["rule"] for x in log] == ["B2"]
+    # an adopted look re-check counts as an answer at its row
+    rows3 = [r(228, "0", rejected=True, rechecked="1"), r(258, "0", p=0.1), r(288, "1")]
+    log3: list = []
+    bw.remove_noise(rows3, log3)
+    assert [(x["t"], x["was"], x["now"]) for x in log3] == [(258, "0", "1")]
+    from capx.bggen.serialize import row_to_json
+
+    j = row_to_json(rows3[0])
+    assert j["rejected"] == ["(in cream_cheese_A basket_B)"] and j["rechecked"] == {"(in cream_cheese_A basket_B)": "1"}
+    assert "rejected" not in row_to_json(rows3[1])
 
 
 # --- C: lifted 4.3 cm and put back on the same plate (t02 demo_2) ---------------------------------------------------

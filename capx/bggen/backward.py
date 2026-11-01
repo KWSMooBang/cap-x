@@ -80,24 +80,36 @@ def unify_ids(rows: list[Any], merges: Sequence[dict[str, Any]], log: list[dict[
         n = 0
         for r in rows:
             r.observed = [(_rename(k, a, b), v) for k, v in r.observed]
+            # provenance for the evaluation (B1b only): ``b1b_origin`` final key -> the merged alias it came from;
+            # ``b1b_shadowed`` the entries a collision displaced (key, value, origin alias or None = the survivor's own)
+            old_origin = dict(getattr(r, "b1b_origin", {}))
+            origin: dict[EdgeKey, str | None] = {}
+            shadow = list(getattr(r, "b1b_shadowed", []))
             nb: dict[EdgeKey, Any] = {}
-            renamed: set[EdgeKey] = set()
             for k, v in r.belief.items():
                 k2 = _rename(k, a, b)
-                if k2 in nb and (k2 in renamed) == (k2 != k):
-                    continue  # same origin twice: cannot happen; keep the first
-                if k2 in nb and (k2 != k) != prefer:
-                    continue  # the preferred origin is already there
+                ren = k2 != k
+                o = a if ren else old_origin.get(k)
+                n += ren
+                if k2 in nb:
+                    new_wins = ren if prefer else not ren  # the preferred origin wins a collision
+                    if not new_wins:
+                        if prefer:
+                            shadow.append((k2, v, o))
+                        continue
+                    if prefer:
+                        shadow.append((k2, nb[k2], origin.get(k2)))
                 nb[k2] = v
-                if k2 != k:
-                    renamed.add(k2)
-                    n += 1
-                else:
-                    renamed.discard(k2)
+                origin[k2] = o
             r.belief = nb
+            if prefer or old_origin:
+                r.b1b_origin = {k: o for k, o in origin.items() if o is not None}
+                r.b1b_shadowed = shadow
             r.s4 = [word.sub(b, x) for x in r.s4]
             r.changed = [_rename(k, a, b) for k in r.changed]
             r.hindsight = {_rename(k, a, b): v for k, v in r.hindsight.items()}
+            r.rechecked = {_rename(k, a, b): v for k, v in getattr(r, "rechecked", {}).items()}
+            r.rejected = [_rename(k, a, b) for k in getattr(r, "rejected", [])]
             r.touched = [b if x == a else x for x in r.touched]
             r.held = {k: (b if v == a else v) for k, v in r.held.items()}
             if r.obj == a:
@@ -174,9 +186,13 @@ def _touched_between(rows: Sequence[Any], i0: int, i1: int, key: EdgeKey) -> boo
 def remove_noise(rows: list[Any], log: list[dict[str, Any]]) -> None:
     obs: dict[EdgeKey, list[tuple[float, int, str]]] = {}
     for i, r in enumerate(rows):
+        rejected = set(getattr(r, "rejected", []))
         for k, v in r.observed:
-            if v in ("0", "1"):
+            if v in ("0", "1") and k not in rejected:  # R10: a first answer the verifier did not adopt is no evidence
                 obs.setdefault(k, []).append((float(i), i, v))
+        for k, v in getattr(r, "rechecked", {}).items():  # the adopted re-check (another camera, same moment)
+            if v in ("0", "1"):
+                obs.setdefault(k, []).append((i + 0.25, i, v))
         for k, v in r.hindsight.items():
             if v in ("0", "1"):
                 obs.setdefault(k, []).append((i + 0.5, i, v))
