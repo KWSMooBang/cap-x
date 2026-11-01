@@ -507,7 +507,13 @@ verbatim, `capx/belief/prompts_v2.py`). `bg_est` is unchanged and can still be r
   **Geometric veto** (replaces the 2-radii anomaly rule): Observe on / in = 1 with both objects detected now is
   not accepted when the geometry shows the object is not resting flat — center distance d_xy > support radius r
   + 0.5 cm (`veto_xy_margin`), or center height difference dz > the pair's flat dz + 1.0 cm (`veto_dz_margin`;
-  `flat_dz` = `{"bowl/plate": 0.018}`, other pairs: the dz of their first accepted Observe 1, no dz check before).
+  `flat_dz` = `{"bowl/plate": 0.028, "bottle/plate": 0.063}`, other pairs: the dz of their first accepted Observe 1,
+  no dz check before). The flat dz are of the perceived (SAM3 / depth) centers, measured on 20261101_mem10x5_bgest2
+  (28 trials, truth On and d_xy < r): bowl/plate n=48 median 0.028 m (p10 0.025, p90 0.030, max 0.032), bottle/plate
+  n=21 median 0.063 m (p90 0.066, max 0.067); the earlier 0.018 (simulator-pose dz) vetoed about half of the flat
+  bowls. Rim-resting bowls (t06: dz 0.029-0.036, overlapping flat bowls) are caught by d_xy (6.4-7.3 cm vs r
+  5.4-6.3 cm), not by dz. Known limits: a rim bowl with d_xy within r + 0.5 cm is not vetoed; a flat bottle whose
+  center is off the plate's estimated radius (t01 tr2: d_xy 7.5 > 6.3 cm) is vetoed.
   The key gets P 0.5, source `conflict`, a `vetoes` record and S4 `<obj> may be resting on the rim of <support>
   (tilted), not on it` (d_xy beyond 2 radii: `a mark may be on the wrong object`); the step / place stays pending
   and S5b is suppressed. It stays `conflict` until the key is observed again (or lowered by another location).

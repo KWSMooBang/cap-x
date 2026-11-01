@@ -113,9 +113,13 @@ class Est2Config(EstConfig):
     veto: bool = True
     veto_xy_margin: float = 0.005  # m
     veto_dz_margin: float = 0.010  # m
-    # "<object category>/<support category>" -> center dz of the object resting flat (m). Pairs not listed
+    # "<object category>/<support category>" -> center dz (SAM3 / depth centers) of the object resting flat (m).
+    # Measured on 20261101_mem10x5_bgest2 (28 trials; truth On and d_xy < r): bowl/plate n=48 median 0.028
+    # (p10 0.025, p90 0.030, max 0.032); bottle/plate n=21 median 0.063 (p90 0.066, max 0.067). With the
+    # 0.010 margin no flat placement is vetoed by dz; rim-resting bowls (dz 0.029-0.036, not separable by dz)
+    # are caught by d_xy. (0.018 was the simulator-pose dz, too low for perceived centers.) Pairs not listed
     # use the dz measured at their first accepted Observe 1 (no dz check before that).
-    flat_dz: dict[str, float] = field(default_factory=lambda: {"bowl/plate": 0.018})
+    flat_dz: dict[str, float] = field(default_factory=lambda: {"bowl/plate": 0.028, "bottle/plate": 0.063})
     anomaly_factor: float = 2.0
     gripper_mark_radii: float = 2.5  # image 2: no mark (except the held object's) this close to the fingertip pixel
     region_radius: float = 0.10  # m: at(o, region) when o's center is this close (xy) to the region center
