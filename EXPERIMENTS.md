@@ -1,5 +1,21 @@
 # cap-bg EXPERIMENTS
 
+## 20261101_mem10x5_bgest2 (2026-11-01) — discard (비교 제외: 하네스 버그 2건), 추정 품질 자료로는 keep
+- 실행: kubectl baccus_cap-bg, bg d471268, 10/31 22:08 – 11/01 03:03 UTC, pod 2 (A100, worker 1, 30Gi), 크래시·OOM·재실행 0. 약 9.8 GPU-h.
+- 설정: memory_mode bg_est2, 메모리 조건 파일럿과 같은 설정·seed (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 32768, Kimi-K3 + Qwen3.8-27B, 영상 on, seg off).
+- 결과 (baccus 보고 원문): 성공 2/50 (t00 tr2·tr5). 종료 사유 step_cap 35, misparsed_finish 7, finish_but_fail 3, turn_limit 3.
+  진행률 0.23 (upstream init 2/20 0.25, 생성 init 0/30 0.21). task별 성공·진행률: t0 2/5 .60 · t1 0 .00 · t2 .60 · t3 .20 · t4 .36 · t5 .03 · t6 .27 · t7 .05 · t8 .10 · t9 .10.
+  짝 비교 (L1 계산, 같은 seed): 대 none_v2 성공 2/0, 진행률 높음 9 · 같음 33 · 낮음 8 (부호검정 p≈1.0). 대 bg_oracle 성공 1/6, 진행률 8 · 22 · 20 (p≈0.036). 대 vdm_history 진행률 11 · 27 · 12.
+  추정 품질 (belief_trace): 원시 Observe 1350/1492 = 0.905, 융합 후 belief 6166/6318 = 0.976 (미결정 139). t08·t09 는 원시 0.987·0.973 인데 융합 후 0.913·0.915 (at(center)·basket 관계 기하 판정 의심).
+  shadow 합계: veto [118, 62], S4 [119, 59] 오발동 60, S5b [2, 1]. 거부권 오답 25 관계 중 24 가 bowl why=dz (dz 0.028–0.038 > limit 0.028).
+  실측 평평 기준 (정답 On·d_xy<r): bowl n=161 중앙값 0.027 (p90 0.029, 최대 0.036), bottle n=21 중앙값 0.063. 새 기준 재적용 시 거부권 [100,59] → [66,57], 오답 41 → 9, 놓침 5.
+- 토큰·비용: coding Kimi-K3 321 calls 입력 2.70M · 출력 2.71M, goal parse 21k/73k, Observe Qwen 312 calls 0.35M/0.95M. 약 $52.9 (Kimi 49.9 + Qwen 3.0).
+- 판단: 비교에서 제외. (1) 판단 응답이 펜스 없이 '# Subtask' 로 시작하는 코드면 파서가 FINISH 로 처리 → 7 trial 이 코드를 버리고 조기 종료 (t07 에서 3건). 재판정 결과 메모리 조건 150 trial 에는 같은 경우 0.
+  (2) bowl/plate flat_dz 0.018 이 실측보다 약 1 cm 낮아 정상 그릇의 Observe 1 을 거부 → 단계 보류·S4 오발동. 두 수정 bg 7dccdad 병합.
+  현재 숫자로는 none_v2 와 차이 없음, bg_oracle 보다 낮음. 정식 판단은 r2.
+- next: 20261101_mem10x5_bgest2_r2 (bg f9508fb, 같은 설정·seed, 03:03 UTC 자동 시작, 사람 승인). t08·t09 기하 판정 오답 확인.
+- 산출물(kubectl PVC): outputs/capbg_baseline/20261101_mem10x5_bgest2/, 스크립트 /workspace/cap-bg/{trial_table.py, bgest2_quality.py, group_wrong_vetoes.py, veto_replay.py}, 재판정 outputs/rejudge_7dccdad.json
+
 ## 20261101_bgest2_rim_smoke (2026-11-01) — 원시 Observe 기준 근소 미달, 융합 후 기준 통과 → 10×5 진행
 - 실행: kubectl baccus_cap-bg, bg d471268 (기하 거부권 + 미검출 표식 생략 + 'on = resting flat'), 21:50–22:04 UTC, task_06 × 2 (둘 다 과제 실패).
 - 결과 (baccus 보고 원문): 크래시 0 · 파싱 실패 0 · belief_trace 2/2 · 검출 5/5 · goal_match(·normalized) 2/2 · 진짜 누출 0
