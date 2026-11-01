@@ -1,5 +1,17 @@
 # cap-bg EXPERIMENTS
 
+## 20261101_ens2_mem5x5 (2026-11-01) — keep: Nebius 앙상블 기본 CaP-X, LIBERO-Mem 5과제 × 5 (메모리 없음)
+- 실행: kubectl baccus_cap-bg, exp/ensemble-nebius 7b72289, 11:2x–14:10 UTC, pod 2 (A100 1장씩, worker 1, task 0·4·6 / 7·8 분할). 같은 init (trial k = seed k, none_v2 와 같음).
+- 설정: 후보 openai/gpt-oss-120b, Qwen/Qwen3-235B-A22B-Instruct-2507, deepseek-ai/DeepSeek-V4-Flash-0731 × temp 0.1/0.5/0.9 + 합성 deepseek-ai/DeepSeek-V4-Pro, VDM Qwen3.8-27B, memory none,
+  step 8000 / wall 3600 / retries 1, max_tokens 32768, 영상 on. (Kimi-K2.7-Code 후보 구성은 쿼리당 ~5–10분이라 사람 결정으로 교체; 그 smoke 는 wall_timeout.)
+- 결과 (baccus 보고 원문): 성공 1/25 (task_04 trial 4). task_00 0/5 (finish_but_fail 3·turn_limit 1·step_cap 1), task_04 1/5 (step_cap 4), task_06 0/5 (step_cap 5), task_07 0/5 (step_cap 4·turn_limit 1), task_08 0/5 (step_cap 5).
+  평균 5.9턴·704 s·7224 step. 쿼리 153 (평균 67.7 s), 후보 실패 0/1377, 후보 잘림 26, 합성 형식 오류 0/153. 비용 $13.81 ($0.55/trial; 합성 V4-Pro $8.63).
+  진행률 (24 trial, task_00 tr2 서브골 기록 없음): 0.283. task별 t0 .75 · t4 .76 · t6 .00 · t7 .00 · t8 .00.
+  같은 24 trial 짝 비교 (L1 계산): 대 none_v2 (Kimi-K3 단일, 0.176) 높음 5 · 같음 16 · 낮음 3 (p≈0.73), 성공 1/0. 대 bg_oracle (0.340) 5 · 11 · 8. 대 bg_est2 r2 (0.336) 4 · 12 · 8. 대 capx (0.225) 5 · 17 · 2.
+  메모: task_00 tr1·3·5 는 서브골 1/1 인데 실패 판정, task_04 tr1·5 는 5/5 인데 step_cap — 서브골 추적기와 성공 판정이 어긋나는 경우가 있음 (확인 필요).
+- 판단: keep. 앙상블은 Kimi-K3 단일과 유의한 차이 없음. 단순 과제(t0·t4)에서 서브골은 더 자주 채우지만 성공 판정·예산에서 막히고, 교환·회전·바구니(t6·t7·t8)는 0.
+- 산출물(kubectl PVC): /workspace/cap-bg/cap-x-ens4/outputs/capbg_ensemble/20261101_ens2_mem5x5/ (SUMMARY.md, results.tsv), 영상 deepseek-ai_DeepSeek-V4-Pro/<task>/trial_*/video_combined.mp4
+
 ## bggen_validation_qwen (2026-11-01) — keep: Agent as BG Generator 첫 정상 실행 (에피소드 1개씩)
 - 실행: kubectl baccus_cap-bg, exp/agent-bg-gen b8e8fe4 (생성·평가), 11:01–11:31 UTC, pod 1 (A100), 모델 init·agent·VDM 모두 Qwen/Qwen3.8-27B (사람 지시), SAM3 검출. 방식 A (앞으로 + 뒤로 패스).
   데이터: LIBERO-Mem task 06 swap 시연 demo_1 (418 프레임, 20 Hz), B1K task 45 cook hot dogs episode_00450010 (6805 프레임, 30 Hz).
