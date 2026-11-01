@@ -86,6 +86,7 @@
   vdm_history 는 none 대비 유의한 차이 없음.
 - next: (1) bg_est (정답 없음) smoke → 10×5 로 같은 seed 비교. (2) bg_oracle ablation: 좌표 제거(관계만), 목표를 LLM 파싱으로 교체, 신호 끄기 —
   정답 지각·정답 목표·기억 구조 효과 분리. (3) 영상 프레임 디스크 스트리밍(1i) 으로 worker 수 회복.
+- 뷰어: https://claude.ai/artifact/6KRnzgXKgwfBZHsw8kiZVd 의 '조건 비교' (trial 별 표, baccus trial_table.py 기준). bg_est2 10×5 진행 현황도 같은 페이지.
 - 산출물(kubectl PVC): outputs/capbg_baseline/20261030_memcond_COMPARE_{orig,reflected}.md, logs/20261030_memcond_final/{orig,reflected}/,
   outputs/capbg_baseline/20261030_mem10x5_{none_v2,vdmhist,bgoracle}{,_infra_rerun}/, 중단분 _aborted_podkill, _aborted_podkill_vla, _aborted_oom.
 
