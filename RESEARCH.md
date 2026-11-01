@@ -86,6 +86,8 @@ cap-x 에 Belief Graph 모듈을 추가해 memory 관리 능력을 높이고 lon
 1o. [진행 2026-11-01] 앙상블 기본 CaP-X (사람 지시): 후보 gpt-oss-120b·Qwen3-235B-2507·Kimi-K2.7-Code × temp 0.1/0.5/0.9, 합성 DeepSeek-V4-Pro, VDM Qwen3.8-27B.
     pilot: LIBERO-Mem t00·t04·t06·t07·t08 × 5, RoboMME PickXtimes·StopCube·VideoUnmaskSwap·ButtonUnmask·PickHighlight·VideoPlaceOrder·MoveCube·PatternLock × 5 (memory none).
     텍스트 전용 모델이라 RoboMME 조건 영상은 VDM 서술(vdm_text)로. L2 exp_cap-bg_ensemble-nebius. 예상 API 약 $40–60, 4–6 h (GPU 3장). Kimi-K3 단일 RoboMME pilot 은 중단 상태(1/80).
+    2026-11-01 사람 지시: pod 3개 (각 CPU 16, A100 1, 32Gi) — LIBERO-Mem pilot, RoboMME pilot, bggen 검증. GPU 3장(노드 빈 GPU 전부) 사용을 사람이 명시적으로 허용 (일회성).
+    bggen pod 는 즉시 (reaper 회피), pilot pod 2개는 앙상블 코드 준비 후.
 1g. 결정 대기: 비교 예산 기준 (제안: sim step 상한 8000 이 주 예산, wall 은 넉넉한 안전장치)
 1h. 2026-10-30 사람 사전 승인: 하네스 수정 4건 리뷰 통과 시 bg 병합·push → LIBERO-Mem 파일럿 재실행
     (task_00..09 × 5, step 8000 / wall 3600 / retries 1, max_tokens 20480, 앙상블 끔·VDM 켬·seg 끔).
