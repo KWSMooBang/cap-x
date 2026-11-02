@@ -24,6 +24,7 @@ from PIL import Image
 
 from capx.envs.configs.instantiate import instantiate
 from capx.envs.configs.loader import DictLoader
+from capx.utils.json_utils import json_default
 
 # Re-export LLM client symbols for backward compatibility
 from capx.llm.client import (  # noqa: F401
@@ -696,8 +697,37 @@ def _save_trial_artifacts(
     if raw_code:
         (trial_dir / "raw_response.sh").write_text(raw_code)
 
-    (trial_dir / "all_responses.json").write_text(json.dumps(all_responses, indent=2))
+    # A failed save of one artifact must not end the task process (later trials still run); the error is
+    # recorded in save_errors.txt and summary.txt is always written.
+    save_errors: list[str] = []
+    try:
+        responses_json = json.dumps(all_responses, indent=2, default=json_default)
+    except Exception as exc:
+        save_errors.append(f"all_responses.json: {exc!r}")
+    else:
+        (trial_dir / "all_responses.json").write_text(responses_json)
     (trial_dir / "summary.txt").write_text("\n".join(log_lines))
+    try:
+        _save_trial_extras(trial_dir, all_responses, visual_feedback_imgs, ensemble_data, multiturn_ensemble_data)
+    except Exception as exc:
+        save_errors.append(f"extras: {exc!r}")
+    if save_errors:
+        print(f"[trial {trial}] artifact save errors: {save_errors}")
+        try:
+            (trial_dir / "save_errors.txt").write_text("\n".join(save_errors) + "\n")
+        except OSError:
+            pass
+    return code_path
+
+
+def _save_trial_extras(
+    trial_dir: Path,
+    all_responses: list[dict],
+    visual_feedback_imgs: list[Image.Image],
+    ensemble_data: dict[str, str] | None,
+    multiturn_ensemble_data: list[dict[str, str]] | None,
+) -> None:
+    """Ensemble texts, per-prompt texts and visual feedback images of one trial."""
 
     # Save initial ensemble data if provided
     if ensemble_data:
@@ -745,8 +775,6 @@ def _save_trial_artifacts(
             i += 1
     for i, img in enumerate(visual_feedback_imgs):
         img.save(trial_dir / f"visual_feedback_{i:02d}.png")
-
-    return code_path
 
 
 

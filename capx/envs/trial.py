@@ -51,6 +51,7 @@ from capx.utils.launch_utils import (
     _save_trial_artifacts,
 )
 from capx.utils.video_utils import _encode_video_base64, _write_video
+from capx.utils.json_utils import json_default
 
 # Use TYPE_CHECKING to avoid circular imports for type hints only
 from typing import TYPE_CHECKING
@@ -231,9 +232,10 @@ def _write_trial_end(code_path: str | None, record: dict[str, Any]) -> None:
     if not code_path:
         return
     try:
+        text = json.dumps(record, indent=2, default=json_default)
         with open(os.path.join(os.path.dirname(str(code_path)), "trial_end.json"), "w") as f:
-            json.dump(record, f, indent=2, default=str)
-    except OSError as exc:
+            f.write(text)
+    except (OSError, TypeError, ValueError) as exc:
         print(f"could not write trial_end.json: {exc}")
 
 
@@ -1081,8 +1083,13 @@ def _run_single_trial(
         **_memory_est_log(memory),
     })
 
-    with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
-        json.dump(all_responses, f)
+    try:
+        responses_json = json.dumps(all_responses, default=json_default)
+    except Exception as exc:  # a save error must not end the task process
+        print(f"could not write all_responses.json: {exc!r}")
+    else:
+        with open(os.path.join(config["output_dir"], "all_responses.json"), "w") as f:
+            f.write(responses_json)
 
     if args.debug:
         with open(os.path.join(config["output_dir"], "code_init.txt"), "w") as f:
