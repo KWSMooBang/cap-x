@@ -140,12 +140,25 @@ def observe_prompt(instruction: str, image_before: str | None, image_now: str, m
 IDENTITY_SYSTEM = "You check one object detection in a robot's camera image. Answer with one character."
 
 
-def identity_prompt(category_text: str, image: str, view: str) -> list[dict[str, Any]]:
-    """Is the object inside the red box (mark 1) a ``category_text``? -> one line ``Answer: 1 | 0 | ?``."""
+# bggen-fix6 B: one line telling a category from the look-alike the detector confuses it with (B1K kitchen: the built-in
+# oven was detected as the microwave; batch4 010 / 020 the real microwave got its one 'no' too). B1K categories only.
+IDENTITY_CUES = {
+    "microwave": ("A microwave is a small box-shaped appliance (about half a metre wide) with one side-hinged door with a "
+                  "window and a narrow button / keypad panel beside it; a built-in oven is larger, with a door that opens "
+                  "downward and knobs / dials above it."),
+    "fridge": ("A fridge is a tall cabinet-like appliance (taller than the counter) with one or two large vertical doors; "
+               "a kitchen cabinet or an oven is not one."),
+}
+
+
+def identity_prompt(category_text: str, image: str, view: str, cue: str | None = None) -> list[dict[str, Any]]:
+    """Is the object inside the red box (mark 1) a ``category_text``? -> one line ``Answer: 1 | 0 | ?``. ``cue``
+    (fix6 B, ``IDENTITY_CUES``): one line on how the category looks next to its look-alike."""
     head = f"{VIEWS.get(view, view)} A red box with the mark 1 surrounds one detected object."
     tail = (f"Is the object in the red box (mark 1) a {category_text}? Look at the object itself, not at what is near it "
             f"(another appliance or a cabinet door that only resembles a {category_text} is not one).\n"
-            "Answer 1 if it is, 0 if it is not, ? if you cannot tell. Output exactly one line: Answer: <1|0|?>")
+            + (f"{cue}\n" if cue else "")
+            + "Answer 1 if it is, 0 if it is not, ? if you cannot tell. Output exactly one line: Answer: <1|0|?>")
     return [{"role": "system", "content": IDENTITY_SYSTEM},
             {"role": "user", "content": [_text(head), _image(image), _text(tail)]}]
 

@@ -34,8 +34,9 @@
     target with a position (B1K 030: both hot dogs came out of the fridge unseen); see ``Generator._grasp_unseen``.
   - B ``bind_confirm``: the first binding of an expected name of a category capped at 1 (fridge / microwave) asks
     the VDM whether the marked detection is that category (``confirm`` callback of ``update``); 0 -> not bound
-    (``rejected_identity``; the place is remembered and later detections there are rejected without a call), ? ->
-    bound and marked (``bind_note``).
+    (``rejected_identity``; the place is remembered and later detections there are rejected without a call -- bggen-fix6
+    B: only after ``bind_confirm_reject_n`` 'no' answers from different events, a first 'no' holds back its event
+    only), ? -> bound and marked (``bind_note``).
   - C ``relocate_min_events``: a capped-at-1 track whose dropped far detections (``capped_dropped``) repeat at one
     place (>= that many distinct events, pairwise within ``relocate_radius``) more often than the track was re-detected
     since its binding is moved there (``relocations``; earlier rows keep the old place).
@@ -100,6 +101,10 @@ class TrackConfig:
     bind_confirm_exempt: tuple[str, ...] = ()
     # at most this many identity calls per category and episode; beyond -> not bound, recorded (0 = no limit)
     bind_confirm_max_calls: int = 0
+    # bggen-fix6 B: a place is rejected for good (later detections there rejected without a call) only after this many
+    # 'no' answers at DIFFERENT events; before that a 'no' holds back only its own event (the same event asks once) and
+    # the next event there asks again. 1 = the fix5 behaviour (one 'no' is final)
+    bind_confirm_reject_n: int = 1
     # C: relocation of a capped-at-1 track to a repeated far place (>= relocate_min_events distinct events, pairwise
     # within relocate_radius); 0 = off. Evidence accumulates per place over the episode; a place wins only with more
     # events than the track's current place; at most relocate_max relocations per track (0 = no limit)
@@ -130,6 +135,7 @@ class Track:
     zlim: tuple[float, float] | None = None  # world z of the mask's lowest / highest depth points (5 / 95 %)
     bound_t: int | None = None  # frame the name got its object (created / expected name bound / relocated)
     bind_note: str | None = None  # bggen-fix5: how the name was bound when not by a plain detection
+    no_ts: list[int] = field(default_factory=list, repr=False)  # fix6 B (rejected places only): events answered 'no'
 
     def to_dict(self) -> dict[str, Any]:
         return {"alias": self.alias, "category": self.category,
@@ -599,22 +605,36 @@ class Tracker:
     def _check_identity(self, alias: str, d: Detection, t: int, cam: str, base_pose: np.ndarray | None) -> str:
         """"1" / "0" / "?" for "the marked detection is a <category>". A detection at a place already rejected (within
         ``assoc_radius`` of it, box gap for large objects; without 3D: the same camera, pixel within ``assoc_px``) is
-        rejected again without a call. Beyond ``bind_confirm_max_calls`` calls of the category: not bound, no call."""
+        rejected again without a call once the place has ``bind_confirm_reject_n`` 'no' answers from different events
+        (fix6 B; before that: without a call only at the event that said 'no', asked again at a later event). Beyond
+        ``bind_confirm_max_calls`` calls of the category: not bound, no call."""
         cfg = self.cfg
         rec: dict[str, Any] = {"t": t, "alias": alias, "category": d.category, "camera": cam,
                                "pixel": [round(x, 1) for x in d.pixel]}
         w = self._world(d, base_pose)
         if w is not None:
             rec["world"] = [round(float(x), 3) for x in w]
+        need = max(cfg.bind_confirm_reject_n, 1)
+        again: Track | None = None  # a place with fewer 'no' answers than ``need``: asked again at this event
         for spot in self.rejected_spots:
             # 3D detection vs 3D place; a detection without 3D vs the place's pixel in this camera
             m = self._metric(spot, d, cam, base_pose)
             if m is not None and (m[0] == "m") == (w is not None) and \
                     m[1] <= (cfg.assoc_radius if m[0] == "m" else cfg.assoc_px):
-                rec.update(answer="0", cached=True, spot_t=spot.created, unit=m[0])
-                self.identity_checks.append(rec)
-                self._count("rejected_identity_cached")
-                return "0"
+                if len(spot.no_ts) >= need:
+                    rec.update(answer="0", cached=True, spot_t=spot.created, unit=m[0])
+                    self.identity_checks.append(rec)
+                    self._count("rejected_identity_cached")
+                    return "0"
+                if t in spot.no_ts:  # this event already said 'no' here: held back, no second call
+                    rec.update(answer="0", held_event=True, spot_t=spot.created, unit=m[0])
+                    self.identity_checks.append(rec)
+                    self._count("rejected_identity_held")
+                    return "0"
+                if again is None:
+                    again = spot
+        if again is not None:
+            rec.update(asked_again=True, spot_t=again.created, previous_no=list(again.no_ts))
         n = self.identity_calls_per_cat.get(d.category, 0)
         if cfg.bind_confirm_max_calls > 0 and n >= cfg.bind_confirm_max_calls:
             rec.update(answer="0", limit=cfg.bind_confirm_max_calls)
@@ -632,10 +652,17 @@ class Tracker:
         self._count("identity_checks")
         if ans == "0":
             self._count("rejected_identity")
-            spot = Track(f"rejected:{alias}", d.category, w, None if (w is None or d.size is None)
-                         else self._world_size(d, base_pose), created=t)
-            spot.pixel[cam], spot.box[cam] = d.pixel, d.box  # the camera place too (detections without 3D)
-            self.rejected_spots.append(spot)
+            if again is not None:
+                again.no_ts.append(t)
+                rec["no_count"] = len(again.no_ts)
+            else:
+                spot = Track(f"rejected:{alias}", d.category, w, None if (w is None or d.size is None)
+                             else self._world_size(d, base_pose), created=t, no_ts=[t])
+                spot.pixel[cam], spot.box[cam] = d.pixel, d.box  # the camera place too (detections without 3D)
+                self.rejected_spots.append(spot)
+                rec["no_count"] = 1
+            if need > 1 and rec["no_count"] < need:
+                self._count("rejected_identity_pending")
         elif ans == "?":
             self._count("bound_identity_unknown")
         return ans

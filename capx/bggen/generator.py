@@ -28,12 +28,13 @@ from capx.belief.perception import Category, project_to_pixel
 from capx.belief.som import MarkTable, draw_marks, mark_radius, spread_marks
 from capx.belief.verify import encode_png
 
-from .agent import Plan, PlanError, default_plan, extract_json, parse_plan
+from .agent import Plan, PlanError, default_plan, extract_json, json_error, parse_plan
 from .events import Event, EventConfig, detect_events
 from .geometry import GeoMemory, Geometry
 from .graph import BeliefGraph, GoalTracker, Step, decided
 from .perception import Detection, Detector
 from .prompts import (
+    IDENTITY_CUES,
     agent_prompt,
     identity_prompt,
     init_prompt,
@@ -121,6 +122,15 @@ class GenConfig:
     wrist_grasp_radius: float = 0.10
     unseen_grasp_settle_s: float = 0.5
     unseen_grasp_step_s: float = 0.25
+    # bggen-fix6 A (off by default; B1K: fridge / microwave / countertop): a grasp / close whose target is of one of
+    # these categories (fixed or articulated objects of the scene) OPERATES it -- a door handle is pulled, nothing is
+    # carried: no hold (the track stays where it is and keeps its usual association), no co-motion check, the hand
+    # stays empty. The event names the object (``Event.obj``) until the release, which names it again; it counts as
+    # touched while operated (R7); an openable's (open X) is observed at the grasp and at the release whatever the agent
+    # chose (once per event, like the R9 / A1 release candidates). Why: batch4 (05e842e) open 0.81 -> 0.57, the fridge
+    # held by the hand followed the EEF and its detections were dropped (capped, beyond 1.0 m from the hand), so the
+    # closed door was never seen: (open fridge_A) mem 0.9 vs truth False 17-24 rows per episode.
+    operate_categories: tuple[str, ...] = ()
     cam_still_m: float = 0.01  # 2D path: the camera counts as unmoved since the close within 1 cm and 1 deg
     cam_still_deg: float = 1.0
     agent_retry: int = 0  # extra agent queries after a format failure before the fallback plan
@@ -233,6 +243,8 @@ class Generator:
         self.agent_failures = 0
         self.init_info: dict[str, Any] = {}
         self.identity_calls: list[dict[str, Any]] = []  # fix5 B: VDM identity checks of first bindings
+        self.operating: dict[str, str] = {}  # fix6 A: arm -> fixed / articulated object it closed on (not held)
+        self.operations: list[dict[str, Any]] = []  # fix6 A: every operate / let-go (report)
 
     # --- helpers ---------------------------------------------------------------------------------
     def _arm_name(self, arm: str | None) -> str:
@@ -417,7 +429,7 @@ class Generator:
         """Default-plan statements: relations of the objects around the event, re-checks, goal relations."""
         out: list[EdgeKey] = list(self.verifier.recheck_keys())
         geo: list[tuple[str, str]] = []
-        focus = [a for a in [e.obj] + [self.tracker.held(k) for k in self.arm_keys] if a]
+        focus = [a for a in [e.obj] + [self.tracker.held(k) for k in self.arm_keys] + list(self.operating.values()) if a]
         if e.kind in ("keyframe", "end", "base_stop") and self.tracker.last_released:
             focus.append(self.tracker.last_released)
         for a in dict.fromkeys(focus):
@@ -583,7 +595,13 @@ class Generator:
         info: dict[str, Any] = {"prompt": text_only(msgs), "replies": [], "errors": [], "attempts": [], "categories":
                                 {c.key: c.sam3_text for c in self.categories}, "detections": [d.to_dict() for d in dets]}
         parsed = None
-        for _ in range(cfg.init_retry + 1):
+        # fix6 D (batch4 t06 demo_3: both replies closed goal_branches' brackets early -> "no JSON object"): a reply
+        # whose JSON does not decode is re-asked with the decoder's message and position, for the same content as valid
+        # JSON -- at most once, on top of ``init_retry``. No automatic bracket repair (it could change the content).
+        budget, json_fix = cfg.init_retry + 1, False
+        n = 0
+        while n < budget:
+            n += 1
             text, usage, err, meta = self._query("init", msgs)
             info["replies"].append(text)
             info["attempts"].append({"usage": usage, **meta})
@@ -595,8 +613,18 @@ class Generator:
                 break
             except PlanError as exc:
                 info["errors"].append(str(exc))
+                jerr = json_error(text)
+                if jerr is not None and not json_fix:
+                    json_fix = True
+                    budget += 1
+                    info["json_fix"] = {"attempt": n, "error": jerr}
+                    hint = (f"That reply is not valid JSON: {jerr}. Write the SAME content again as valid JSON (check "
+                            "that every [ and { is closed exactly where it should be; goal_branches is a list of "
+                            "branches, each a list of steps, each step a list of relations). JSON only.")
+                else:
+                    hint = f"That reply could not be used: {exc}. Answer again with JSON only."
                 msgs = msgs + [{"role": "assistant", "content": text}, {"role": "user", "content": [
-                    {"type": "text", "text": f"That reply could not be used: {exc}. Answer again with JSON only."}]}]
+                    {"type": "text", "text": hint}]}]
         if parsed is None:
             parsed = {"branches": [], "observe": [], "remember": [], "expected": {}}
             info["fallback"] = True
@@ -882,6 +910,12 @@ class Generator:
             px = self._eef_pixel(main, fr, arm_key) if main is not None else None
             target, dist = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, px)
             rec["grasp"] = {"target": target, "distance": dist}
+            if target is not None and self._operated(target) and cfg.unseen_grasp:
+                # fix6 A: the hand is inside / at an operated object's box (a hot dog taken out of the fridge whose
+                # box contains the EEF): the wrist camera decides whether a movable object is in the fingers
+                alt, rec["grasp_wrist"] = self._grasp_unseen(e, arm_key, fr, next_gripper_t, wrist_only=True)
+                if alt is not None and not self._operated(alt):
+                    target = alt
             if target is not None:
                 self._take(e, arm_key, fr, main, target, px)
         elif e.kind in ("release", "open") and arm_key is not None:
@@ -891,6 +925,12 @@ class Generator:
             release_pend = self.pending_grasp.pop(arm_key, None)  # resolved with this frame's detections below
             if e.obj:
                 self.graph.events.append(f"robot -release-> {e.obj} @{e.t}")
+            elif (op := self.operating.pop(arm_key, None)) is not None:
+                # fix6 A: the hand lets go of the handle of the object it operated
+                e.obj = op
+                self.graph.events.append(f"robot -let go-> {op} @{e.t}")
+                self.operations.append({"t": e.t, "arm": arm_key, "alias": op, "what": "let go"})
+                rec["operate"] = {"let_go": op}
         elif e.kind == "close_empty" and arm_key is not None:
             target, _ = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, None)
             e.obj = target  # pressed / touched, not held
@@ -902,6 +942,7 @@ class Generator:
             if e.obj:
                 touched_now.add(e.obj)
         touched_now |= {a for a in (self.tracker.held(k) for k in self.arm_keys) if a}
+        touched_now |= {a for a in self.operating.values() if a in self.tracker.tracks}  # fix6 A: operated now
         for a in touched_now:
             self.touched_at[a] = e.t
         robot_keys = self._robot_state(fr, e.t)
@@ -939,7 +980,8 @@ class Generator:
                 touched_now.add(target)
                 self.touched_at[target] = e.t
                 robot_keys |= self._robot_state(fr, e.t)
-                self.verifier.held_off_supports(target, e.t)
+                if not self._operated(target):
+                    self.verifier.held_off_supports(target, e.t)
             elif cfg.unseen_grasp:
                 # bggen-fix5 A: still nothing with a position at the hand -> an expected (never seen) object was taken
                 target, rec["grasp_unseen"] = self._grasp_unseen(e, arm_key, fr, next_gripper_t)
@@ -950,7 +992,8 @@ class Generator:
                     touched_now.add(target)
                     self.touched_at[target] = e.t
                     robot_keys |= self._robot_state(fr, e.t)
-                    self.verifier.held_off_supports(target, e.t)
+                    if not self._operated(target):
+                        self.verifier.held_off_supports(target, e.t)
         for a in self.tracker.tracks:
             self.marks.assign(a, self.tracker.tracks[a].category)
         self.geo.observe_sizes()
@@ -1035,10 +1078,19 @@ class Generator:
         observed: list[tuple[EdgeKey, str]] = []
         accepted: set[EdgeKey] = set()
         vals: dict[EdgeKey, str] = {}
+        # fix6 A: an operated openable's (open X) at its grasp and at its let-go, whatever the agent chose
+        if e.is_gripper and e.kind in ("grasp", "close", "release", "open") and e.obj and self._operated(e.obj) \
+                and self._cat(e.obj) in OPENABLE_KEYS and "open" in cfg.relations:
+            k = ("open", e.obj, None)
+            if k not in plan.observe:
+                plan.observe.append(k)
+                plan.forced.append(statement_text(k))
+            rec["operate_observe"] = statement_text(k)
         # A1: at a release the geometry of the released object vs the nearby marked supports / containers is always
         # computed (and those statements asked), whatever the agent chose
         auto_pairs: list[tuple[str, str]] = []
-        if e.kind == "release" and e.obj and arm_key is not None and e.obj in self.tracker.tracks:
+        if e.kind == "release" and e.obj and arm_key is not None and e.obj in self.tracker.tracks \
+                and not self._operated(e.obj):  # fix6 A: a let-go of a handle places nothing
             auto_pairs = self._release_candidates(e.obj, np.asarray(fr.eef_world(arm_key), float),
                                                   self._eef_pixel(main, fr, arm_key), main.name)
             for a, s in auto_pairs:
@@ -1051,7 +1103,8 @@ class Generator:
             mt = marks_text if obs_cam is main else obs_marks
             vals, tool["observe"] = self._observe(obs_cam, before, url, mt, ev_text, plan.observe, view)
             observed = [(k, vals.get(k, "?")) for k in plan.observe]
-        release = {e.obj: np.asarray(fr.eef_world(arm_key))} if e.kind == "release" and e.obj and arm_key else None
+        release = {e.obj: np.asarray(fr.eef_world(arm_key))} if e.kind == "release" and e.obj and arm_key \
+            and not self._operated(e.obj) else None
         settle = None
         if release is not None and e.obj in self.tracker.tracks and arm_key is not None:
             # B: the released object's on / in geometry at the first settled frame after the release (recorded which)
@@ -1120,7 +1173,15 @@ class Generator:
 
     def _take(self, e: Event, arm_key: str, fr: FrameRecord, main: CameraFrame | None, target: str,
               px: tuple[float, float] | None) -> None:
-        """The gripper holds ``target`` from this event on (``close``: provisionally, checked by co-motion)."""
+        """The gripper holds ``target`` from this event on (``close``: provisionally, checked by co-motion). A fixed /
+        articulated target (fix6 A ``operate_categories``) is operated instead: not held."""
+        if self._operated(target):
+            self.operating[arm_key] = target
+            e.obj = target
+            self.touched_at[target] = e.t
+            self.graph.events.append(f"robot -operate-> {target} @{e.t}")
+            self.operations.append({"t": e.t, "arm": arm_key, "alias": target, "what": "operate", "kind": e.kind})
+            return
         frm = self._support_of(target)
         self.tracker.hold(target, arm_key, fr.eef_world(arm_key))
         self.grasped_at.setdefault(target, []).append(e.t)
@@ -1142,6 +1203,10 @@ class Generator:
                 "loc0": {k: (ed.p, ed.source) for k, ed in self.graph.edges.items()
                          if k[1] == target and k[0] in ("on", "in", "at")}}
 
+    def _operated(self, alias: str) -> bool:
+        """fix6 A: a grasp of this track operates it (fixed / articulated category), never holds it."""
+        return alias in self.tracker.tracks and self._cat(alias) in self.cfg.operate_categories
+
     # --- bggen-fix5 -------------------------------------------------------------------------------------------------
     def _identity_fn(self, cam: CameraFrame) -> Any:
         """B: ``confirm(alias, detection, t)`` for the tracker: the VDM is asked whether the boxed detection in this
@@ -1155,7 +1220,7 @@ class Generator:
             img = Image.fromarray(np.asarray(draw_marks(cam.rgb, [("1", d.pixel)]), dtype=np.uint8))
             lw = max(int(round(min(img.height, img.width) / 160)), 2)
             ImageDraw.Draw(img).rectangle(tuple(float(x) for x in d.box), outline=(255, 0, 0), width=lw)
-            msgs = identity_prompt(text, encode_png(np.asarray(img)), self.cfg.view)
+            msgs = identity_prompt(text, encode_png(np.asarray(img)), self.cfg.view, IDENTITY_CUES.get(cat))
             reply, usage, err, meta = self._query("vdm", msgs)
             ans = "?" if err else parse_identity(reply)
             self.identity_calls.append({"t": t, "alias": alias, "camera": cam.name, "image_t": cam.t, "reply": reply,
@@ -1179,7 +1244,8 @@ class Generator:
             return list(dict.fromkeys(cats)), "goal remaining steps"
         return [c.key for c in self.categories if not is_support(c.key)], "instruction"
 
-    def _grasp_unseen(self, e: Event, arm: str, fr: FrameRecord, next_gripper_t: int) -> tuple[str | None, dict[str, Any]]:
+    def _grasp_unseen(self, e: Event, arm: str, fr: FrameRecord, next_gripper_t: int, wrist_only: bool = False,
+                      ) -> tuple[str | None, dict[str, Any]]:
         """A: the hand closed and no track with a position is within reach. Which expected (never detected) name did it
         take? 1. the arm's wrist camera at the grasp frame (mode A: also later frames before the next gripper event): the
         detection nearest to the EEF by point-to-box distance within ``wrist_grasp_radius`` (movable objects first; a
@@ -1236,6 +1302,13 @@ class Generator:
             d, dist, wt = near
             info["wrist"] = {"category": d.category, "distance": round(dist, 3), "t": wt}
             if is_support(d.category):
+                # fix6 A: a known track of an operated category (the fridge whose handle this is) is operated
+                ops = sorted((float(np.linalg.norm(tr.pos - np.asarray(fr.eef_world(arm), float))), a)
+                             for a, tr in self.tracker.tracks.items() if tr.category == d.category
+                             and d.category in cfg.operate_categories and not tr.expected and tr.pos is not None)
+                if ops:
+                    info.update(result=f"closed on a {d.category} (door / lid handle): operated", alias=ops[0][1])
+                    return ops[0][1], info
                 info["result"] = f"closed on a {d.category} (door / lid handle): nothing bound"
                 return None, info
             if (known := self._known_near(arm, fr, [d.category])) is not None:
@@ -1249,6 +1322,9 @@ class Generator:
             self.tracker.tracks[names[0]].seen_ts.append(e.t)  # detected (wrist camera) at this event
             info.update(result="bound (wrist)", alias=names[0])
             return names[0], info
+        if wrist_only:  # fix6 A: only a wrist detection can overrule an operated target
+            info["result"] = "no wrist detection at the hand (wrist only)"
+            return None, info
         cats, src = self._pointed_categories()
         if (known := self._known_near(arm, fr, cats)) is not None:
             info.update(result="known track near the hand (stale position)", alias=known)
@@ -1547,6 +1623,9 @@ class Generator:
     # --- rows / trace --------------------------------------------------------------------------------
     def _subtask_causal(self) -> str:
         for k in self.arm_keys:
+            if (op := self.operating.get(k)) is not None:
+                return f"manipulate({op})"  # fix6 A: as a held openable read before
+        for k in self.arm_keys:
             a = self.tracker.held(k)
             if a is None:
                 continue
@@ -1638,6 +1717,8 @@ class Generator:
                     # bggen-fix5
                     "grasp_binds": self.tracker.grasp_binds, "identity_checks": self.tracker.identity_checks[:50],
                     "identity_calls": len(self.identity_calls), "relocations": self.tracker.relocations}
+        if self.operations:  # fix6 A (only when it happened: fix5 summaries keep their keys)
+            identity["operations"] = self.operations
         return {"init_failed": self.init_info.get("failed"), "track_identity": identity,
                 "events": kinds, "rows": len(self.rows), "agent_fallbacks": self.agent_failures,
                 "agent_fallback_reasons": reasons, "grasp_checks": self.grasp_checks,

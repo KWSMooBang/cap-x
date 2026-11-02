@@ -66,6 +66,23 @@ def extract_json(text: str) -> Any:
     raise PlanError("no JSON object in the reply")
 
 
+def json_error(text: str) -> str | None:
+    """bggen-fix6 D: where the reply's JSON breaks, for a re-query (None if there is no ``{`` or it parses). The span
+    from the first ``{`` to the last ``}`` is decoded; the error's message, line / column and the text around it."""
+    text = re.sub(r"```(?:json)?", "", text or "")
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    body = text[start:end + 1]
+    try:
+        json.loads(body)
+    except json.JSONDecodeError as exc:
+        lo, hi = max(exc.pos - 60, 0), min(exc.pos + 20, len(body))
+        near = body[lo:exc.pos] + " <HERE> " + body[exc.pos:hi]
+        return f"{exc.msg} at line {exc.lineno} column {exc.colno} (character {exc.pos}): ...{near}..."
+    return None
+
+
 def parse_plan(text: str, names: Sequence[str], arms: Sequence[str | None] = ARMS_ONE, cameras: Sequence[str] = (),
                categories: Sequence[str] = (), offline: bool = False, max_obs: int = 10) -> Plan:
     data = extract_json(text)

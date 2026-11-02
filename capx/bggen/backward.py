@@ -19,6 +19,11 @@ Rule: the label at t says only what was knowable from observations up to t. Allo
   release row (its approach); the row that confirms the end state (Effect) never moves a boundary. Only a close
   on nothing (a press) or on an openable is articulated (open / close / toggle_on / manipulate); a retracted grasp
   of a bowl keeps pick / place labels, and a segment without an Effect keeps them too (B3 logs ``effect []``).
+* B4 keeps the forward boundaries (bggen-fix6 C; ``keep_forward``): every frame where the forward Subtask changed is a
+  boundary of the backward Subtask too. Within each B4 span (a segment's approach, its hold, the rows after the last
+  segment) the B4 label goes to the LAST forward sub-span only; the earlier forward sub-spans keep their forward labels
+  (batch4 B1K 020: one place label over 2030-6432 erased the forward boundary 2933; the tail erased 7537 / 7783). The
+  only exception is two adjacent sub-spans that end up with the same label (merged; logged ``B4-merged``).
 
 Forbidden (enforced, and tested): filling ``?`` from later frames, changing Delta / goal progress,
 writing a hidden process state (cooked behind a closed door) as an observation.
@@ -305,9 +310,12 @@ def _where(row: Any, obj: str) -> str | None:
 
 
 def subtasks(rows: list[Any], segs: list[Segment], categories: dict[str, str], base_moving: Sequence[tuple[int, int]],
-             navigation: bool, done: bool, log: list[dict[str, Any]]) -> None:
+             navigation: bool, done: bool, log: list[dict[str, Any]], keep_forward: bool = True) -> None:
+    fwd = [r.subtask for r in rows]  # the forward (causal) labels, before B4 replaces them
+    spans: set[int] = {0}  # first rows of the B4 spans (approach / hold / tail)
     prev_end = -1
     for s in segs:
+        spans |= {prev_end + 1, s.start_row}
         src = _where(rows[max(s.start_row - 1, 0)], s.obj) or "?"
         er = s.effect_row if s.effect_row is not None else s.end_row
         dst = _where(rows[er], s.obj) or "?"
@@ -341,12 +349,79 @@ def subtasks(rows: list[Any], segs: list[Segment], categories: dict[str, str], b
         log.append({"rule": "B4", "segment": [s.start_t, s.end_t, s.obj], "pick": s.label_pick, "place": s.label_place,
                     "pick_to_place_t": s.start_t, "next_from_t": s.end_t, "confirmed_t": rows[er].t})
     last = segs[-1] if segs else None
+    spans.add(prev_end + 1)
     for i in range(prev_end + 1, len(rows)):  # after the last release: "done" only from the row where the goal was confirmed
         r = rows[i]
         if done and r.goal_total and r.goal_done >= r.goal_total:
             r.subtask = "done"
         elif last is not None:
             r.subtask = last.label_place  # the last place, not yet confirmed as the goal
+    if keep_forward:
+        _keep_forward(rows, fwd, spans, prev_end + 1, log)
+
+
+def _keep_forward(rows: list[Any], fwd: Sequence[str], spans: set[int], tail: int, log: list[dict[str, Any]]) -> None:
+    """bggen-fix6 C: the backward labels keep every forward boundary. Units = runs of one backward label, cut at the B4
+    span starts; a unit with forward boundaries inside keeps the forward labels up to its last forward boundary and the
+    backward label from there (the end of the unit: the pick / place that B4 knows). After the last segment (rows from
+    ``tail``) B4 knows no further segment: a tail unit with forward boundaries inside keeps the forward labels throughout
+    (a ``done`` unit, from the goal-confirmed row, is a normal unit). A forward boundary that would still disappear
+    (the backward label of one side equals the forward label of the other: e.g. the hold's end got the place label the
+    forward rows name right after the release) -> the unit on that side whose end carries the backward label takes the
+    forward labels throughout (``B4-forward-unit``); one that remains (none expected) is logged ``B4-merged``."""
+    n = len(rows)
+    if n < 2 or len(fwd) != n:
+        return
+    bwd = [r.subtask for r in rows]
+    starts = [0] + [i for i in range(1, n) if bwd[i] != bwd[i - 1] or i in spans]
+    units = [[a, starts[u + 1] if u + 1 < len(starts) else n, None] for u, a in enumerate(starts)]  # [a, b, c]
+    unit_of = [0] * n
+    for u, (a, b, _) in enumerate(units):
+        for i in range(a, b):
+            unit_of[i] = u
+    for un in units:
+        a, b, _ = un
+        inner = [i for i in range(a + 1, b) if fwd[i] != fwd[i - 1]]
+        if not inner:
+            un[2] = a  # the backward label throughout
+            continue
+        c = inner[-1]
+        if fwd[c - 1] == bwd[a] or (a >= tail and bwd[a] != "done"):
+            c = b  # forward labels throughout (the tail; or the sub-span before c already reads as the backward label)
+        un[2] = c
+
+    def label(i: int) -> str:
+        return fwd[i] if i < units[unit_of[i]][2] else bwd[i]
+
+    flipped = []
+    for _ in range(len(units) + 1):
+        lost = [i for i in range(1, n) if fwd[i] != fwd[i - 1] and label(i) == label(i - 1)]
+        if not lost:
+            break
+        changed = False
+        for i in lost:
+            for u in (unit_of[i], unit_of[i - 1]):  # the later unit first (the tail after a release)
+                if units[u][2] < units[u][1]:  # this unit carries a backward label: forward throughout
+                    units[u][2] = units[u][1]
+                    flipped.append(rows[units[u][0]].t)
+                    changed = True
+                    break
+        if not changed:
+            break
+    kept = []
+    for a, b, c in units:
+        if c > a:
+            kept.append({"unit": [rows[a].t, rows[b - 1].t], "label": bwd[a], "forward_kept_until": rows[c - 1].t,
+                         "forward_boundaries": [rows[i].t for i in range(a + 1, b) if fwd[i] != fwd[i - 1]]})
+    for i in range(n):
+        rows[i].subtask = label(i)
+    if kept:
+        log.append({"rule": "B4-keep", "units": kept})
+    if flipped:
+        log.append({"rule": "B4-forward-unit", "t": flipped, "why": "a forward boundary at the unit's edge"})
+    merged = [rows[i].t for i in range(1, n) if fwd[i] != fwd[i - 1] and rows[i].subtask == rows[i - 1].subtask]
+    if merged:
+        log.append({"rule": "B4-merged", "t": merged, "why": "adjacent sub-spans with the same label"})
 
 
 def check_forbidden(fwd: Sequence[Any], bwd: Sequence[Any], hidden_keys: Sequence[tuple[int, EdgeKey]] = (),

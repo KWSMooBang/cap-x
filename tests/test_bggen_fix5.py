@@ -329,13 +329,16 @@ def test_oven_detection_is_not_bound_as_the_microwave():
     rep = tr.update(746, "head", [OVEN], confirm=confirm)
     assert rep["dropped"] == 1 and tr.expected() == ["microwave_A"] and asked == [("microwave_A", 746)]
     assert tr.counts["rejected_identity"] == 1 and tr.identity_checks[-1]["answer"] == "0"
-    # the oven again (a little moved): rejected without a call
+    # the oven again (a little moved) at another event: asked again (fix6 B: one 'no' holds back its event only);
+    # the second 'no' rejects the place for good
     tr.update(900, "head", [_det("microwave", 1.05, 2.02, 0.6, (0.6, 0.1, 0.6))], confirm=confirm)
-    assert len(asked) == 1 and tr.counts["rejected_identity_cached"] == 1 and tr.expected() == ["microwave_A"]
+    assert len(asked) == 2 and tr.identity_checks[-1]["asked_again"] and tr.identity_checks[-1]["no_count"] == 2
+    tr.update(950, "head", [_det("microwave", 1.02, 2.01, 0.6, (0.6, 0.1, 0.6))], confirm=confirm)
+    assert len(asked) == 2 and tr.counts["rejected_identity_cached"] == 1 and tr.expected() == ["microwave_A"]
     # the real microwave (with the oven in the same frame): asked, bound
     rep = tr.update(1500, "head", [OVEN, MICRO], confirm=confirm)
     assert tr.expected() == [] and np.allclose(tr.tracks["microwave_A"].pos, MICRO.center)
-    assert len(asked) == 2 and tr.tracks["microwave_A"].bind_note is None and tr.counts["bound_expected"] == 1
+    assert len(asked) == 3 and tr.tracks["microwave_A"].bind_note is None and tr.counts["bound_expected"] == 1
 
 
 def test_identity_unknown_binds_and_marks():
@@ -350,22 +353,23 @@ def test_identity_unknown_binds_and_marks():
 
 
 def test_rejection_without_3d_is_cached_by_camera_pixel_and_calls_are_limited():
-    """Lead review P2: a detection without a world point is cached by its pixel in that camera; at most 5 identity
-    calls per category and episode, then not bound (recorded)."""
+    """Lead review P2: a detection without a world point is cached by its pixel in that camera; at most 8 (fix6 B; fix5
+    5) identity calls per category and episode, then not bound (recorded)."""
     tr, confirm, asked = _mw_tracker(lambda d: "0")
     flat = Detection("microwave", 0.9, (20.0, 30.0), (10, 20, 30, 40))  # no depth
     tr.update(100, "head", [flat], confirm=confirm)
-    tr.update(200, "head", [Detection("microwave", 0.9, (25.0, 32.0), (15, 22, 35, 42))], confirm=confirm)
-    assert len(asked) == 1 and tr.counts["rejected_identity_cached"] == 1
+    tr.update(200, "head", [Detection("microwave", 0.9, (25.0, 32.0), (15, 22, 35, 42))], confirm=confirm)  # 2nd 'no'
+    tr.update(205, "head", [Detection("microwave", 0.9, (24.0, 31.0), (15, 22, 35, 42))], confirm=confirm)
+    assert len(asked) == 2 and tr.counts["rejected_identity_cached"] == 1
     assert tr.identity_checks[-1]["cached"] and tr.identity_checks[-1]["unit"] == "px"
     # another camera: not the cached place
     tr.update(210, "left_wrist", [flat], confirm=confirm)
-    assert len(asked) == 2
-    # five calls per category: the sixth distinct place is not asked and not bound
-    for k in range(6):
+    assert len(asked) == 3
+    # eight calls per category: beyond, a distinct place is not asked and not bound
+    for k in range(8):
         tr.update(300 + k, "head", [_det("microwave", 1.0, 3.0 + k, 0.6, MW)], confirm=confirm)
-    assert tr.cfg.bind_confirm_max_calls == 5 and len(asked) == 5
-    assert tr.counts["identity_limit_skipped"] == 3 and tr.identity_checks[-1]["limit"] == 5
+    assert tr.cfg.bind_confirm_max_calls == 8 and len(asked) == 8
+    assert tr.counts["identity_limit_skipped"] == 3 and tr.identity_checks[-1]["limit"] == 8
     assert tr.expected() == ["microwave_A"]
 
 
@@ -394,15 +398,18 @@ def test_generator_asks_the_vdm_with_a_boxed_image_once_per_binding():
     gen.tracker.expect("microwave", "microwave_A")
     gen.tracker.set_caps({"microwave": 1})
     gen.step(Event(100, "keyframe"), 800)
-    gen.step(Event(200, "keyframe"), 800)
+    gen.step(Event(200, "keyframe"), 800)  # fix6 B: asked again at another event (2nd 'no': the place is rejected)
+    gen.step(Event(300, "keyframe"), 800)
     asked = [m for m in models.vdm.calls if "red box" in _texts(m)]
-    assert len(asked) == 1 and "Is the object in the red box (mark 1) a microwave" in _texts(asked[0])
-    assert gen.trace[-2]["identity"][0]["answer"] == "0" and "identity" not in gen.trace[-1]
+    assert len(asked) == 2 and "Is the object in the red box (mark 1) a microwave" in _texts(asked[0])
+    assert "small box-shaped appliance" in _texts(asked[0])  # fix6 B: the category cue
+    assert gen.trace[-3]["identity"][0]["answer"] == "0" and gen.trace[-2]["identity"][0]["answer"] == "0"
+    assert "identity" not in gen.trace[-1]
     assert gen.tracker.expected() == ["microwave_A"]
     models.vdm.fn = lambda m: "Answer: 1" if "red box" in _texts(m) else "Observe: none"
     gen.step(Event(600, "keyframe"), 800)
     assert gen.tracker.expected() == [] and np.allclose(gen.tracker.tracks["microwave_A"].pos, MICRO.center)
-    assert gen.summary()["track_identity"]["identity_calls"] == 2
+    assert gen.summary()["track_identity"]["identity_calls"] == 3
 
 
 def test_parse_identity():

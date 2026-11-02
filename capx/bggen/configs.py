@@ -65,6 +65,12 @@ def b1k(mode: str = "A") -> GenConfig:
         # are still it, as for cap_assign_exempt).
         # At most 5 identity calls per category and episode (a false detector that wanders defeats the place cache;
         # batch3 010/020 had one oven place): beyond -> not bound, recorded (identity_limit_skipped).
+        # bggen-fix6 B (batch4 010 t1083 / 020 t3361: the real microwave's one VDM 'no' rejected its place for good, the
+        # 38 / 39 later detections there were rejected without a call; 3 / 4 of the 5 calls used): a place is rejected
+        # for good after 2 'no' answers from different events (bind_confirm_reject_n); a first 'no' holds back its own
+        # event only. Calls 5 -> 8: with 2 per rejected place, batch4's oven places (2 per episode: 3 rejections) and the
+        # microwave's first 'no' take up to 2 x 2 + 2 = 6 calls before the real microwave is asked a third time; +2 margin.
+        # One call is ~1 VDM image query (~$0.002 at Qwen3.8-27B rates).
         # C relocate 3 events within 0.3 m (spec): the track moves to a place it keeps being dropped at; evidence
         # accumulates per place and a place must beat the current one; at most 2 moves per track (the first + one
         # correction; two false appliances winning in turn cannot ping-pong).
@@ -73,7 +79,8 @@ def b1k(mode: str = "A") -> GenConfig:
                            large_extent=0.4, cap_from_init=True, cap_assign_radius=1.0,
                            cap_assign_exempt=("countertop",),
                            held_reacquire_radius=0.15, bind_confirm=True, bind_confirm_exempt=("countertop",),
-                           bind_confirm_max_calls=5, relocate_min_events=3, relocate_radius=0.3, relocate_max=2),
+                           bind_confirm_max_calls=8, bind_confirm_reject_n=2,
+                           relocate_min_events=3, relocate_radius=0.3, relocate_max=2),
         verifier=VerifierConfig(flat_dz={}),  # LIBERO table does not apply; first accepted Observe 1 per pair
         cook_s=10.0, navigation_subtask=True,
         # bggen-fix5 A (030: both hot dogs came out of the closed fridge never detected; the grasps at t2057 / t2720 had no
@@ -82,6 +89,11 @@ def b1k(mode: str = "A") -> GenConfig:
         # looks up to 0.5 s later (the fingers / arm may cover the object at the closing frame).
         unseen_grasp=True, arm_cameras={"left": "left_wrist", "right": "right_wrist"}, wrist_grasp_radius=0.10,
         unseen_grasp_settle_s=0.5,
+        # bggen-fix6 A (batch4 05e842e: open 0.81 -> 0.57, (open fridge_A) mem 0.9 vs truth False 17-24 rows in 010-050):
+        # a grasp of the fridge / microwave door handle (or the counter) operates the object, it is never held: the
+        # track stays in place (no hand following, no held reacquire, normal association) and (open X) is observed at
+        # the grasp and the let-go. The scene's fixed / articulated categories = the capped-at-1 ones above.
+        operate_categories=("fridge", "microwave", "countertop"),
     )
 
 
