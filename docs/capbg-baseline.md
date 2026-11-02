@@ -20,6 +20,7 @@ python scripts/gen_capbg_baseline_configs.py --check  # exit 1 if a file is stal
 | Config | Benchmark |
 | --- | --- |
 | `env_configs/capbg_baseline/libero_pro/franka_libero_object_swap_0.yaml` | LIBERO-PRO `libero_object_swap` task 0 (same task as CaP-Agent0) |
+| `env_configs/capbg_baseline/libero_pro/franka_<suite>_<task>.yaml` | the rest of the paper's Table 2: `libero_{object,goal,spatial}_{swap,task}` × tasks 0–9 (60 files with the one above) |
 | `env_configs/capbg_baseline/libero_mem/task_<NN>_<slug>.yaml` | LIBERO-Mem tasks 0–9 (0-based `task_id`; e.g. `task_06_swap_bowls` = `KITCHEN_SCENE1_7`) |
 
 Every config sets these values explicitly instead of relying on defaults:

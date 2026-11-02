@@ -38,10 +38,19 @@ COLUMNS = ["cond", "task", "trial", "reason", "success", "turns", "sim_steps", "
            "cost_usd", "ens_queries", "ens_failed_candidates", "synth_format_errors"]
 
 
+def _missing_row(cond: str, task: str, k: int) -> dict[str, Any]:
+    return {"cond": cond, "task": task, "trial": k, "reason": "missing", "success": 0, "turns": None,
+            "sim_steps": None, "time_s": None, "init_source": None, **dict.fromkeys(COLUMNS[9:], 0),
+            "_by_model": {}, "_ensemble": {}}
+
+
 def collect(run_dir: Path, cond: str, trials: int | None, coding_model: str, vdm_model: str,
-            prices: dict[str, tuple[float, float]]) -> list[dict[str, Any]]:
+            prices: dict[str, tuple[float, float]], *, dir_glob: str = "task_*",
+            dir_re: re.Pattern[str] = TASK_DIR, expected_tasks: list[str] | tuple[str, ...] = ()) -> list[dict[str, Any]]:
+    """One row per (task dir name, trial); ``expected_tasks`` with no directory yet get missing rows (needs
+    ``trials``)."""
     rows: dict[tuple[str, int], dict[str, Any]] = {}
-    task_dirs = sorted(d for d in run_dir.rglob("task_*") if d.is_dir() and TASK_DIR.match(d.name)
+    task_dirs = sorted(d for d in run_dir.rglob(dir_glob) if d.is_dir() and dir_re.match(d.name)
                        and "_incomplete" not in d.parts)
     for task_dir in task_dirs:
         task = task_dir.name
@@ -59,10 +68,29 @@ def collect(run_dir: Path, cond: str, trials: int | None, coding_model: str, vdm
             }
         n = trials or max([k for (t, k) in rows if t == task] or [0])
         for k in range(1, n + 1):
-            rows.setdefault((task, k), {"cond": cond, "task": task, "trial": k, "reason": "missing", "success": 0,
-                                        "turns": None, "sim_steps": None, "time_s": None, "init_source": None,
-                                        **dict.fromkeys(COLUMNS[9:], 0), "_by_model": {}, "_ensemble": {}})
+            rows.setdefault((task, k), _missing_row(cond, task, k))
+    for task in expected_tasks:
+        for k in range(1, (trials or 0) + 1):
+            rows.setdefault((task, k), _missing_row(cond, task, k))
     return sorted(rows.values(), key=lambda r: (r["task"], r["trial"]))
+
+
+def group_table(lines: list[str], groups: dict[str, list[dict[str, Any]]], title: str) -> None:
+    """Append a "## title" table: success, rate, mean turns / sim steps / time / tokens / $, reasons per group."""
+    lines.extend([f"## {title}", "",
+                  "| group | success | rate | turns | sim_steps | time_s | code tok/trial | $/trial | reasons |",
+                  "|---|---|---|---|---|---|---|---|---|"])
+    for name, rs in groups.items():
+        s = sum(r["success"] for r in rs)
+        fin = [r for r in rs if r["reason"] != "missing"]
+        reasons = ", ".join(f"{k} {v}" for k, v in Counter(r["reason"] for r in rs).most_common())
+        code = [r["code_prompt_tok"] + r["code_completion_tok"] for r in fin]
+        lines.append(
+            f"| {name} | {s}/{len(rs)} | {s / len(rs):.0%} | {_mean([r['turns'] for r in fin])} | "
+            f"{_mean([r['sim_steps'] for r in fin])} | {_mean([r['time_s'] for r in fin])} | {_mean(code)} | "
+            f"{_mean([r['cost_usd'] for r in fin]) if fin else '-'} | {reasons} |"
+        )
+    lines.append("")
 
 
 def summarize(rows: list[dict[str, Any]], prices: dict[str, tuple[float, float]]) -> str:
@@ -71,20 +99,7 @@ def summarize(rows: list[dict[str, Any]], prices: dict[str, tuple[float, float]]
              f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", ""]
 
     def table(groups: dict[str, list[dict[str, Any]]], title: str) -> None:
-        lines.extend([f"## {title}", "",
-                      "| group | success | rate | turns | sim_steps | time_s | code tok/trial | $/trial | reasons |",
-                      "|---|---|---|---|---|---|---|---|---|"])
-        for name, rs in groups.items():
-            s = sum(r["success"] for r in rs)
-            fin = [r for r in rs if r["reason"] != "missing"]
-            reasons = ", ".join(f"{k} {v}" for k, v in Counter(r["reason"] for r in rs).most_common())
-            code = [r["code_prompt_tok"] + r["code_completion_tok"] for r in fin]
-            lines.append(
-                f"| {name} | {s}/{len(rs)} | {s / len(rs):.0%} | {_mean([r['turns'] for r in fin])} | "
-                f"{_mean([r['sim_steps'] for r in fin])} | {_mean([r['time_s'] for r in fin])} | {_mean(code)} | "
-                f"{_mean([r['cost_usd'] for r in fin]) if fin else '-'} | {reasons} |"
-            )
-        lines.append("")
+        group_table(lines, groups, title)
 
     by_task: dict[str, list] = defaultdict(list)
     by_init: dict[str, list] = defaultdict(list)

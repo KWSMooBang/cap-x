@@ -24,6 +24,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CAP_AGENT0_CONFIG = REPO_ROOT / "env_configs" / "libero" / "franka_libero_cap_agent0.yaml"
 OUT_ROOT = REPO_ROOT / "env_configs" / "capbg_baseline"
 
+# LIBERO-PRO suites of the CaP-X paper's Table 2 (upstream capx/envs/scripts/run_libero_batch.py), 10 tasks each
+# (Pos = *_swap, Task = *_task). The CaP-Agent0 config's own suite/task (libero_object_swap 0) is one of them.
+LIBERO_PRO_SUITES = ["libero_object_swap", "libero_object_task", "libero_goal_swap", "libero_goal_task",
+                     "libero_spatial_swap", "libero_spatial_task"]
+LIBERO_PRO_TASKS_PER_SUITE = 10
+
 # LIBERO-Mem suite order (0-based task_id) -> (file slug, upstream task name).
 LIBERO_MEM_TASKS = [
     ("pick_bowl_back_on_plate", "KITCHEN_SCENE1_1_pick_up_the_bowl_and_place_it_back_on_the_plate"),
@@ -127,24 +133,32 @@ def _render(*, title: str, extra: str, requires: str, path: str, code_env: str, 
     )
 
 
+def libero_pro_tasks() -> list[tuple[str, int]]:
+    """(suite, task_id) for every LIBERO-PRO config, in suite order."""
+    return [(suite, t) for suite in LIBERO_PRO_SUITES for t in range(LIBERO_PRO_TASKS_PER_SUITE)]
+
+
 def build() -> dict[Path, str]:
     cfg = yaml.safe_load(CAP_AGENT0_CONFIG.read_text())["env"]["cfg"]
     prompts = {"prompt": cfg["prompt"], "multi_turn_prompt": cfg["multi_turn_prompt"]}
     ll = cfg["low_level"]
+    if (ll["suite_name"], ll["task_id"]) not in libero_pro_tasks():
+        raise ValueError(f"CaP-Agent0 task {ll['suite_name']} {ll['task_id']} is not in LIBERO_PRO_SUITES")
     files: dict[Path, str] = {}
 
-    rel = Path("libero_pro") / f"franka_{ll['suite_name']}_{ll['task_id']}.yaml"
-    files[rel] = _render(
-        title=f"LIBERO-PRO {ll['suite_name']} task {ll['task_id']}",
-        extra="--extra libero",
-        requires="uv sync --active --extra libero --extra contactgraspnet (.venv-libero)",
-        path=f"env_configs/capbg_baseline/{rel.as_posix()}",
-        code_env="capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv",
-        low_level="capx.envs.simulators.libero.FrankaLiberoEnv",
-        low_level_args=f"      suite_name: {ll['suite_name']}\n      task_id: {ll['task_id']}\n",
-        output_dir=f"./outputs/capbg_baseline/libero_pro/{ll['suite_name']}_{ll['task_id']}",
-        prompts=prompts,
-    )
+    for suite, task_id in libero_pro_tasks():
+        rel = Path("libero_pro") / f"franka_{suite}_{task_id}.yaml"
+        files[rel] = _render(
+            title=f"LIBERO-PRO {suite} task {task_id}",
+            extra="--extra libero",
+            requires="uv sync --active --extra libero --extra contactgraspnet (.venv-libero)",
+            path=f"env_configs/capbg_baseline/{rel.as_posix()}",
+            code_env="capx.envs.tasks.franka.franka_libero_env.FrankaLiberoCodeEnv",
+            low_level="capx.envs.simulators.libero.FrankaLiberoEnv",
+            low_level_args=f"      suite_name: {suite}\n      task_id: {task_id}\n",
+            output_dir=f"./outputs/capbg_baseline/libero_pro/{suite}_{task_id}",
+            prompts=prompts,
+        )
 
     for task_id, (slug, upstream_name) in enumerate(LIBERO_MEM_TASKS):
         stem = f"task_{task_id:02d}_{slug}"

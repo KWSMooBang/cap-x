@@ -30,6 +30,7 @@ def test_generated_configs_are_current():
 def test_all_benchmarks_covered():
     names = {p.relative_to(BASELINE_DIR).as_posix() for p in BASELINE_CONFIGS}
     assert "libero_pro/franka_libero_object_swap_0.yaml" in names
+    assert len([n for n in names if n.startswith("libero_pro/franka_")]) == 60  # 6 Table-2 suites x 10 tasks
     assert len([n for n in names if n.startswith("libero_mem/task_")]) == 10
 
 

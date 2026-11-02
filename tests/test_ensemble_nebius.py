@@ -35,6 +35,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import analyze_libero_mem_pilot as analyze_mem  # noqa: E402
+import analyze_libero_pro_pilot as analyze_pro  # noqa: E402
 import analyze_robomme_pilot as analyze_rm  # noqa: E402
 import model_costs  # noqa: E402
 import run_ensemble_pilot as ens_pilot  # noqa: E402
@@ -232,14 +233,16 @@ def test_generated_ensemble_configs_are_current():
     names = {p.relative_to(ENS_DIR).as_posix() for p in ENS_CONFIGS}
     assert len([n for n in names if n.startswith("libero_mem/")]) == 10
     assert len([n for n in names if n.startswith("robomme/")]) == 8
+    pro = {n for n in names if n.startswith("libero_pro/")}
+    assert len(pro) == 60 and "libero_pro/franka_libero_spatial_task_9.yaml" in pro
     assert {n.split("/")[1][:7] for n in names if n.startswith("libero_mem/")} == {
         f"task_{i:02d}" for i in range(10)}
 
 
 @pytest.mark.parametrize("path", ENS_CONFIGS, ids=lambda p: p.relative_to(ENS_DIR).as_posix())
 def test_ensemble_config_matches_baseline_except_ensemble(path):
-    if path.parent.name == "libero_mem":
-        base = REPO_ROOT / "env_configs" / "capbg_baseline" / "libero_mem" / path.name
+    if path.parent.name in ("libero_mem", "libero_pro"):
+        base = REPO_ROOT / "env_configs" / "capbg_baseline" / path.parent.name / path.name
     else:
         base = REPO_ROOT / "env_configs" / "robomme" / path.name
     ens, ref = yaml.safe_load(path.read_text()), yaml.safe_load(base.read_text())
@@ -517,6 +520,60 @@ def test_libero_mem_analyzer(tmp_path):
     assert rows[0]["cond"] == "ensemble" and rows[0]["init_source"] == "upstream" and float(rows[0]["cost_usd"]) > 0
     summary = (run / "SUMMARY.md").read_text()
     assert "| task_06_swap_bowls | 1/2 | 50% |" in summary and "## Ensemble" in summary
+
+
+def test_libero_pro_analyzer_merges_split_runs(tmp_path):
+    a, b = tmp_path / "pod_a", tmp_path / "pod_b"
+    end_ok = {"reason": "finish", "task_completed": True, "turns": 2, "sim_steps": 4000, "time_s": 600}
+    end_bad = {"reason": "turn_limit", "task_completed": False, "turns": 12, "sim_steps": 8000, "time_s": 900}
+    _fake_trial(a / SYNTH.replace("/", "_") / "franka_libero_object_swap_0", 1, end_ok, _ensemble_responses())
+    _fake_trial(a / SYNTH.replace("/", "_") / "franka_libero_object_swap_0", 2, end_bad, _ensemble_responses())
+    _fake_trial(b / SYNTH.replace("/", "_") / "franka_libero_goal_task_3", 1, end_ok, _ensemble_responses())
+    for d, tasks in ((a, ["franka_libero_object_swap_0"]),
+                     (b, ["franka_libero_goal_task_3", "franka_libero_spatial_swap_9"])):
+        d.joinpath("pilot_manifest.jsonl").write_text(json.dumps({"bench": "libero_pro", "use_parallel_ensemble": True,
+                                                                  "trials": 2, "model": SYNTH, "tasks": tasks}) + "\n")
+    assert _run_main(analyze_pro, ["analyze", str(a), str(b)]) == 0
+    rows = [ln.split("\t") for ln in (a / "results.tsv").read_text().strip().split("\n")[1:]]
+    assert [(r[0], r[2], r[3], r[4]) for r in rows] == [
+        ("libero_object_swap", "franka_libero_object_swap_0", "1", "finish"),
+        ("libero_object_swap", "franka_libero_object_swap_0", "2", "turn_limit"),
+        ("libero_goal_task", "franka_libero_goal_task_3", "1", "finish"),
+        ("libero_goal_task", "franka_libero_goal_task_3", "2", "missing"),
+        ("libero_spatial_swap", "franka_libero_spatial_swap_9", "1", "missing"),
+        ("libero_spatial_swap", "franka_libero_spatial_swap_9", "2", "missing")]
+    summary = (a / "SUMMARY.md").read_text()
+    assert "| Object Pos | Object Task | Goal Pos | Goal Task | Spatial Pos | Spatial Task | Pos | Task | All |" in summary
+    assert "| success | 50.0% (1/2) | - | - | 50.0% (1/2) | 0.0% (0/2) | - | 25.0% (1/4) | 50.0% (1/2) | 33.3% (2/6) |" \
+        in summary
+
+
+def test_libero_pro_task_specs():
+    assert len(ens_pilot.parse_libero_pro_tasks([])) == 60
+    assert ens_pilot.parse_libero_pro_tasks(["goal_swap:3", "object_swap:1", "libero_object_swap:1"]) == [
+        ("libero_object_swap", 1), ("libero_goal_swap", 3)]
+    whole = ens_pilot.parse_libero_pro_tasks(["spatial_task", "object_task"])
+    assert whole == [("libero_object_task", i) for i in range(10)] + [("libero_spatial_task", i) for i in range(10)]
+    for bad in (["object"], ["object_swap:10"], ["object_swap:x"], ["libero_10_swap"]):
+        with pytest.raises(SystemExit):
+            ens_pilot.parse_libero_pro_tasks(bad)
+    args = ens_pilot.Args(bench="libero_pro", run_name="r", trials=10, tasks=["object_swap"])
+    cfgs = ens_pilot.task_configs(args)
+    assert list(cfgs) == [f"franka_libero_object_swap_{i}" for i in range(10)]
+    cmd = ens_pilot.task_command(args, cfgs["franka_libero_object_swap_0"], 1, Path("/tmp/x"))
+    assert cmd[cmd.index("--total-trials") + 1] == "10"
+    assert "capbg_ensemble/libero_pro" in cmd[cmd.index("--config-path") + 1]
+    assert ens_pilot.ensemble_settings(cfgs["franka_libero_object_swap_0"])["use_multimodel"] is True
+    assert len(ens_pilot.task_configs(ens_pilot.Args(bench="libero_pro", run_name="r"))) == 60
+
+
+def test_libero_pro_trial_k_is_init_state_k_minus_1():
+    from capx.integrations.libero import LiberoHandle
+
+    handle = LiberoHandle.__new__(LiberoHandle)
+    handle.init_states = list(range(50))
+    assert [handle.init_state_index(k) for k in (1, 2, 10, 51)] == [0, 1, 9, 0]
+    assert handle.init_state_index(None) == 0
 
 
 def test_ensemble_pilot_commands():
@@ -1017,7 +1074,7 @@ def test_generator_condition_video_override():
     assert gen_ens.load_condition_video() == {"model": CV_MODEL, "tasks": CV_TASKS, "segment_frames": 0,
                                               "condition_frames": 32}
     video = {Path("robomme") / f"robomme_{t.lower()}.yaml" for t in CV_TASKS}
-    assert len(files) == 18
+    assert len(files) == 78
     for rel, text in files.items():
         if rel not in video:
             assert text == files_none[rel]  # the other 9 configs: no change

@@ -227,8 +227,9 @@ console is the authority.
 
 ## Configs and runner
 
-`scripts/gen_capbg_ensemble_configs.py` writes `env_configs/capbg_ensemble/{libero_mem,robomme}/` (18 files) from
-the baseline configs: LIBERO-Mem tasks 0–9 (`env_configs/capbg_baseline/libero_mem/`) and RoboMME
+`scripts/gen_capbg_ensemble_configs.py` writes `env_configs/capbg_ensemble/{libero_mem,libero_pro,robomme}/` (78
+files) from the baseline configs: LIBERO-Mem tasks 0–9 (`env_configs/capbg_baseline/libero_mem/`), LIBERO-PRO
+6 suites × 10 tasks (`env_configs/capbg_baseline/libero_pro/`, see below) and RoboMME
 PickXtimes, StopCube, VideoUnmaskSwap, ButtonUnmask, PickHighlight, VideoPlaceOrder, MoveCube, PatternLock
 (`env_configs/robomme/`). Only the header, `use_parallel_ensemble` / `use_multimodel` (true), `ensemble`,
 `condition_video_mode: auto` (RoboMME) and `output_dir` differ (`tests/test_ensemble_nebius.py` checks this);
@@ -237,6 +238,36 @@ PickXtimes, StopCube, VideoUnmaskSwap, ButtonUnmask, PickHighlight, VideoPlaceOr
 LIBERO-Mem covers all 10 tasks since 2026-11-02 (the pilot 20261101_ens2_mem5x5 ran tasks 0, 4, 6, 7, 8; those five
 configs are unchanged), so `run_ensemble_pilot.py --bench libero_mem` without `--tasks` now runs tasks 0–9; pass
 `--tasks 1 2 3 5 9` for only the rest (e.g. run 20261102_ens2_mem10x5_rest).
+
+### LIBERO-PRO (CaP-X paper Table 2)
+
+The six suites of the paper's Table 2 / upstream `capx/envs/scripts/run_libero_batch.py` — `libero_object_swap`,
+`libero_object_task`, `libero_goal_swap`, `libero_goal_task`, `libero_spatial_swap`, `libero_spatial_task`
+(Pos = `*_swap`, Task = `*_task`) — × all 10 tasks = 60 configs `libero_pro/franka_<suite>_<task>.yaml`. Each is
+the CaP-Agent0 baseline (`scripts/gen_capbg_baseline_configs.py` now writes all 60; `franka_libero_object_swap_0`
+is byte-identical to before) with the same ensemble block and `output_dir` rule as LIBERO-Mem. Molmo2-8B (:8122,
+`.venv-molmo`) stays outside `api_servers`, as in the baseline. Trial k resets with seed k, i.e. benchmark init
+state k−1 (`LiberoHandle.init_state_index`, the libero-init-fix reset order), so trials 1–10 = init states 0–9.
+
+`run_ensemble_pilot.py --bench libero_pro` (from `.venv-libero`, `MUJOCO_GL=egl`) runs all 60 by default;
+`--tasks` takes whole suites (`object_swap` or `libero_object_swap`) and single tasks (`object_swap:3`), so one
+run can be split over pods by suite with the same `--run-name`. `scripts/analyze_libero_pro_pilot.py <run dir>
+[<run dir> ...]` merges every `franka_libero_*` task directory under the given directories (one shared volume: pass
+the run once; separate volumes: copy the pods' run directories together and pass them all), counts tasks listed in
+any `pilot_manifest.jsonl` but without results as missing, and writes `results.tsv` (with a `suite` column) and
+`SUMMARY.md`: a Table 2 row (Object / Goal / Spatial × Pos / Task, then Pos, Task, All), by suite, by task, cost by
+model and ensemble statistics.
+
+Differences from the paper's LIBERO-PRO setting (upstream `run_libero_batch.py` + the CaP-Agent0 config):
+
+| | paper / upstream | here |
+| --- | --- | --- |
+| Coding models | upstream ensemble defaults (`capx/llm/client.py` `ENSEMBLE_CONFIGS` / `DEFAULT_SYNTHESIS_MODEL`; batch default model `google/gemini-3.1-pro-preview`) | Nebius ensemble from `models.json` (3 models × 3 temperatures, DeepSeek-V4-Pro synthesis) |
+| VDM | the coding model | Qwen3.8-27B (`--visual-differencing-model`) |
+| Trials per task | every init state (50) | 10 (init states 0–9) |
+| Wall-clock limit | none | 3600 s per trial, 1 attempt |
+| Parallelism | 10 trial workers per task | 1 sequential worker per task, `--workers` tasks at a time |
+| `max_tokens` / temperature | 20480 / 1.0 | 32768 / the candidates' temperatures |
 
 Candidates and the synthesis model are arguments; the choice is kept in `env_configs/capbg_ensemble/models.json`, so
 later runs and `--check` reuse it:
@@ -332,12 +363,25 @@ kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg && git fetch origin
     > logs/20261101_ens2_robomme8x5_video.out 2>&1 &'
 ```
 
+(2c) LIBERO-PRO, 6 suites × 10 tasks × 10 trials, split over pods by suite (same run name; rerun the same command
+to resume). `.venv-libero`, Molmo server up as above; one command per pod:
+
+```bash
+kubectl exec -it <GPU_POD_1> -- bash -lc 'cd /workspace/cap-bg && git fetch origin && git checkout exp/ensemble-nebius &&
+  git pull --ff-only origin exp/ensemble-nebius &&
+  MUJOCO_GL=egl PYOPENGL_PLATFORM=egl nohup .venv-libero/bin/python scripts/run_ensemble_pilot.py \
+    --bench libero_pro --run-name 20261102_ens2liberopro_6x10x10 --tasks object_swap object_task --trials 10 \
+    --workers 2 > logs/20261102_ens2liberopro_6x10x10_object.out 2>&1 &'
+# <GPU_POD_2>: --tasks goal_swap goal_task (..._goal.out); <GPU_POD_3>: --tasks spatial_swap spatial_task (..._spatial.out)
+```
+
 (3) Aggregate:
 
 ```bash
 kubectl exec -it <GPU_POD> -- bash -lc 'cd /workspace/cap-bg &&
   .venv-libero-mem/bin/python scripts/analyze_libero_mem_pilot.py outputs/capbg_ensemble/20261102_ens_mem5x5 &&
-  .venv-robomme/bin/python scripts/analyze_robomme_pilot.py outputs/capbg_ensemble/20261102_ens_robomme8x5'
+  .venv-robomme/bin/python scripts/analyze_robomme_pilot.py outputs/capbg_ensemble/20261102_ens_robomme8x5 &&
+  .venv-libero/bin/python scripts/analyze_libero_pro_pilot.py outputs/capbg_ensemble/20261102_ens2liberopro_6x10x10'
 ```
 
 ### Expected calls

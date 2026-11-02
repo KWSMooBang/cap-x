@@ -1,6 +1,6 @@
-"""Generate the Nebius ensemble pilot configs (env_configs/capbg_ensemble/{libero_mem,robomme}/).
+"""Generate the Nebius ensemble pilot configs (env_configs/capbg_ensemble/{libero_mem,libero_pro,robomme}/).
 
-Each file is the matching baseline config (env_configs/capbg_baseline/libero_mem/ or env_configs/robomme/) with
+Each file is the matching baseline config (env_configs/capbg_baseline/{libero_mem,libero_pro}/ or env_configs/robomme/) with
 only these changes: the header, ``use_parallel_ensemble`` / ``use_multimodel`` on, the ``ensemble`` block
 (candidates x temperatures and the synthesis model), ``condition_video_mode: auto`` (RoboMME) and
 ``output_dir`` under ./outputs/capbg_ensemble/. Prompts, APIs, servers, VDM, budgets and the rest are the
@@ -35,8 +35,11 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))  # capx (text-only model list, candidate parser)
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+from gen_capbg_baseline_configs import LIBERO_PRO_SUITES, libero_pro_tasks  # noqa: E402,F401
 OUT_ROOT = REPO_ROOT / "env_configs" / "capbg_ensemble"
 BASELINE_LIBERO_MEM = REPO_ROOT / "env_configs" / "capbg_baseline" / "libero_mem"
+BASELINE_LIBERO_PRO = REPO_ROOT / "env_configs" / "capbg_baseline" / "libero_pro"
 BASELINE_ROBOMME = REPO_ROOT / "env_configs" / "robomme"
 
 # Pilot tasks (lead, 2026-11-01); LIBERO-Mem extended to all 10 tasks (2026-11-02).
@@ -166,7 +169,7 @@ def _strip_header(text: str) -> str:
 
 
 def _convert(text: str, *, robomme: bool, title: str, baseline: str, bench: str, out_old: str, out_new: str,
-             candidates: list[tuple[str, list[float]]], synthesis: str, cv: dict | None = None) -> str:
+             venv: str, candidates: list[tuple[str, list[float]]], synthesis: str, cv: dict | None = None) -> str:
     body = _strip_header(text)
     off = "use_parallel_ensemble: false\nuse_multimodel: false\n"
     if body.count(off) != 1:
@@ -180,7 +183,6 @@ def _convert(text: str, *, robomme: bool, title: str, baseline: str, bench: str,
         if body.count(frames) != 1:
             raise ValueError(f"{baseline}: expected one {frames!r}")
         body = body.replace(frames, f"      condition_frames: {int(cv['condition_frames'])}\n")
-    venv = ".venv-robomme" if robomme else ".venv-libero-mem"
     cv_note = CV_NOTE if robomme else ""
     if cv is not None:
         how = "in one call" if cv.get("segment_frames") == 0 else "in parts"
@@ -207,9 +209,19 @@ def build(candidates: list[tuple[str, list[float]]] | None = None, synthesis: st
         rel = src.relative_to(REPO_ROOT).as_posix()
         files[Path("libero_mem") / src.name] = _convert(
             src.read_text(), robomme=False, title=f"LIBERO-Mem task {idx} ({src.stem})", baseline=rel,
-            bench="libero_mem",
+            bench="libero_mem", venv=".venv-libero-mem",
             out_old=f"output_dir: ./outputs/capbg_baseline/libero_mem/{src.stem}",
             out_new=f"output_dir: ./outputs/capbg_ensemble/libero_mem/{src.stem}",
+            candidates=candidates, synthesis=synthesis,
+        )
+    for suite, idx in libero_pro_tasks():
+        src = BASELINE_LIBERO_PRO / f"franka_{suite}_{idx}.yaml"
+        rel = src.relative_to(REPO_ROOT).as_posix()
+        files[Path("libero_pro") / src.name] = _convert(
+            src.read_text(), robomme=False, title=f"LIBERO-PRO {suite} task {idx} (trial k = init state k-1)",
+            baseline=rel, bench="libero_pro", venv=".venv-libero",
+            out_old=f"output_dir: ./outputs/capbg_baseline/libero_pro/{suite}_{idx}",
+            out_new=f"output_dir: ./outputs/capbg_ensemble/libero_pro/{suite}_{idx}",
             candidates=candidates, synthesis=synthesis,
         )
     for task in ROBOMME_TASKS:
@@ -218,7 +230,7 @@ def build(candidates: list[tuple[str, list[float]]] | None = None, synthesis: st
         rel = src.relative_to(REPO_ROOT).as_posix()
         files[Path("robomme") / src.name] = _convert(
             src.read_text(), robomme=True, title=f"RoboMME {task} (trial k = test episode k-1)", baseline=rel,
-            bench="robomme",
+            bench="robomme", venv=".venv-robomme",
             out_old=f"output_dir: ./outputs/robomme/{stem}",
             out_new=f"output_dir: ./outputs/capbg_ensemble/robomme/{stem}",
             candidates=candidates, synthesis=synthesis,

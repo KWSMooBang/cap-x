@@ -1,4 +1,4 @@
-"""Run the Nebius ensemble pilot (env_configs/capbg_ensemble/) on LIBERO-Mem or RoboMME, resumable.
+"""Run the Nebius ensemble pilot (env_configs/capbg_ensemble/) on LIBERO-Mem, LIBERO-PRO or RoboMME, resumable.
 
 Same scheme as scripts/run_robomme_pilot.py (whose resume helpers it uses): each task is one
 ``capx/envs/launch.py`` process with one sequential worker, ``--workers`` tasks run at a time, a trial is done
@@ -6,13 +6,18 @@ when its directory has ``trial_end.json``, and a rerun of the same command resum
 unfinished trial (half-written trial directories go to ``_incomplete/``).
 
 Trials: LIBERO-Mem trial k resets with seed k, which picks its init state (same inits as the baseline pilots,
-trials 1-5); RoboMME trial k plays test episode k-1 (episodes 0-4). Models come from the configs (ensemble
+trials 1-5); LIBERO-PRO trial k resets with seed k = benchmark init state k-1 (LiberoHandle.init_state_index);
+RoboMME trial k plays test episode k-1 (episodes 0-4). Models come from the configs (ensemble
 candidates / synthesis); ``--model`` only names the output directory (launch.py inserts it) and is the synthesis model by default.
 
     export NEBIUS_SERVER_URL=... NEBIUS_API_KEY=...
     python scripts/run_ensemble_pilot.py --bench libero_mem --run-name 20261102_ens_mem --workers 2
     python scripts/run_ensemble_pilot.py --bench robomme --run-name 20261102_ens_robomme --workers 2
+    # LIBERO-PRO (.venv-libero): all 60 tasks, or whole suites / single tasks (split a run over pods):
+    python scripts/run_ensemble_pilot.py --bench libero_pro --run-name 20261102_ens_pro --trials 10 \
+        --tasks object_swap object_task goal_swap:0 goal_swap:3
     python scripts/analyze_libero_mem_pilot.py outputs/capbg_ensemble/20261102_ens_mem
+    python scripts/analyze_libero_pro_pilot.py outputs/capbg_ensemble/20261102_ens_pro
     python scripts/analyze_robomme_pilot.py outputs/capbg_ensemble/20261102_ens_robomme
 
 Outputs: outputs/capbg_ensemble/<run>/<model>/<config stem>/trial_XX_*/, logs in logs/capbg_ensemble/<run>/,
@@ -35,20 +40,24 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
-from gen_capbg_ensemble_configs import LIBERO_MEM_TASKS, ROBOMME_TASKS, SYNTHESIS_MODEL, VDM_MODEL  # noqa: E402
+from gen_capbg_ensemble_configs import (  # noqa: E402
+    LIBERO_MEM_TASKS, LIBERO_PRO_SUITES, ROBOMME_TASKS, SYNTHESIS_MODEL, VDM_MODEL, libero_pro_tasks,
+)
 from run_robomme_pilot import finished_trials, first_unfinished, quarantine_incomplete  # noqa: E402
 
-BENCHES = ("libero_mem", "robomme")
+BENCHES = ("libero_mem", "libero_pro", "robomme")
 
 
 @dataclass
 class Args:
     bench: str
-    """libero_mem or robomme."""
+    """libero_mem, libero_pro or robomme."""
     run_name: str
     """Run directory name, e.g. 20261102_ens_mem."""
     tasks: list[str] = field(default_factory=list)
-    """LIBERO-Mem task indices (0-9) or RoboMME task names; default: all 10 LIBERO-Mem tasks / the 8 RoboMME pilot tasks."""
+    """LIBERO-Mem task indices (0-9); LIBERO-PRO suites (object_swap or libero_object_swap = its 10 tasks) or
+    suite:task (object_swap:3); RoboMME task names. Default: all 10 LIBERO-Mem / all 60 LIBERO-PRO / the 8 RoboMME
+    pilot tasks."""
     workers: int = 2
     """Task processes running at the same time."""
     trials: int = 5
@@ -75,6 +84,27 @@ class Args:
     """Extra launch.py flags, e.g. --extra --condition-video-mode --extra images."""
 
 
+def parse_libero_pro_tasks(specs: list[str]) -> list[tuple[str, int]]:
+    """``object_swap`` / ``libero_object_swap`` (whole suite) or ``object_swap:3`` -> [(suite, task)], in suite
+    order without duplicates; no specs = all 60."""
+    if not specs:
+        return libero_pro_tasks()
+    known = set(libero_pro_tasks())
+    wanted: set[tuple[str, int]] = set()
+    for spec in specs:
+        name, sep, idx = spec.partition(":")
+        suite = name if name.startswith("libero_") else f"libero_{name}"
+        if suite not in LIBERO_PRO_SUITES:
+            raise SystemExit(f"unknown LIBERO-PRO suite {name!r} (one of {LIBERO_PRO_SUITES}, 'libero_' optional)")
+        if not sep:
+            wanted |= {(s, t) for s, t in known if s == suite}
+            continue
+        if not idx.isdigit() or (suite, int(idx)) not in known:
+            raise SystemExit(f"bad LIBERO-PRO task {spec!r}: expected suite:task with task 0-9")
+        wanted.add((suite, int(idx)))
+    return [st for st in libero_pro_tasks() if st in wanted]
+
+
 def task_configs(args: Args) -> dict[str, Path]:
     """Task label -> config path, in pilot order."""
     cdir = REPO_ROOT / (args.config_dir or f"env_configs/capbg_ensemble/{args.bench}")
@@ -86,6 +116,14 @@ def task_configs(args: Args) -> dict[str, Path]:
             if not found:
                 raise SystemExit(f"no config for LIBERO-Mem task {idx} in {cdir}")
             out[found[0].stem] = found[0]
+        return out
+    if args.bench == "libero_pro":
+        out = {}
+        for suite, idx in parse_libero_pro_tasks(args.tasks):
+            path = cdir / f"franka_{suite}_{idx}.yaml"
+            if not path.exists():
+                raise SystemExit(f"no config for LIBERO-PRO {suite} task {idx} in {cdir}")
+            out[path.stem] = path
         return out
     wanted = args.tasks or ROBOMME_TASKS
     out = {}
