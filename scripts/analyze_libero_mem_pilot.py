@@ -31,6 +31,7 @@ from analyze_robomme_pilot import (  # noqa: E402
     token_counts,
 )
 from model_costs import DEFAULT_PRICES, load_prices  # noqa: E402
+from trial_end_fields import success_error_lines, success_of  # noqa: E402
 
 TASK_DIR = re.compile(r"^task_(\d{2})_")
 COLUMNS = ["cond", "task", "trial", "reason", "success", "turns", "sim_steps", "time_s", "init_source",
@@ -60,9 +61,12 @@ def collect(run_dir: Path, cond: str, trials: int | None, coding_model: str, vdm
             resp_path = end_path.parent / "all_responses.json"
             responses = json.loads(resp_path.read_text()) if resp_path.exists() else []
             init = next((r.get("init_source") for r in responses if r.get("decision") == "initial"), None)
+            success, success_err = success_of(end, end_path)
+            if success_err:
+                print(f"WARNING: {success_err} (counted as failure)", file=sys.stderr)
             rows[(task, int(end["trial"]))] = {
                 "cond": cond, "task": task, "trial": int(end["trial"]), "reason": end.get("reason"),
-                "success": int(bool(end.get("task_completed"))), "turns": end.get("turns"),
+                "success": success, "success_error": success_err, "turns": end.get("turns"),
                 "sim_steps": end.get("sim_steps"), "time_s": end.get("time_s"), "init_source": init,
                 **token_counts(responses, coding_model, vdm_model, prices),
             }
@@ -96,7 +100,7 @@ def group_table(lines: list[str], groups: dict[str, list[dict[str, Any]]], title
 def summarize(rows: list[dict[str, Any]], prices: dict[str, tuple[float, float]]) -> str:
     done = [r for r in rows if r["reason"] != "missing"]
     lines = [f"# LIBERO-Mem pilot summary ({rows[0]['cond'] if rows else '?'})", "",
-             f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", ""]
+             f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", "", *success_error_lines(rows)]
 
     def table(groups: dict[str, list[dict[str, Any]]], title: str) -> None:
         group_table(lines, groups, title)

@@ -31,6 +31,7 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from gen_robomme_configs import TASKS  # noqa: E402
 from model_costs import DEFAULT_PRICES, cost_by_model, cost_table, load_prices, merge_usage, trial_usage  # noqa: E402
+from trial_end_fields import success_error_lines, success_of  # noqa: E402
 
 TASK_BY_STEM = {f"robomme_{t.lower()}": t for t, _ in TASKS}
 SUITE = dict(TASKS)
@@ -77,9 +78,12 @@ def collect(
             end = json.loads(end_path.read_text())
             resp_path = end_path.parent / "all_responses.json"
             responses = json.loads(resp_path.read_text()) if resp_path.exists() else []
+            success, success_err = success_of(end, end_path)
+            if success_err:
+                print(f"WARNING: {success_err} (counted as failure)", file=sys.stderr)
             rows[(task, int(end["trial"]))] = {
                 "cond": cond, "task": task, "trial": int(end["trial"]), "reason": end.get("reason"),
-                "success": int(bool(end.get("task_completed"))), "turns": end.get("turns"),
+                "success": success, "success_error": success_err, "turns": end.get("turns"),
                 "sim_steps": end.get("sim_steps"), "time_s": end.get("time_s"),
                 **token_counts(responses, coding_model, vdm_model, prices),
             }
@@ -100,7 +104,7 @@ def _mean(vals: list[Any]) -> str:
 def summarize(rows: list[dict[str, Any]], prices: dict[str, tuple[float, float]] | None = None) -> str:
     done = [r for r in rows if r["reason"] != "missing"]
     lines = [f"# RoboMME pilot summary ({rows[0]['cond'] if rows else '?'})", "",
-             f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", ""]
+             f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", "", *success_error_lines(rows)]
 
     def table(groups: dict[str, list[dict[str, Any]]], title: str) -> None:
         lines.extend([f"## {title}", "",

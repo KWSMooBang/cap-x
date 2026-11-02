@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from analyze_libero_mem_pilot import COLUMNS, collect, group_table  # noqa: E402
 from analyze_robomme_pilot import DEFAULT_CODING_MODEL, DEFAULT_VDM_MODEL, cost_and_ensemble_sections  # noqa: E402
 from model_costs import DEFAULT_PRICES, load_prices  # noqa: E402
+from trial_end_fields import success_error_lines  # noqa: E402
 
 TASK_DIR = re.compile(r"^franka_(libero_(?:object|goal|spatial)_(?:swap|task))_(\d+)$")
 FAMILIES = ["object", "goal", "spatial"]
@@ -80,7 +81,7 @@ def summarize(rows: list[dict[str, Any]], prices: dict[str, tuple[float, float]]
         by_suite[suite_of(r["task"])].append(r)
         by_task[r["task"]].append(r)
     lines = [f"# LIBERO-PRO pilot summary ({rows[0]['cond'] if rows else '?'})", "",
-             f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", "",
+             f"Finished trials: {len(done)} / {len(rows)} (missing trials count as failures below).", "", *success_error_lines(rows),
              "## Table 2 layout (success rate; Pos = *_swap, Task = *_task)", "",
              "| | " + " | ".join(f"{f.capitalize()} {name}" for f in FAMILIES for _, name in PERTURBATIONS)
              + " | Pos | Task | All |",
