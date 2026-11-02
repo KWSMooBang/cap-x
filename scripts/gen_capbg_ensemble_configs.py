@@ -39,8 +39,8 @@ OUT_ROOT = REPO_ROOT / "env_configs" / "capbg_ensemble"
 BASELINE_LIBERO_MEM = REPO_ROOT / "env_configs" / "capbg_baseline" / "libero_mem"
 BASELINE_ROBOMME = REPO_ROOT / "env_configs" / "robomme"
 
-# Pilot tasks (lead, 2026-11-01).
-LIBERO_MEM_TASKS = [0, 4, 6, 7, 8]
+# Pilot tasks (lead, 2026-11-01); LIBERO-Mem extended to all 10 tasks (2026-11-02).
+LIBERO_MEM_TASKS = list(range(10))
 ROBOMME_TASKS = ["PickXtimes", "StopCube", "VideoUnmaskSwap", "ButtonUnmask", "PickHighlight", "VideoPlaceOrder",
                  "MoveCube", "PatternLock"]
 

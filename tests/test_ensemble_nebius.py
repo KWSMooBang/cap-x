@@ -230,10 +230,10 @@ def test_generated_ensemble_configs_are_current():
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
     names = {p.relative_to(ENS_DIR).as_posix() for p in ENS_CONFIGS}
-    assert len([n for n in names if n.startswith("libero_mem/")]) == 5
+    assert len([n for n in names if n.startswith("libero_mem/")]) == 10
     assert len([n for n in names if n.startswith("robomme/")]) == 8
     assert {n.split("/")[1][:7] for n in names if n.startswith("libero_mem/")} == {
-        "task_00", "task_04", "task_06", "task_07", "task_08"}
+        f"task_{i:02d}" for i in range(10)}
 
 
 @pytest.mark.parametrize("path", ENS_CONFIGS, ids=lambda p: p.relative_to(ENS_DIR).as_posix())
@@ -522,7 +522,9 @@ def test_libero_mem_analyzer(tmp_path):
 def test_ensemble_pilot_commands():
     args = ens_pilot.Args(bench="libero_mem", run_name="r")
     cfgs = ens_pilot.task_configs(args)
-    assert [s[:7] for s in cfgs] == ["task_00", "task_04", "task_06", "task_07", "task_08"]
+    assert [s[:7] for s in cfgs] == [f"task_{i:02d}" for i in range(10)]
+    rest = ens_pilot.task_configs(ens_pilot.Args(bench="libero_mem", run_name="r", tasks=["1", "2", "3", "5", "9"]))
+    assert [s[:7] for s in rest] == ["task_01", "task_02", "task_03", "task_05", "task_09"]
     cmd = ens_pilot.task_command(args, next(iter(cfgs.values())), 2, Path("/tmp/x"))
     assert cmd[cmd.index("--resume-idx") + 1] == "2" and cmd[cmd.index("--total-trials") + 1] == "5"
     assert cmd[cmd.index("--trial-timeout-s") + 1] == "3600" and cmd[cmd.index("--model") + 1] == SYNTH
@@ -1015,7 +1017,7 @@ def test_generator_condition_video_override():
     assert gen_ens.load_condition_video() == {"model": CV_MODEL, "tasks": CV_TASKS, "segment_frames": 0,
                                               "condition_frames": 32}
     video = {Path("robomme") / f"robomme_{t.lower()}.yaml" for t in CV_TASKS}
-    assert len(files) == 13
+    assert len(files) == 18
     for rel, text in files.items():
         if rel not in video:
             assert text == files_none[rel]  # the other 9 configs: no change

@@ -227,12 +227,16 @@ console is the authority.
 
 ## Configs and runner
 
-`scripts/gen_capbg_ensemble_configs.py` writes `env_configs/capbg_ensemble/{libero_mem,robomme}/` (13 files) from
-the baseline configs: LIBERO-Mem tasks 0, 4, 6, 7, 8 (`env_configs/capbg_baseline/libero_mem/`) and RoboMME
+`scripts/gen_capbg_ensemble_configs.py` writes `env_configs/capbg_ensemble/{libero_mem,robomme}/` (18 files) from
+the baseline configs: LIBERO-Mem tasks 0–9 (`env_configs/capbg_baseline/libero_mem/`) and RoboMME
 PickXtimes, StopCube, VideoUnmaskSwap, ButtonUnmask, PickHighlight, VideoPlaceOrder, MoveCube, PatternLock
 (`env_configs/robomme/`). Only the header, `use_parallel_ensemble` / `use_multimodel` (true), `ensemble`,
 `condition_video_mode: auto` (RoboMME) and `output_dir` differ (`tests/test_ensemble_nebius.py` checks this);
 `memory_mode` stays `none`. `--check` exits 1 when a file is stale.
+
+LIBERO-Mem covers all 10 tasks since 2026-11-02 (the pilot 20261101_ens2_mem5x5 ran tasks 0, 4, 6, 7, 8; those five
+configs are unchanged), so `run_ensemble_pilot.py --bench libero_mem` without `--tasks` now runs tasks 0–9; pass
+`--tasks 1 2 3 5 9` for only the rest (e.g. run 20261102_ens2_mem10x5_rest).
 
 Candidates and the synthesis model are arguments; the choice is kept in `env_configs/capbg_ensemble/models.json`, so
 later runs and `--check` reuse it:

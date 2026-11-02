@@ -48,7 +48,7 @@ class Args:
     run_name: str
     """Run directory name, e.g. 20261102_ens_mem."""
     tasks: list[str] = field(default_factory=list)
-    """LIBERO-Mem task indices (0 4 6 7 8) or RoboMME task names; default: the pilot's tasks."""
+    """LIBERO-Mem task indices (0-9) or RoboMME task names; default: all 10 LIBERO-Mem tasks / the 8 RoboMME pilot tasks."""
     workers: int = 2
     """Task processes running at the same time."""
     trials: int = 5
