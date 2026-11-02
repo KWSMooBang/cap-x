@@ -552,10 +552,12 @@ class FrankaLiberoEnv(BaseEnv):
             self._record_frame()
 
     def get_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
-        frames = [frame.copy() for frame in self._frame_buffer]
+        # clear=True hands the recorded frames over instead of copying them: a trial records up to
+        # ~2000 frames (1.2 MB each at 800x512), and a copy held them twice at the end of every trial.
         if clear:
-            self._frame_buffer.clear()
-        return frames
+            frames, self._frame_buffer = self._frame_buffer, []
+            return frames
+        return [frame.copy() for frame in self._frame_buffer]
 
     def get_video_frame_count(self) -> int:
         return len(self._frame_buffer)
@@ -564,10 +566,10 @@ class FrankaLiberoEnv(BaseEnv):
         return [frame.copy() for frame in self._frame_buffer[start:end]]
 
     def get_wrist_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
-        frames = [frame.copy() for frame in self._wrist_frame_buffer]
         if clear:
-            self._wrist_frame_buffer.clear()
-        return frames
+            frames, self._wrist_frame_buffer = self._wrist_frame_buffer, []
+            return frames
+        return [frame.copy() for frame in self._wrist_frame_buffer]
 
     def get_wrist_video_frames_range(self, start: int, end: int) -> list[np.ndarray]:
         return [frame.copy() for frame in self._wrist_frame_buffer[start:end]]
@@ -582,7 +584,8 @@ class FrankaLiberoEnv(BaseEnv):
             height=self._render_height,
             depth=False,
         )
-        self._frame_buffer.append(frame[::-1])  # Flip vertically
+        # Flip vertically; a contiguous copy, so the buffer holds plain frames (handed over as they are).
+        self._frame_buffer.append(np.ascontiguousarray(frame[::-1]))
 
         if self._record_wrist_camera:
             wrist_frame = self.handle.env.sim.render(
@@ -591,7 +594,7 @@ class FrankaLiberoEnv(BaseEnv):
                 height=self._render_height,
                 depth=False,
             )
-            self._wrist_frame_buffer.append(wrist_frame[::-1])
+            self._wrist_frame_buffer.append(np.ascontiguousarray(wrist_frame[::-1]))
 
     def render(self, mode: str = "rgb_array") -> np.ndarray:  # type: ignore[override]
         if mode != "rgb_array":

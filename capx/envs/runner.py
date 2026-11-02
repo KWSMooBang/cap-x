@@ -35,6 +35,7 @@ from capx.utils.launch_utils import (
     _save_trial_artifacts,
     run_server_proc,
 )
+from capx.utils.mem_utils import release_memory, rss_mb
 from capx.utils.parallel_eval import run_parallel_with_setup
 
 # ---------------------------------------------------------------------------
@@ -228,6 +229,8 @@ def _run_trial_with_retries(
             )
         except TimeoutError:
             print(f"Trial {trial} timed out (attempt {attempt + 1}/{max_retries}). Retrying...")
+        finally:
+            _release_trial_memory(trial, attempt)
 
     # All retries exhausted
     return TrialSummary(
@@ -244,6 +247,20 @@ def _run_trial_with_retries(
         num_finishes=0,
         num_code_blocks=0,
     )
+
+
+def _release_trial_memory(trial: int, attempt: int) -> None:
+    """Return the memory a finished trial attempt freed (its frames, renders, prompts) to the OS.
+
+    The env is reused for the next trial in this process; without this the freed heap stayed in the
+    process and RSS grew by about one trial's video frames per trial (see capx.utils.mem_utils).
+    """
+    before = rss_mb()
+    trimmed = release_memory()
+    after = rss_mb()
+    if before is not None and after is not None:
+        print(f"[mem] trial {trial} attempt {attempt + 1}: rss {before:.0f} MB -> {after:.0f} MB"
+              f"{'' if trimmed else ' (no trim)'}")
 
 
 def _run_trial_batch(

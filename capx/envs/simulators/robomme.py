@@ -347,10 +347,10 @@ class RoboMMEEnv(BaseEnv):
                 self._wrist_frame_buffer.append(wrist)
 
     def get_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
-        frames = [f.copy() for f in self._frame_buffer]
-        if clear:
-            self._frame_buffer.clear()
-        return frames
+        if clear:  # hand the frames over (no second copy of a whole trial's frames)
+            frames, self._frame_buffer = self._frame_buffer, []
+            return frames
+        return [f.copy() for f in self._frame_buffer]
 
     def get_video_frame_count(self) -> int:
         return len(self._frame_buffer)
@@ -359,10 +359,10 @@ class RoboMMEEnv(BaseEnv):
         return [f.copy() for f in self._frame_buffer[start:end]]
 
     def get_wrist_video_frames(self, *, clear: bool = False) -> list[np.ndarray]:
-        frames = [f.copy() for f in self._wrist_frame_buffer]
         if clear:
-            self._wrist_frame_buffer.clear()
-        return frames
+            frames, self._wrist_frame_buffer = self._wrist_frame_buffer, []
+            return frames
+        return [f.copy() for f in self._wrist_frame_buffer]
 
     def get_wrist_video_frames_range(self, start: int, end: int) -> list[np.ndarray]:
         return [f.copy() for f in self._wrist_frame_buffer[start:end]]
