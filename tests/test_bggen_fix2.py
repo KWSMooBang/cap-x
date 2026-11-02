@@ -219,11 +219,12 @@ def test_backward_boundaries_at_close_and_after_release():
             _r(150), _r(180, "close", "bowl_B"), _r(210, "release", "bowl_B"), _r(240)]
     res = bw.backward(rows, [], {"bowl_A": "bowl", "bowl_B": "bowl", "plate_A": "plate"})
     lab = {r.t: r.subtask.split("(")[0] for r in res.rows}
-    assert lab == {0: "pick", 30: "pick", 60: "place", 90: "place", 120: "pick", 150: "pick", 180: "place", 210: "place",
-                   240: "place"}
+    # bggen-fix6 C (review of 07baa92): after the last release the forward labels stay (here the fixture's '?')
+    assert lab == {0: "pick", 30: "pick", 60: "place", 90: "place", 120: "pick", 150: "pick", 180: "place", 210: "?",
+                   240: "?"}
     assert [r.subtask for r in res.rows][120 // 30].startswith("pick(bowl_B")
     gen = [res.rows[i].t for i in range(1, len(res.rows)) if res.rows[i].subtask != res.rows[i - 1].subtask]
-    assert gen == [60, 120, 180]  # the close events and the release; not the confirming keyframe (90)
+    assert gen == [60, 120, 180, 210]  # the close events and the releases; not the confirming keyframe (90)
     b4 = [x for x in res.log if x["rule"] == "B4"]
     assert b4[0]["pick_to_place_t"] == 60 and b4[0]["next_from_t"] == 120
 

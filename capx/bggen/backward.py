@@ -364,8 +364,8 @@ def _keep_forward(rows: list[Any], fwd: Sequence[str], spans: set[int], tail: in
     """bggen-fix6 C: the backward labels keep every forward boundary. Units = runs of one backward label, cut at the B4
     span starts; a unit with forward boundaries inside keeps the forward labels up to its last forward boundary and the
     backward label from there (the end of the unit: the pick / place that B4 knows). After the last segment (rows from
-    ``tail``) B4 knows no further segment: a tail unit with forward boundaries inside keeps the forward labels throughout
-    (a ``done`` unit, from the goal-confirmed row, is a normal unit). A forward boundary that would still disappear
+    ``tail``) B4 knows no further segment: every tail unit but ``done`` keeps the forward labels throughout (review of
+    07baa92: also one without forward boundaries inside; a ``done`` unit, from the goal-confirmed row, is a normal unit). A forward boundary that would still disappear
     (the backward label of one side equals the forward label of the other: e.g. the hold's end got the place label the
     forward rows name right after the release) -> the unit on that side whose end carries the backward label takes the
     forward labels throughout (``B4-forward-unit``); one that remains (none expected) is logged ``B4-merged``."""
@@ -381,13 +381,16 @@ def _keep_forward(rows: list[Any], fwd: Sequence[str], spans: set[int], tail: in
             unit_of[i] = u
     for un in units:
         a, b, _ = un
+        if a >= tail and bwd[a] != "done":
+            un[2] = b  # the tail (not 'done'): forward labels throughout, with or without forward boundaries inside
+            continue
         inner = [i for i in range(a + 1, b) if fwd[i] != fwd[i - 1]]
         if not inner:
             un[2] = a  # the backward label throughout
             continue
         c = inner[-1]
-        if fwd[c - 1] == bwd[a] or (a >= tail and bwd[a] != "done"):
-            c = b  # forward labels throughout (the tail; or the sub-span before c already reads as the backward label)
+        if fwd[c - 1] == bwd[a]:
+            c = b  # the sub-span before c already reads as the backward label: forward labels throughout
         un[2] = c
 
     def label(i: int) -> str:

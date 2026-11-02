@@ -67,15 +67,16 @@ def extract_json(text: str) -> Any:
 
 
 def json_error(text: str) -> str | None:
-    """bggen-fix6 D: where the reply's JSON breaks, for a re-query (None if there is no ``{`` or it parses). The span
-    from the first ``{`` to the last ``}`` is decoded; the error's message, line / column and the text around it."""
+    """bggen-fix6 D: where the reply's JSON breaks, for a re-query (None if there is no ``{`` or an object parses from
+    the first ``{``). The text from the first ``{`` to the end is decoded (a reply cut before its closing ``}`` errors at
+    the cut); the error's message, line / column and the text around it."""
     text = re.sub(r"```(?:json)?", "", text or "")
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
+    start = text.find("{")
+    if start == -1:
         return None
-    body = text[start:end + 1]
+    body = text[start:]
     try:
-        json.loads(body)
+        json.JSONDecoder().raw_decode(body)
     except json.JSONDecodeError as exc:
         lo, hi = max(exc.pos - 60, 0), min(exc.pos + 20, len(body))
         near = body[lo:exc.pos] + " <HERE> " + body[exc.pos:hi]

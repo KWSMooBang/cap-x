@@ -910,12 +910,7 @@ class Generator:
             px = self._eef_pixel(main, fr, arm_key) if main is not None else None
             target, dist = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, px)
             rec["grasp"] = {"target": target, "distance": dist}
-            if target is not None and self._operated(target) and cfg.unseen_grasp:
-                # fix6 A: the hand is inside / at an operated object's box (a hot dog taken out of the fridge whose
-                # box contains the EEF): the wrist camera decides whether a movable object is in the fingers
-                alt, rec["grasp_wrist"] = self._grasp_unseen(e, arm_key, fr, next_gripper_t, wrist_only=True)
-                if alt is not None and not self._operated(alt):
-                    target = alt
+            target = self._wrist_first(e, arm_key, fr, next_gripper_t, target, rec)
             if target is not None:
                 self._take(e, arm_key, fr, main, target, px)
         elif e.kind in ("release", "open") and arm_key is not None:
@@ -974,6 +969,7 @@ class Generator:
             px = self._eef_pixel(main, fr, arm_key)
             target, dist = self.tracker.grasp_target(fr.eef_world(arm_key), cfg.camera, px)
             rec["grasp_retry"] = {"target": target, "distance": dist}
+            target = self._wrist_first(e, arm_key, fr, next_gripper_t, target, rec)  # review: after detection too
             if target is not None:
                 self.tracker.counts["grasp_retarget"] += 1
                 self._take(e, arm_key, fr, main, target, px)
@@ -1203,6 +1199,16 @@ class Generator:
                 "loc0": {k: (ed.p, ed.source) for k, ed in self.graph.edges.items()
                          if k[1] == target and k[0] in ("on", "in", "at")}}
 
+    def _wrist_first(self, e: Event, arm: str, fr: FrameRecord, next_gripper_t: int, target: str | None,
+                     rec: dict[str, Any]) -> str | None:
+        """fix6 A: an operated target (the hand inside / at a fridge's box: a hot dog taken out of it) gives way to a
+        movable the arm's wrist camera sees at the fingers (bound expected name or known track). Before and after the
+        frame's detection (a fridge first detected at the grasp frame must not hide the hot dog)."""
+        if target is None or not self._operated(target) or not self.cfg.unseen_grasp:
+            return target
+        alt, rec["grasp_wrist"] = self._grasp_unseen(e, arm, fr, next_gripper_t, wrist_only=True)
+        return alt if alt is not None and not self._operated(alt) else target
+
     def _operated(self, alias: str) -> bool:
         """fix6 A: a grasp of this track operates it (fixed / articulated category), never holds it."""
         return alias in self.tracker.tracks and self._cat(alias) in self.cfg.operate_categories
@@ -1256,7 +1262,7 @@ class Generator:
         instead (A4: a track with a position wins over an expected name)."""
         cfg = self.cfg
         info: dict[str, Any] = {"arm": arm}
-        if not self.tracker.unplaced():
+        if not self.tracker.unplaced() and not wrist_only:  # wrist_only: a known movable at the fingers counts too
             info["result"] = "no position-less expected name"
             return None, info
         cam_name = cfg.arm_cameras.get(arm)

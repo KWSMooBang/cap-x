@@ -128,6 +128,29 @@ def test_hot_dog_taken_inside_the_fridge_box_is_held_not_the_fridge_operated():
     assert gen.operating == {"right": "fridge_A"} and gen.tracker.unplaced("hotdog") == ["hotdog_A"]
 
 
+def test_fridge_first_detected_at_the_grasp_frame_does_not_hide_the_hot_dog():
+    """Review of 07baa92: nothing tracked before the grasp frame; its detection binds the fridge (whose box contains the
+    EEF) and a hot dog 0.2 m off the fingers (beyond grasp_radius); the retry after detection targets the fridge, the
+    wrist camera sees the hot dog at the fingers -> the hot dog is held (known track), the fridge is not operated."""
+    gen, _ = _fridge_gen()
+    gen.tracker = Tracker(gen.cfg.tracks)
+    gen.geo.tracker = gen.tracker
+    gen.tracker.initialize(0, "head", [])
+    gen.tracker.expect("fridge", "fridge_A")
+    gen.tracker.expect("hotdog", "hotdog_A")
+    gen.tracker.set_caps({"fridge": 1, "hotdog": 1})
+    inside = np.array([1.5, -0.15, 1.0])
+    hot_head = _det("hotdog", *(inside + [0.2, 0, 0]), (0.15, 0.05, 0.05))
+    gen.ep._eef = lambda arm, t: inside if arm == "right" else np.array([0.2, 0.5, 1.0])
+    gen.det = _Det(lambda cam, t: [_det("hotdog", *(inside + [0.03, 0, -0.02]), (0.15, 0.05, 0.05))]
+                   if cam == "right_wrist" else [FRIDGE, hot_head] if cam == "head" else [])
+    gen.step(Event(100, "grasp", "right"), 300)
+    rec = gen.trace[-1]
+    assert rec["grasp"]["target"] is None and rec["grasp_retry"]["target"] == "fridge_A"
+    assert rec["grasp_wrist"]["result"].startswith("known track") and gen.tracker.held("right") == "hotdog_A"
+    assert gen.operating == {} and gen.rows[-1].obj == "hotdog_A"
+
+
 # --- B: one 'no' is not final -----------------------------------------------------------------------------------------
 
 MICRO = _det("microwave", 1.0, -2.8, 1.2, (0.5, 0.35, 0.3), px=(60.0, 20.0))
@@ -241,14 +264,14 @@ def test_backward_keeps_forward_boundaries_inside_a_long_hold_and_after_the_last
 
 def test_backward_without_forward_boundaries_inside_is_unchanged():
     """The forward labels change only where B4 changes them: the B4 labels as before (the LIBERO swap golden)."""
-    rows = [_row(0, "pick(bowl_A, ?)", "start"), _row(30, "place(bowl_A, ?)", "grasp", "bowl_A"), _row(60, "place(bowl_A, ?)"),
-            _row(90, "place(bowl_A, ?)", "release", "bowl_A", {("on", "bowl_A", "plate_A"): (0.9, "obs")})]
+    rows = [_row(0, "pick(bowl_A, ?)", "start"), _row(30, "place(bowl_A, plate_A)", "grasp", "bowl_A"),
+            _row(60, "place(bowl_A, plate_A)"), _row(90, "place(bowl_A, plate_A)", "release", "bowl_A", {("on", "bowl_A", "plate_A"): (0.9, "obs")})]
     for r in rows[:3]:
         r.belief = {("on", "bowl_A", "plate_A"): (0.1, "obs")}
     res = bw.backward(rows, [], {"bowl_A": "bowl", "plate_A": "plate"})
     assert [r.subtask for r in res.rows] == ["pick(bowl_A, ?)", "place(bowl_A, plate_A)", "place(bowl_A, plate_A)",
                                              "place(bowl_A, plate_A)"]
-    assert not any(x["rule"] in ("B4-keep", "B4-forward-unit") for x in res.log)
+    assert not any(x["rule"] == "B4-forward-unit" for x in res.log)
 
 
 def test_a_forward_boundary_at_the_last_release_keeps_the_tail_forward():
@@ -261,7 +284,16 @@ def test_a_forward_boundary_at_the_last_release_keeps_the_tail_forward():
     res = bw.backward(rows, [], {"bowl_A": "bowl", "plate_A": "plate"})
     assert [r.subtask for r in res.rows] == ["pick(bowl_A, ?)", "place(bowl_A, plate_A)", "place(bowl_A, plate_A)",
                                              "pick(bowl_B, ?)"]
-    assert next(x for x in res.log if x["rule"] == "B4-forward-unit")["t"] == [90]
+    assert not any(x["rule"] == "B4-merged" for x in res.log)
+
+
+def test_a_tail_with_a_constant_forward_label_keeps_it():
+    """Review of 07baa92: a tail without forward boundaries inside keeps its forward label too (not the last place)."""
+    rows = _rows_020()
+    for r in rows[5:]:
+        r.subtask = "pick(hotdog_A, ?)"
+    res = bw.backward(rows, [], {"hotdog_B": "hotdog", "countertop_A": "countertop"})
+    assert [r.subtask for r in res.rows][5:] == ["pick(hotdog_A, ?)"] * 4
 
 
 def test_a_forward_boundary_at_a_unit_edge_is_kept_by_forward_labels():
@@ -321,6 +353,16 @@ def test_init_bracket_error_is_reasked_with_the_error_then_succeeds():
     assert "not valid JSON" in second and "SAME content" in second and "<HERE>" in second
     third = _texts(models.init.calls[2])
     assert "could not be used" in third.split("SAME content")[-1]  # the 2nd failure: the usual re-query
+
+
+def test_init_cut_json_without_closing_brace_is_reasked_with_the_error():
+    cut = '{"goal_branches": [[[["on","bowl_A","plate_A"]], [["on","bowl_B"'
+    err = json_error("```json\n" + cut)
+    assert err is not None and "<HERE>" in err
+    gen, models = _init_gen([cut, GOOD])
+    gen.initialize()
+    assert "failed" not in gen.init_info and gen.init_info["json_fix"]["attempt"] == 1
+    assert "not valid JSON" in _texts(models.init.calls[1])
 
 
 def test_init_json_fix_is_used_at_most_once():
